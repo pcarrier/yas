@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"yas.tools/jsr"
 )
 
 func Run(env []string, args []string, in *os.File, out *os.File, errFile *os.File) {
@@ -15,4 +16,9 @@ func Run(env []string, args []string, in *os.File, out *os.File, errFile *os.Fil
 		log.Fatalf("Invalid tool reference: %v\n", err)
 	}
 	log.Printf("Would invoke %v with fragment %v\n", strconv.Quote(url), strconv.Quote(frag))
+
+	rt := jsr.NewRuntime()
+	defer rt.Close()
+	ctx := rt.NewContext()
+	defer ctx.Close()
 }

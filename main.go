@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/yas-tools/yas/cli"
 	"os"
+	"yas.tools/cli"
 )
 
 func main() {
