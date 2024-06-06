@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Yet Another System‽</title>
+    <link
+      rel="icon"
+      href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><text x="16" y="16" text-anchor="middle" dominant-baseline="middle" font-size="32">‽</text></svg>'
+    />
+    <style>
+      :root {
+        color-scheme: light dark;
+        background-color: light-dark(#fff, #000);
+        font-family: sans-serif;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 100svh;
+      }
+
+      body {
+        max-width: 40em;
+      }
+
+      code {
+        background-color: light-dark(#ddd, #222);
+        border-radius: 0.25em;
+      }
+
+      .broad {
+        flex: 1;
+        min-width: 20em;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        img {
+          filter: invert(1);
+        }
+      }
+
+      .copy {
+        cursor: pointer;
+      }
+
+      .copy::after {
+        content: "📋";
+      }
+
+      h3 {
+        margin-top: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Yet Another System‽</h1>
+    <p style="text-align: center">
+      <a href="https://xkcd.com/927/"
+        ><img
+          width="500"
+          height="283"
+          src="https://imgs.xkcd.com/comics/standards.png"
+          srcset="https://imgs.xkcd.com/comics/standards_2x.png 2x"
+      /></a>
+    </p>
+    <h2>Install</h2>
+    <div style="display: flex; flex-wrap: wrap">
+      <div class="broad">
+        <h3>Mac, Linux</h3>
+        <p>
+          Open a terminal and run:<br />
+          <code class="copy">curl -s https://sh.yas.tools | bash</code>
+        </p>
+      </div>
+      <div class="broad">
+        <h3>Windows</h3>
+        <p>
+          Open PowerShell and run:<br />
+          <code class="copy">iex (iwr https://ps.yas.tools)</code>
+        </p>
+      </div>
+    </div>
+    <h2>Usage</h2>
+    <code> $ yas <i>tool</i> … </code>
+    <p>
+      where <code><i>tool</i></code> takes the form
+      <code>[[protocol://]host/]path[#anchor]</code>, for example:
+    </p>
+    <ul>
+      <li><code>https://npmjs.com/alive-server#1.3.0</code></li>
+      <li>
+        <code>npmjs.com/alive-server</code> (protocol defaults to
+        <code>https</code>)
+      </li>
+      <li>
+        <code>alive-server#1.3.0</code> (host defaults to
+        <code>oh.yas.tools</code> deployed from
+        <a href="https://github.com/yas-tools/oh">our repository</a>)
+      </li>
+      <li>
+        <code>alive-server</code> (anchors are arbitrary and optional, commonly
+        used for versions)
+      </li>
+    </ul>
+    <h2>Design</h2>
+    <ul>
+      <li>Single self-updating binary in its dedicated <code>~/.yas</code>;</li>
+      <li>
+        URLs can point to scripts, or HTML where we look up
+        <code>&lt;link rel="yas" href="…"&gt;</code>;
+      </li>
+      <li>ES2023 script per tool with dependencies;</li>
+      <li>Everything is cached &amp; updated effortlessly;</li>
+      <li>
+        Downloads, extractions, etc. through simple APIs and an opt-in standard
+        library, to easily package arbitrary software.
+      </li>
+    </ul>
+    <script>
+      document.querySelectorAll(".copy").forEach((el) => {
+        el.addEventListener("click", () => {
+          navigator.clipboard.writeText(el.textContent.trim());
+        });
+      });
+    </script>
+  </body>
+</html>
