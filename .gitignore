@@ -1,3 +1,7 @@
-/bazel-*
 /.idea/
 /node_modules/
+/yas-*
+*.a
+*.o
+*.lib
+.zig-cache/
