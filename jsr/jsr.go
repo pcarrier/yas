@@ -1,7 +1,7 @@
 package jsr
 
 /*
-#include "quickjs.h"
+#include "jsr.h"
 */
 import "C"
 import "runtime"
