@@ -1,15 +1,15 @@
 package main
 
-import "github.com/buke/quickjs-go"
+import (
+	"github.com/yas-tools/yas/cli"
+	"os"
+)
 
 func main() {
-	rt := quickjs.NewRuntime()
-	defer rt.Close()
-	ctx := rt.NewContext()
-	defer ctx.Close()
-	ret, err := ctx.Eval("1 + 2")
-	if err != nil {
-		panic(err)
-	}
-	println(ret.Int32())
+	env := os.Environ()
+	args := os.Args
+	in := os.Stdin
+	out := os.Stdout
+	err := os.Stderr
+	cli.Run(env, args, in, out, err)
 }
