@@ -1,11 +1,9 @@
 package jsr
 
 /*
-#include "jsr/quickjs/quickjs.h"
-#include "jsr/quickjs/quickjs-libc.h"
+#include "quickjs.h"
 */
 import "C"
-
 import "runtime"
 
 type Value struct {
@@ -31,10 +29,8 @@ func (v Value) Free() {
 
 func NewRuntime() Runtime {
 	runtime.LockOSThread()
-	rt := C.JS_NewRuntime()
-	C.js_std_init_handlers(rt)
 	return Runtime{
-		ref: rt,
+		ref: C.JS_NewRuntime(),
 	}
 }
 

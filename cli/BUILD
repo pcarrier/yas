@@ -6,9 +6,9 @@ go_library(
         "run.go",
         "toolpath.go",
     ],
-    deps = ["//jsr"],
     importpath = "yas.tools/cli",
     visibility = ["//visibility:public"],
+    deps = ["//jsr"],
 )
 
 go_test(

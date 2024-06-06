@@ -8,7 +8,6 @@ cc_library(
         "quickjs/libregexp.c",
         "quickjs/libunicode.c",
         "quickjs/quickjs.c",
-        "quickjs/quickjs-libc.c",
     ],
     hdrs = [
         "quickjs/cutils.h",
@@ -20,19 +19,20 @@ cc_library(
         "quickjs/list.h",
         "quickjs/quickjs.h",
         "quickjs/quickjs-atom.h",
-        "quickjs/quickjs-libc.h",
         "quickjs/quickjs-opcode.h",
     ],
     defines = [
         "CONFIG_VERSION='\"yas\"'",
     ],
+    includes = ["quickjs"],
+    linkstatic = True,
 )
 
 go_library(
     name = "jsr",
     srcs = ["jsr.go"],
-    importpath = "yas.tools/jsr",
-    cgo = True,
     cdeps = [":quickjs"],
+    cgo = True,
+    importpath = "yas.tools/jsr",
     visibility = ["//visibility:public"],
 )
