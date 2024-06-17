@@ -1,7 +1,7 @@
 /.idea/
+/bin/*
+/lib/*
+!/bin/.keep
+!/lib/.keep
 /node_modules/
-/yas-*
-*.a
-*.o
-*.lib
 .zig-cache/

@@ -2,28 +2,37 @@ package rt
 
 import (
 	"fmt"
-	"github.com/birkelund/boltdbcache"
-	"github.com/gregjones/httpcache"
-	"go.etcd.io/bbolt"
-	"go.starlark.net/starlark"
-	"go.starlark.net/syntax"
 	"io"
 	"net/url"
 	"os"
 	"path"
 	"strings"
+
+	"github.com/birkelund/boltdbcache"
+	"github.com/gregjones/httpcache"
+	"go.etcd.io/bbolt"
 )
 
-type loadEntry struct {
-	globals starlark.StringDict
-	err     error
-}
+/*
+#cgo CFLAGS: -I${SRCDIR} -I${SRCDIR}/../lua-5.4.6/src
+#cgo LDFLAGS: -L${SRCDIR}/../lib
+#cgo darwin,amd64  LDFLAGS: -lrt-darwin-amd64
+#cgo darwin,arm64  LDFLAGS: -lrt-darwin-arm64
+#cgo linux,amd64   LDFLAGS: -lrt-linux-amd64
+#cgo linux,arm64   LDFLAGS: -lrt-linux-arm64
+#cgo windows,amd64 LDFLAGS: -lrt-windows-amd64
+#cgo windows,arm64 LDFLAGS: -lrt-windows-arm64
+#include "rt.h"
+*/
+import "C"
 
 type RT struct {
+	Base      *url.URL
 	Tool      string
 	Fragment  string
-	globals   starlark.StringDict
-	loadCache map[string]*loadEntry
+	Args      []string
+	Env       map[string]string
+	state     *C.lua_State
 	db        *bbolt.DB
 	httpCache httpcache.Cache
 }
@@ -32,19 +41,18 @@ func NewRT(envp []string, argv []string) (*RT, error) {
 	var home string
 	base := "https://oh.yas.tools"
 
-	env := starlark.NewDict(len(envp))
+	env := make(map[string]string)
+
 	for _, kv := range envp {
 		parts := strings.SplitN(kv, "=", 2)
 		name := parts[0]
 		value := parts[1]
+		env[name] = value
 		switch name {
 		case "YAS_BASE":
 			base = value
 		case "YAS_HOME":
 			home = value
-		}
-		if err := env.SetKey(starlark.String(name), starlark.String(value)); err != nil {
-			return nil, fmt.Errorf("failed to set env var %q: %v", kv, err)
 		}
 	}
 
@@ -60,9 +68,6 @@ func NewRT(envp []string, argv []string) (*RT, error) {
 		return nil, fmt.Errorf("failed to create database directory: %v", err)
 	}
 
-	frag := ""
-	args := starlark.Tuple{}
-
 	baseURL, err := url.Parse(base)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse base URL %v: %v", baseURL, err)
@@ -70,16 +75,6 @@ func NewRT(envp []string, argv []string) (*RT, error) {
 	tool, frag, err := deriveToolURI(argv[1], baseURL)
 	if err != nil {
 		return nil, err
-	}
-	for _, arg := range argv[2:] {
-		args = append(args, starlark.String(arg))
-	}
-
-	globals := starlark.StringDict{
-		"args": args,
-		"env":  env,
-		"tool": starlark.String(tool),
-		"frag": starlark.String(frag),
 	}
 
 	db, err := bbolt.Open(path.Join(home, "db"), 0600, nil)
@@ -92,53 +87,23 @@ func NewRT(envp []string, argv []string) (*RT, error) {
 		return nil, fmt.Errorf("failed to open cache: %v", err)
 	}
 
-	return &RT{
+	res := RT{
+		Base:      baseURL,
 		Tool:      tool,
 		Fragment:  frag,
-		globals:   globals,
-		loadCache: make(map[string]*loadEntry),
+		Args:      argv[2:],
+		Env:       env,
 		db:        db,
 		httpCache: httpCache,
-	}, nil
-}
-
-func (r *RT) Globals() starlark.StringDict {
-	return r.globals
-}
-
-func (r *RT) Load(thread *starlark.Thread, module string) (starlark.StringDict, error) {
-	e, ok := r.loadCache[module]
-	if e == nil {
-		if ok {
-			// request for package whose loading is in progress
-			return nil, fmt.Errorf("cycle in load graph")
-		}
-		r.loadCache[module] = nil
-		var globals starlark.StringDict
-		data, err := r.Fetch(thread, module)
-		if err == nil {
-			thread := r.Thread(module)
-			globals, err = starlark.ExecFileOptions(&syntax.FileOptions{}, thread, module, data, r.globals)
-		}
-		e = &loadEntry{globals, err}
-		r.loadCache[module] = e
 	}
-	return e.globals, e.err
+
+	res.state = C.buildLua()
+
+	return &res, nil
 }
 
-func (r *RT) Thread(module string) *starlark.Thread {
-	return &starlark.Thread{
-		Name: module,
-		Load: r.Load,
-	}
-}
-
-func (r *RT) Fetch(thread *starlark.Thread, module string) (string, error) {
+func (r *RT) Fetch(base *url.URL, module string) (string, error) {
 	u, err := url.Parse(module)
-	if err != nil {
-		return "", err
-	}
-	base, err := url.Parse(thread.Name)
 	if err != nil {
 		return "", err
 	}
