@@ -6,27 +6,31 @@ edition = "2021"
 [profile.release]
 lto = true
 opt-level = "z"
-strip = "debuginfo"
+strip = "symbols"
 
 [dependencies]
-mimalloc = "0.1.42"
+dirs = "5.0.1"
+url = "2.5.1"
+log = "0.4.21"
+
+[dependencies.mlua]
+version = "0.9.8"
+features = ["async", "lua54", "macros", "serialize", "vendored"]
 
 [dependencies.tokio]
 version = "1.38.0"
 features = ["rt", "macros"]
 
-[dependencies.sqlite]
-version = "0.36.0"
-features = ["bundled"]
-
-[dependencies.rquickjs]
-version = "0.6.2"
-features = ["array-buffer", "futures", "loader", "rust-alloc", "macro", "phf"]
-
 [dependencies.reqwest]
 version = "0.12.4"
 features = ["brotli", "gzip"]
 
+[dependencies.reqwest-middleware]
+version = "0.3.1"
+
+[dependencies.http-cache-reqwest]
+version = "0.14.0"
+
 [dependencies.minicbor]
 version = "0.24.0"
-features = ["full"]
+features = ["std", "derive"]
