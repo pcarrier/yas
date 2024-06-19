@@ -1,14 +1,14 @@
 #!/usr/bin/env lua
 
 local operating_systems = {
-  mac = { zig = "macos", go = "darwin", p = "lib", s = ".a", gonozig = true },
-  lin = { zig = "linux-musl", go = "linux", p = "lib", s = ".a" },
-  win = { zig = "windows", go = "windows", p = "", s = ".lib" },
+  mac = { nim = "macosx", zig = "macos", p = "lib", s = ".a", },
+  lin = { nim = "linux", zig = "linux-musl", p = "lib", s = ".a", },
+  win = { nim = "windows", zig = "windows", p = "", s = ".lib", },
 }
 
 local architectures = {
-  x64 = { zig = "x86_64", go = "amd64" },
-  a64 = { zig = "aarch64", go = "arm64" },
+  x64 = { nim = "amd64", zig = "x86_64", },
+  a64 = { nim = "arm64", zig = "aarch64", },
 }
 
 local lua_files = {
@@ -33,23 +33,32 @@ local exec = function(...)
   assert(os.execute(cmd))
 end
 
-local build = function(os, arch)
-  local zig_target = arch.zig .. "-" .. os.zig
-  local go_target = os.go .. "-" .. arch.go
-  local libname = os.p .. "rt-" .. go_target .. os.s
+local build = function(o, a)
+  local zigcc = os.getenv("PWD") .. "/zigcc"
+  local zig_target = a.zig .. "-" .. o.zig
   exec(
-    "zig", "build-lib", "-femit-bin=lib/" .. libname,
-    "-O", "ReleaseSmall", "-fstrip", "-target", zig_target, "-lc",
+    "zig", "build-lib", "-femit-bin=lib/" .. o.p .. "lua-" .. zig_target .. o.s,
+    "-O", "ReleaseSmall", "-fstrip", "-fsingle-threaded", "-lc", "-target", zig_target,
     "-I", "lua/src",
-    table.unpack(map(lua_files, function(f) return "lua/src/" .. f .. ".c" end
-  )))
+    table.unpack(map(lua_files, function(f) return "lua/src/" .. f .. ".c" end))
+  )
   exec(
-    "env", "GOARCH=" .. arch.go, "GOOS=" .. os.go,  "CGO_ENABLED=1",
-    os.gonozig and "CC=clang" or "CC=zig cc -target " .. zig_target,
-    "go", "build",
-    "-ldflags=-s -w",
-    "-o", "bin/yas-" .. go_target,
-    "."
+    "zig", "build-lib", "-femit-bin=lib/" .. o.p .. "lmdb-" .. zig_target .. o.s,
+    "-O", "ReleaseSmall", "-fstrip", "-fsingle-threaded", "-lc", "-target", zig_target,
+    "-I", "lmdb", "lmdb/mdb.c"
+  )
+  exec(
+    "env", "ZIG_FLAGS=-target " .. zig_target,
+    "nim", "compile",
+    "--out:bin/yas-" .. o.nim .. "-" .. a.nim,
+    "--cc:clang",
+    "--os:" .. o.nim,
+    "--cpu:" .. a.nim,
+    "--clang.exe:" .. zigcc,
+    "--clang.linkerexe:" .. zigcc,
+    "--passC:-Ilua/src -Ilmdb",
+    "--passL:-Llib -llua-" .. zig_target .. " -llmdb-" .. zig_target,
+    "src/yas.nim"
   )
 end
 
