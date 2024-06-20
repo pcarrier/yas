@@ -1,8 +1,9 @@
 {
   "type": "module",
   "scripts": {
-    "deploy": "xmit yas.tools",
-    "start": "alive-server dist",
+    "yas.tools": "xmit yas.tools yas.tools",
+    "yas.run": "xmit yas.run yas.run",
+    "start": "alive-server yas.tools",
     "test": "node test.js"
   },
   "dependencies": {

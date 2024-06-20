@@ -14,3 +14,5 @@ switch("d", "danger")
 switch("lineTrace", "off")
 switch("stackTrace", "off")
 switch("checks", "off")
+
+switch("d", "ssl")
