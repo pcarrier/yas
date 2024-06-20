@@ -2,5 +2,4 @@
 /bin/*
 /lib/*
 !/bin/cacert.pem
-!/lib/.keep
 /node_modules/
