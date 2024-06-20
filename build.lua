@@ -1,9 +1,12 @@
 #!/usr/bin/env lua
 
 local operating_systems = {
-  mac = { nim = "macosx",  zig = "macos",      p = "lib", s = ".a", passL = "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks" },
-  lin = { nim = "linux",   zig = "linux-musl", p = "lib", s = ".a", },
-  win = { nim = "windows", zig = "windows",               s = ".lib", },
+  mac  = { nim = "macosx",  zig = "macos",      p = "lib", s = ".a", passL = "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks" },
+  lin  = { nim = "linux",   zig = "linux-musl", p = "lib", s = ".a", },
+  win  = { nim = "windows", zig = "windows",               s = ".lib", },
+  -- fbsd = { nim = "freebsd", zig = "freebsd",    p = "lib", s = ".a", },
+  -- obsd = { nim = "openbsd", zig = "openbsd",    p = "lib", s = ".a", },
+  -- nbsd = { nim = "netbsd",  zig = "netbsd",     p = "lib", s = ".a", },
 }
 
 local architectures = {
@@ -63,24 +66,23 @@ local build = function(o, a)
     "tweetnacl/tweetnacl.c", "tweetnacl/randombytes.c"
   )
   exec(
-    "env", "ZIG_FLAGS=-target " .. zig_target,
+    "env", "ZIG_FLAGS=-Wl,--strip-all -target " .. zig_target,
     "nim", "compile",
     "--out:bin/yas-" .. o.nim .. "-" .. a.nim,
-    "--cc:clang",
     "--os:" .. o.nim,
     "--cpu:" .. a.nim,
     "--clang.exe:" .. zigcc,
     "--clang.linkerexe:" .. zigcc,
-    "--passC:-Ilua/src -Ilmdb -Izstd/lib -Itweetnacl",
     "--passL:-Llib -llua-" .. zig_target ..
       " -llmdb-" .. zig_target  ..
       " -lzstd-" .. zig_target ..
-      " -ltnacl-" .. zig_target
-      .. (o.passL and (" " .. o.passL) or ""),
+      " -ltnacl-" .. zig_target ..
+      (o.passL and (" " .. o.passL) or ""),
     "src/yas.nim"
   )
 end
 
+exec("git", "submodule", "update", "--init")
 if #arg > 0 then
   for _, os_arch in ipairs(arg) do
     local os, arch = os_arch:match("([^-]+)-([^-]+)")
