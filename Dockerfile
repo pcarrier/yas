@@ -1,5 +1,5 @@
 FROM alpine AS build
-RUN apk add bash cmake curl gcc git musl-dev --no-cache
+RUN apk add bash cmake curl gcc git musl-dev ninja --no-cache
 RUN curl -s https://mise.run | MISE_INSTALL_PATH=/bin/mise sh
 ADD .tool-versions /app/.tool-versions
 WORKDIR /app
