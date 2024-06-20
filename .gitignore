@@ -1,6 +1,6 @@
 /.idea/
 /bin/*
 /lib/*
-!/bin/.keep
+!/bin/cacert.pem
 !/lib/.keep
 /node_modules/
