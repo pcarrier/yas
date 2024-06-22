@@ -166,13 +166,22 @@ local build = function(o, a)
     )
 end
 
+local keys = function(t)
+    local r = {}
+    for k, _ in pairs(t) do table.insert(r, k) end
+    return r
+end
+
 if #arg > 0 then
     for _, os_arch in ipairs(arg) do
         local os, arch = os_arch:match("([^-]+)-([^-]+)")
-        if not os or not arch then
-            error("Invalid os-arch argument: " .. os_arch)
+        if (not os) or (not arch) then
+            error("Invalid argument: expected $os-$arch instead of " .. os_arch)
         end
-        build(operating_systems[os], architectures[arch])
+        local fos, farch = operating_systems[os], architectures[arch]
+        if not fos then error("Invalid OS " .. os .. ": pass one of " .. table.concat(keys(operating_systems), ", ")) end
+        if not farch then error("Invalid architecture " .. arch .. ": pass one of " .. table.concat(keys(architectures), ", ")) end
+        build(fos, farch)
     end
 else
     for _, os in pairs(operating_systems) do
