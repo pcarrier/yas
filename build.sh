@@ -1,7 +1,8 @@
 #!/bin/sh
 set -e
 cd "$(dirname "$0")"
-zig build-exe -femit-bin=bin/lua -O ReleaseSmall -fstrip -lc \
+mkdir -p bin lib
+zig build-exe -femit-bin=builda -O ReleaseSmall -fstrip -lc \
 lua/src/lua.c \
 lua/src/lapi.c \
 lua/src/lcode.c \
@@ -35,4 +36,4 @@ lua/src/loslib.c \
 lua/src/lstrlib.c \
 lua/src/ltablib.c \
 lua/src/lutf8lib.c
-exec ./bin/lua build.lua "$@"
+exec ./builda build.lua "$@"

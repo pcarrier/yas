@@ -1,5 +1,5 @@
 /.idea/
-/bin/*
-/lib/*
-!/bin/cacert.pem
+/bin/
+/lib/
+/builda
 /node_modules/
