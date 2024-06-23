@@ -169,7 +169,7 @@ end
 
 local keys = function(t)
     local r = {}
-    for k, _ in pairs(t) do r[#r+1]=k end
+    for k in next, t do r[#r+1]=k end
     return r
 end
 
@@ -185,8 +185,8 @@ if #arg > 0 then
         build(fos, farch)
     end
 else
-    for _, os in pairs(operating_systems) do
-        for _, arch in pairs(architectures) do
+    for _, os in next, operating_systems do
+        for _, arch in next, architectures do
             build(os, arch)
         end
     end

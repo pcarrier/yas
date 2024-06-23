@@ -4,6 +4,7 @@ const c = @import("c.zig");
 const license = @embedFile("LICENSE");
 const osTag = builtin.os.tag;
 const dirName = "yas.tools";
+const defaultBaseURL = "https://oh.yas.tools";
 
 fn dataDir(alloc: std.mem.Allocator) ![]u8 {
     if (osTag == .windows) {
@@ -47,7 +48,7 @@ pub fn main() !void {
     const data = try dataDir(alloc);
     defer alloc.free(data);
     try std.fs.cwd().makePath(data);
-    const baseURL = std.process.getEnvVarOwned(alloc, "YAS_BASE") catch "https://oh.yas.tools";
+    const baseURL = std.process.getEnvVarOwned(alloc, "YAS_BASE") catch defaultBaseURL;
     try w.print("baseURL: {s}\n", .{baseURL});
     const lua = try c.Lua.init(&alloc);
     defer lua.deinit();
