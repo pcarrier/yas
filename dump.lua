@@ -26,4 +26,4 @@ local function dump (t, indent, already)
     end
 end
 
-dump(_G)
+return dump

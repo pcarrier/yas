@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const c = @import("c.zig");
 const license = @embedFile("LICENSE");
+const bootstrap = @embedFile("bootstrap.lua");
 const osTag = builtin.os.tag;
 const dirName = "yas.tools";
 const defaultBaseURL = "https://oh.yas.tools";

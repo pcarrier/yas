@@ -1,0 +1,1 @@
+require("dump")(_G)

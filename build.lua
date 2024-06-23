@@ -1,5 +1,7 @@
 #!/usr/bin/env lua
+
 local tcat = table.concat
+local dump = require("dump")
 
 local operating_systems = {
     mac = {
@@ -173,7 +175,10 @@ local keys = function(t)
     return r
 end
 
-if #arg > 0 then
+if #arg == 1 and arg[1] == "--dump" then
+    dump(_G)
+    return
+elseif #arg > 0 then
     for _, os_arch in ipairs(arg) do
         local os, arch = os_arch:match("([^-]+)-([^-]+)")
         if (not os) or (not arch) then
