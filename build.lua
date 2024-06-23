@@ -1,4 +1,5 @@
 #!/usr/bin/env lua
+local tcat = table.concat
 
 local operating_systems = {
     mac = {
@@ -56,7 +57,7 @@ local map = function(t, f)
 end
 
 local exec = function(...)
-    local cmd = table.concat(map({ ... }, squote), " ")
+    local cmd = tcat(map({ ... }, squote), " ")
     print('$ ' .. cmd)
     assert(os.execute(cmd))
 end
@@ -168,7 +169,7 @@ end
 
 local keys = function(t)
     local r = {}
-    for k, _ in pairs(t) do table.insert(r, k) end
+    for k, _ in pairs(t) do r[#r+1]=k end
     return r
 end
 
@@ -179,8 +180,8 @@ if #arg > 0 then
             error("Invalid argument: expected $os-$arch instead of " .. os_arch)
         end
         local fos, farch = operating_systems[os], architectures[arch]
-        if not fos then error("Invalid OS " .. os .. ": pass one of " .. table.concat(keys(operating_systems), ", ")) end
-        if not farch then error("Invalid architecture " .. arch .. ": pass one of " .. table.concat(keys(architectures), ", ")) end
+        if not fos then error("Invalid OS " .. os .. ": pass one of " .. tcat(keys(operating_systems), ", ")) end
+        if not farch then error("Invalid architecture " .. arch .. ": pass one of " .. tcat(keys(architectures), ", ")) end
         build(fos, farch)
     end
 else
