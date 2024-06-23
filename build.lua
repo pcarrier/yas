@@ -64,7 +64,7 @@ end
 
 local build = function(o, a)
     local pwd = os.getenv("PWD")
-    local zigcc, zigcpp, zigar, zigranlib = pwd .. "/zigcc", pwd .. "/zigcpp", pwd .. "/zigar", pwd .. "/zigranlib"
+    local zigcc, zigar, zigranlib = pwd .. "/zigcc", pwd .. "/zigar", pwd .. "/zigranlib"
     local zig_target = a.zig .. "-" .. o.zig
     exec(
         "zig", "build-lib", "-femit-bin=lib/liblua-" .. zig_target .. ".a",
