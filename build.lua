@@ -1,32 +1,6 @@
 #!/usr/bin/env lua
 
 local tcat = table.concat
-local dump = require("dump")
-
-local operating_systems = {
-    mac = {
-        cmake = "Darwin",
-        zig = "macos",
-        curlcflags = "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
-        abi = "",
-    },
-    lin = {
-        cmake = "Linux",
-        zig = "linux-musl",
-        abi = "ELF",
-    },
-    win = {
-        cmake = "Windows",
-        zig = "windows",
-        bs = ".exe",
-        abi = "",
-    },
-}
-
-local architectures = {
-    x64 = { zig = "x86_64", },
-    a64 = { zig = "aarch64", },
-}
 
 local lua_files = {
     "lapi", "lcode", "lctype", "ldebug", "ldo", "ldump", "lfunc", "lgc", "llex", "lmem", "lobject", "lopcodes", "lparser",
@@ -147,7 +121,7 @@ local build = function(o, a)
         "-target", zig_target,
         "-OReleaseSmall",
         "-fstrip",
-        "-femit-bin=bin/yas-" .. o.zig .. "-" .. a.zig .. (o.bs or ""),
+        "-femit-bin=bin/yas-" .. o.short .. "-" .. a.zig .. (o.bs or ""),
         "-Ilua/src",
         "-Icurl/include",
         "-Ilmdb",
@@ -175,23 +149,24 @@ local keys = function(t)
     return r
 end
 
+local p = require("platforms")
+
 if #arg == 1 and arg[1] == "--dump" then
-    dump(_G)
-    return
+    return require("dump")(_G)
 elseif #arg > 0 then
     for _, os_arch in ipairs(arg) do
         local os, arch = os_arch:match("([^-]+)-([^-]+)")
         if (not os) or (not arch) then
             error("Invalid argument: expected $os-$arch instead of " .. os_arch)
         end
-        local fos, farch = operating_systems[os], architectures[arch]
+        local fos, farch = p.operating_systems[os], p.architectures[arch]
         if not fos then error("Invalid OS " .. os .. ": pass one of " .. tcat(keys(operating_systems), ", ")) end
         if not farch then error("Invalid architecture " .. arch .. ": pass one of " .. tcat(keys(architectures), ", ")) end
         build(fos, farch)
     end
 else
-    for _, os in next, operating_systems do
-        for _, arch in next, architectures do
+    for _, os in next, p.operating_systems do
+        for _, arch in next, p.architectures do
             build(os, arch)
         end
     end
