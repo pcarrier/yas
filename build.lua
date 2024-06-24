@@ -60,7 +60,7 @@ end
 
 local exec = function(...)
     local cmd = tcat(map({ ... }, squote), " ")
-    io.write('$ ', cmd)
+    io.write('$ ', cmd, "\n")
     assert(os.execute(cmd))
 end
 
