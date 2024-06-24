@@ -1,20 +1,20 @@
 return {
   operating_systems = {
-    mac = {
-      short = "mac",
+    macos = {
+      short = "macos",
       cmake = "Darwin",
       zig = "macos",
       curlcflags = "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
       abi = "",
     },
-    lin = {
+    linux = {
       short = "linux",
       cmake = "Linux",
       zig = "linux-musl",
       abi = "ELF",
     },
-    win = {
-      short = "win",
+    windows = {
+      short = "windows",
       cmake = "Windows",
       zig = "windows",
       bs = ".exe",
@@ -22,7 +22,7 @@ return {
   },
   },
   architectures = {
-    x64 = { zig = "x86_64", },
-    a64 = { zig = "aarch64", },
+    'x86_64',
+    'aarch64',
   },
 }

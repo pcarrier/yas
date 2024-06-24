@@ -50,7 +50,7 @@ pub fn main() !void {
     defer alloc.free(data);
     try std.fs.cwd().makePath(data);
     const baseURL = std.process.getEnvVarOwned(alloc, "YAS_BASE") catch defaultBaseURL;
-    try w.print("baseURL: {s}\n", .{baseURL});
+    try w.print("baseURL: {s}, args: {s}\n", .{ baseURL, args });
     const lua = try c.Lua.init(&alloc);
     defer lua.deinit();
 }
