@@ -2,4 +2,4 @@
 set -e
 cd "$(dirname "$0")"
 . ./prep.sh
-exec ./builda run.lua "$@"
+exec ./bin/builda run.lua "$@"

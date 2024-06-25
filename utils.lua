@@ -1,7 +1,5 @@
 local M = {}
 
-local tcat = table.concat
-
 local function squote(s)
   if not s:find("[\'\"%s]") then return s end
   return "'" .. s:gsub("'", "'\\''") .. "'"
@@ -21,7 +19,7 @@ end
 M.map = map
 
 function M.exec(...)
-  local cmd = tcat(map({ ... }, squote), " ")
+  local cmd = table.concat(map({ ... }, squote), " ")
   io.write('$ ', cmd, "\n")
   assert(os.execute(cmd))
 end

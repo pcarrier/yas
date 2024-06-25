@@ -1,39 +1,39 @@
 #!/bin/sh
 set -ex
-mkdir -p bin lib
+mkdir -p lib out
 export LUA_CPATH=./lib/?.so
-zig build-lib -femit-bin=lib/local.so -O ReleaseSmall -fstrip -dynamic -Ilua/src -fallow-shlib-undefined local.zig
-zig build-exe -femit-bin=builda -O ReleaseSmall -fstrip -lc -DLUA_USE_DLOPEN \
-lua/src/lua.c \
-lua/src/lapi.c \
-lua/src/lcode.c \
-lua/src/lctype.c \
-lua/src/ldebug.c \
-lua/src/ldo.c \
-lua/src/ldump.c \
-lua/src/lfunc.c \
-lua/src/lgc.c \
-lua/src/linit.c \
-lua/src/llex.c \
-lua/src/lmem.c \
-lua/src/lobject.c \
-lua/src/lopcodes.c \
-lua/src/lparser.c \
-lua/src/lstate.c \
-lua/src/lstring.c \
-lua/src/ltable.c \
-lua/src/ltm.c \
-lua/src/lundump.c \
-lua/src/lvm.c \
-lua/src/lzio.c \
-lua/src/lauxlib.c \
-lua/src/lbaselib.c \
-lua/src/lcorolib.c \
-lua/src/ldblib.c \
-lua/src/liolib.c \
-lua/src/lmathlib.c \
-lua/src/loadlib.c \
-lua/src/loslib.c \
-lua/src/lstrlib.c \
-lua/src/ltablib.c \
-lua/src/lutf8lib.c
+zig build-lib -femit-bin=lib/local.so -O ReleaseSmall -fstrip -dynamic -Ideps/lua/src -fallow-shlib-undefined local.zig
+zig build-exe -femit-bin=bin/builda -O ReleaseSmall -fstrip -lc -DLUA_USE_DLOPEN \
+deps/lua/src/lua.c \
+deps/lua/src/lapi.c \
+deps/lua/src/lcode.c \
+deps/lua/src/lctype.c \
+deps/lua/src/ldebug.c \
+deps/lua/src/ldo.c \
+deps/lua/src/ldump.c \
+deps/lua/src/lfunc.c \
+deps/lua/src/lgc.c \
+deps/lua/src/linit.c \
+deps/lua/src/llex.c \
+deps/lua/src/lmem.c \
+deps/lua/src/lobject.c \
+deps/lua/src/lopcodes.c \
+deps/lua/src/lparser.c \
+deps/lua/src/lstate.c \
+deps/lua/src/lstring.c \
+deps/lua/src/ltable.c \
+deps/lua/src/ltm.c \
+deps/lua/src/lundump.c \
+deps/lua/src/lvm.c \
+deps/lua/src/lzio.c \
+deps/lua/src/lauxlib.c \
+deps/lua/src/lbaselib.c \
+deps/lua/src/lcorolib.c \
+deps/lua/src/ldblib.c \
+deps/lua/src/liolib.c \
+deps/lua/src/lmathlib.c \
+deps/lua/src/loadlib.c \
+deps/lua/src/loslib.c \
+deps/lua/src/lstrlib.c \
+deps/lua/src/ltablib.c \
+deps/lua/src/lutf8lib.c
