@@ -1,0 +1,22 @@
+name: push
+on: [push]
+jobs:
+  build:
+    name: build
+    runs-on: macos-latest
+    steps:
+    - name: checkout
+      uses: actions/checkout@v1
+    - name: install mise
+      run: brew install mise
+    - name: mise install
+      run: mise install
+    - name: build
+      run: mise exec -- ./build.sh
+    - name: cleanup
+      run: rm bin/*.o bin/*.obj
+    - name: collect
+      uses: actions/upload-artifact@v4
+      with:
+        name: binaries
+        path: bin
