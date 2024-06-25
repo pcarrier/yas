@@ -1,8 +1,6 @@
 const builtin = @import("builtin");
 const c = @cImport({
     @cInclude("lua.h");
-    @cInclude("lauxlib.h");
-    @cInclude("lualib.h");
 });
 
 export fn luaopen_local(state: *c.lua_State) i32 {

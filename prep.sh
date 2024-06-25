@@ -1,5 +1,5 @@
 #!/bin/sh
-set -e
+set -ex
 mkdir -p bin lib
 export LUA_CPATH=./lib/?.so
 zig build-lib -femit-bin=lib/local.so -O ReleaseSmall -fstrip -dynamic -Ilua/src -fallow-shlib-undefined local.zig
