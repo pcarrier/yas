@@ -9,7 +9,7 @@ if #arg > 0 then
             error("Invalid argument: expected $os-$arch instead of " .. os_arch)
         end
         local o = p.operating_systems[os]
-        if not o then error("Invalid OS " .. os .. ": pass one of " .. tcat(keys(operating_systems), ", ")) end
+        if not o then error("Invalid OS " .. os .. ": pass one of " .. table.cat(utils.keys(operating_systems), ", ")) end
         build(o, arch)
     end
 else

@@ -14,9 +14,9 @@ jobs:
     - name: build
       run: mise exec -- ./build.sh
     - name: cleanup
-      run: rm bin/*.o bin/*.obj
+      run: rm out/*.o out/*.obj
     - name: collect
       uses: actions/upload-artifact@v4
       with:
         name: binaries
-        path: bin
+        path: out
