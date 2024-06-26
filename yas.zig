@@ -1,13 +1,136 @@
+const lua = @cImport({
+    @cInclude("lua.h");
+    @cInclude("lualib.h");
+    @cInclude("lauxlib.h");
+});
 const builtin = @import("builtin");
 const std = @import("std");
-const c = @import("c.zig");
+const Allocator = std.mem.Allocator;
 const license = @embedFile("LICENSE");
 const bootstrap = @embedFile("bootstrap.lua");
 const osTag = builtin.os.tag;
 const dirName = "yas.tools";
-const defaultBaseURL = "https://oh.yas.tools";
 
-fn dataDir(alloc: std.mem.Allocator) ![]u8 {
+const LuaErrorCode = enum(u3) {
+    ok = lua.LUA_OK,
+    run = lua.LUA_ERRRUN,
+    mem = lua.LUA_ERRMEM,
+    err = lua.LUA_ERRERR,
+    syntax = lua.LUA_ERRSYNTAX,
+    yield = lua.LUA_YIELD,
+    file = lua.LUA_ERRFILE,
+};
+
+const LuaError = error{ OK, RUN, MEM, ERR, SYNTAX, YIELD, FILE };
+
+fn luaError(code: LuaErrorCode) LuaError {
+    return switch (code) {
+        .ok => LuaError.OK,
+        .run => LuaError.RUN,
+        .mem => LuaError.MEM,
+        .err => LuaError.ERR,
+        .syntax => LuaError.SYNTAX,
+        .yield => LuaError.YIELD,
+        .file => LuaError.FILE,
+    };
+}
+
+pub const LuaState = *lua.lua_State;
+
+pub const Runtime = opaque {
+    const alignment = @alignOf(std.c.max_align_t);
+    fn alloc(data: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callconv(.C) ?*align(alignment) anyopaque {
+        const allocator_ptr: *Allocator = @ptrCast(@alignCast(data.?));
+        if (@as(?[*]align(alignment) u8, @ptrCast(@alignCast(ptr)))) |prev_ptr| {
+            const prev_slice = prev_ptr[0..osize];
+            if (nsize == 0) {
+                allocator_ptr.free(prev_slice);
+                return null;
+            }
+            const new_ptr = allocator_ptr.realloc(prev_slice, nsize) catch return null;
+            return new_ptr.ptr;
+        } else if (nsize == 0) {
+            return null;
+        } else {
+            const new_ptr = allocator_ptr.alignedAlloc(u8, alignment, nsize) catch return null;
+            return new_ptr.ptr;
+        }
+    }
+
+    pub fn init(allocator_ptr: *const Allocator) !*Runtime {
+        if (lua.lua_newstate(alloc, @constCast(allocator_ptr))) |state| {
+            return @ptrCast(state);
+        } else return error.Memory;
+    }
+
+    pub fn deinit(rt: *Runtime) void {
+        lua.lua_close(@ptrCast(rt));
+    }
+
+    pub fn run(rt: *Runtime, w: anytype, args: [][]u8, env: [][*:0]u8, data: []u8) !void {
+        const state: LuaState = @ptrCast(rt);
+        _ = lua.luaopen_base(state);
+        _ = lua.lua_pop(state, 1);
+        _ = lua.luaopen_package(state);
+        _ = lua.lua_getfield(state, -1, "preload");
+        const Package = struct {
+            name: []const u8,
+            load: lua.lua_CFunction,
+        };
+        const packages = &[_]Package{
+            Package{ .name = "coroutine", .load = lua.luaopen_coroutine },
+            Package{ .name = "table", .load = lua.luaopen_table },
+            Package{ .name = "io", .load = lua.luaopen_io },
+            Package{ .name = "os", .load = lua.luaopen_os },
+            Package{ .name = "string", .load = lua.luaopen_string },
+            Package{ .name = "math", .load = lua.luaopen_math },
+            Package{ .name = "utf8", .load = lua.luaopen_utf8 },
+            Package{ .name = "debug", .load = lua.luaopen_debug },
+        };
+
+        for (packages) |pkg| {
+            lua.lua_pushcfunction(state, pkg.load);
+            lua.lua_setfield(state, -2, pkg.name.ptr);
+        }
+
+        _ = lua.lua_pop(state, 3);
+
+        // Set _G['yas'] with env["VAR"] = val, arg[i], data
+        lua.lua_newtable(state);
+        lua.lua_newtable(state);
+
+        var i: c_int = -1;
+        for (args) |arg| {
+            _ = lua.lua_pushstring(state, arg.ptr);
+            _ = lua.lua_rawseti(state, -2, i);
+            i += 1;
+        }
+        _ = lua.lua_setfield(state, -2, "args");
+        lua.lua_newtable(state);
+        for (env) |ev| {
+            _ = lua.lua_pushstring(state, ev);
+            _ = lua.lua_rawseti(state, -2, @intCast(lua.lua_rawlen(state, -2) + 1));
+        }
+        _ = lua.lua_setfield(state, -2, "env");
+        _ = lua.lua_pushlstring(state, data.ptr, data.len);
+        _ = lua.lua_setfield(state, -2, "data");
+        _ = lua.lua_pushlstring(state, license.ptr, license.len);
+        _ = lua.lua_setfield(state, -2, "license");
+        lua.lua_setglobal(state, "yas");
+
+        // XXX Actual run
+        const loadCode: LuaErrorCode = @enumFromInt(lua.luaL_loadbufferx(state, bootstrap, bootstrap.len, "<bootstrap>", null));
+        if (loadCode != .ok) return luaError(loadCode);
+        const callCode: LuaErrorCode = @enumFromInt(lua.lua_pcallk(state, 0, 0, 0, 0, null));
+        if (callCode != .ok) {
+            const msg = lua.lua_tolstring(state, -1, null);
+            try w.print("Error: {s}\n", .{msg});
+        }
+        // XXX Actual run
+    }
+};
+
+fn dataDir(alloc: Allocator) ![]u8 {
     if (osTag == .windows) {
         const appData = try std.process.getEnvVarOwned(alloc, "APPDATA");
         defer alloc.free(appData);
@@ -24,33 +147,16 @@ fn dataDir(alloc: std.mem.Allocator) ![]u8 {
     }
 }
 
-pub fn help(w: anytype, name: []u8) !void {
-    try w.print("Usage: {s} [--help|--license|URL [args...]]", .{name});
-}
-
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
     const stderr = std.io.getStdErr();
     const w = stderr.writer();
     const args = try std.process.argsAlloc(alloc);
-    defer alloc.free(args);
-    if (args.len == 1) {
-        try help(w, args[0]);
-        std.process.exit(1);
-    }
-    const cmd = args[1];
-    if (std.mem.eql(u8, cmd, "--help")) {
-        try help(w, args[0]);
-        std.process.exit(0);
-    } else if (std.mem.eql(u8, cmd, "--license")) {
-        _ = try w.write(license);
-        std.process.exit(0);
-    }
+    defer std.process.argsFree(alloc, args);
     const data = try dataDir(alloc);
     defer alloc.free(data);
     try std.fs.cwd().makePath(data);
-    const baseURL = std.process.getEnvVarOwned(alloc, "YAS_BASE") catch defaultBaseURL;
-    try w.print("baseURL: {s}, args: {s}\n", .{ baseURL, args });
-    const lua = try c.Lua.init(&alloc);
-    defer lua.deinit();
+    const rt = try Runtime.init(&alloc);
+    defer rt.deinit();
+    try rt.run(w, args, std.os.environ, data);
 }

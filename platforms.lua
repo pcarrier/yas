@@ -4,7 +4,7 @@ return {
       short = "macos",
       cmake = "Darwin",
       zig = "macos",
-      curlcflags = "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+      cflags = "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks -L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
       abi = "",
     },
     linux = {

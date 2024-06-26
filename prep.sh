@@ -2,7 +2,7 @@
 set -ex
 mkdir -p lib out
 export LUA_CPATH=./lib/?.so
-zig build-lib -femit-bin=lib/local.so -O ReleaseSmall -fstrip -dynamic -Ideps/lua/src -fallow-shlib-undefined local.zig
+zig build-lib -femit-bin=lib/buildalib.so -O ReleaseSmall -fstrip -dynamic -Ideps/lua/src -fallow-shlib-undefined buildalib.zig
 zig build-exe -femit-bin=bin/builda -O ReleaseSmall -fstrip -lc -DLUA_USE_DLOPEN \
 deps/lua/src/lua.c \
 deps/lua/src/lapi.c \

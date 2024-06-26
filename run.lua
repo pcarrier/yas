@@ -1,9 +1,9 @@
 local utils = require("utils")
 local build = require("builds")
 local p = require("platforms")
-local l = require("local")
+local b = require("buildalib")
 
-local o = p.operating_systems[l.os]
+local o = p.operating_systems[b.os]
 if not o then error("Invalid OS " .. l.os) end
-local exe = build(o, l.arch)
+local exe = build(o, b.arch)
 utils.exec(exe, ...)
