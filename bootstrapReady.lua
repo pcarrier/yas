@@ -1,0 +1,5 @@
+local b = require("buildalib")
+local bootstrap = assert(loadfile("bootstrap.lua"))
+local dest = io.open("bootstrap.luac", "w+")
+dest:write(b.dump(bootstrap))
+dest:close()

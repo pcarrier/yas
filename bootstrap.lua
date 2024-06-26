@@ -10,7 +10,7 @@ local function str (x)
     return type(x) == "string" and ("%q"):format(x) or tostring(x)
 end
 
-do -- turn A=B entries into a nice map
+do
     local args = yas.args
     local script = args[0]
 
@@ -22,6 +22,7 @@ do -- turn A=B entries into a nice map
         return
     end
 
+    -- turn yas.env from "A=B" to ["A"] = "B"
     local sillyEnv = yas.env
     local env = {}
     for _, e in next, sillyEnv do

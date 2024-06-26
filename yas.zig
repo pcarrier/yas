@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const license = @embedFile("LICENSE");
-const bootstrap = @embedFile("bootstrap.lua");
+const bootstrap = @embedFile("bootstrap.luac");
 const osTag = builtin.os.tag;
 const dirName = "yas.tools";
 

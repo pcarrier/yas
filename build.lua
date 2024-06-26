@@ -2,6 +2,8 @@ local utils = require("utils")
 local build = require("builds")
 local p = require("platforms")
 
+require("bootstrapReady")
+
 if #arg > 0 then
     for _, os_arch in ipairs(arg) do
         local os, arch = os_arch:match("([^-]+)-([^-]+)")
