@@ -1,7 +1,12 @@
+local find = require("string").find
+local execute = require("os").execute
+local tcat = require("table").concat
+local write = require("io").write
+
 local M = {}
 
 local function squote(s)
-  if not s:find("[\'\"%s]") then return s end
+  if not find(s, "[\'\"%s]") then return s end
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
@@ -19,9 +24,9 @@ end
 M.map = map
 
 function M.exec(...)
-  local cmd = table.concat(map({ ... }, squote), " ")
-  io.write('$ ', cmd, "\n")
-  assert(os.execute(cmd))
+  local cmd = tcat(map({ ... }, squote), " ")
+  write('$ ', cmd, "\n")
+  assert(execute(cmd))
 end
 
 return M

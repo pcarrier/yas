@@ -1,4 +1,6 @@
+local getenv = require("os").getenv
 local utils = require("utils")
+local table = require("table")
 local exec, map = utils.exec, utils.map
 
 local lua_files = {
@@ -14,7 +16,7 @@ local zlib_files = {
 }
 
 return function(o, a)
-    local pwd = os.getenv("PWD")
+    local pwd = getenv("PWD")
     local zigcc, zigcpp, zigar, zigranlib =
         pwd .. "/bin/zigcc", pwd .. "/bin/zigcpp", pwd .. "/bin/zigar", pwd .. "/bin/zigranlib"
     local zig_target = a .. "-" .. o.zig
@@ -147,6 +149,7 @@ return function(o, a)
         "-DCMAKE_SYSTEM_NAME=" .. o.cmake,
         "-DCMAKE_SYSTEM_PROCESSOR=" .. a,
         "-DCMAKE_C_COMPILER=" .. zigcc,
+        "-DCMAKE_CXX_COMPILER=" .. zigcpp,
         "-DCMAKE_AR=" .. zigar,
         "-DCMAKE_RANLIB=" .. zigranlib,
         "-DCMAKE_C_COMPILER_ABI=" .. o.abi,

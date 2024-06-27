@@ -118,15 +118,13 @@ pub const Runtime = opaque {
         _ = lua.lua_setfield(state, -2, "license");
         lua.lua_setglobal(state, "yas");
 
-        // XXX Actual run
-        const loadCode: LuaErrorCode = @enumFromInt(lua.luaL_loadbufferx(state, bootstrap, bootstrap.len, "<bootstrap>", null));
+        const loadCode: LuaErrorCode = @enumFromInt(lua.luaL_loadbufferx(state, bootstrap, bootstrap.len, "bootstrap", null));
         if (loadCode != .ok) return luaError(loadCode);
         const callCode: LuaErrorCode = @enumFromInt(lua.lua_pcallk(state, 0, 0, 0, 0, null));
         if (callCode != .ok) {
             const msg = lua.lua_tolstring(state, -1, null);
             try w.print("Error: {s}\n", .{msg});
         }
-        // XXX Actual run
     }
 };
 

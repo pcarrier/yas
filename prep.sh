@@ -1,10 +1,8 @@
 #!/bin/sh
 set -ex
 mkdir -p lib out
-export LUA_CPATH=./lib/?.so
-zig build-lib -femit-bin=lib/buildalib.so -O ReleaseSmall -fstrip -dynamic -Ideps/lua/src -fallow-shlib-undefined buildalib.zig
-zig build-exe -femit-bin=bin/builda -O ReleaseSmall -fstrip -lc -DLUA_USE_DLOPEN \
-deps/lua/src/lua.c \
+zig build-exe -femit-bin=bin/builda -O ReleaseSmall -fstrip -lc -Ideps/lua/src \
+builda/builda.zig \
 deps/lua/src/lapi.c \
 deps/lua/src/lcode.c \
 deps/lua/src/lctype.c \
