@@ -170,7 +170,7 @@ return function(o, a)
         "env", "ZIG_FLAGS=-target " .. zig_target,
         "DESTDIR=.", "ninja", "-C", "lib/ngtcp2-" .. zig_target, "install"
     )
-    exec(
+    local curlCmake = {
         "env", "ZIG_FLAGS=-target " .. zig_target, "CC=" .. zigcc, "CFLAGS=" .. (o.cflags or ""),
         "cmake", "-GNinja",
         "-DCMAKE_CROSSCOMPILING=ON",
@@ -205,7 +205,11 @@ return function(o, a)
         "-DNGTCP2_INCLUDE_DIR=" .. pwd .. "/lib/ngtcp2-" .. zig_target .. "/usr/local/include",
         "-DCMAKE_BUILD_TYPE=MinSizeRel",
         "deps/curl", "-B", "lib/curl-" .. zig_target
-    )
+    }
+    for _, v in ipairs(o.curlconf or {}) do
+        table.insert(curlCmake, v)
+    end
+    exec(table.unpack(curlCmake))
     exec(
         "env", "ZIG_FLAGS=-target " .. zig_target,
         "DESTDIR=.", "ninja", "-C", "lib/curl-" .. zig_target, "install"

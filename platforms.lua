@@ -6,6 +6,7 @@ return {
       zig = "macos",
       cflags = "-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks -L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
       abi = "",
+      curlconf = { "-DCURL_CA_BUNDLE=/etc/ssl/cert.pem" },
     },
     linux = {
       short = "linux",
