@@ -5,9 +5,12 @@ const lua = @cImport({
 });
 const builtin = @import("builtin");
 const std = @import("std");
-const Allocator = std.mem.Allocator;
+const pkg = @import("./packages.zig");
+
 const license = @embedFile("LICENSE");
 const bootstrap = @embedFile("bootstrap.luac");
+
+const Allocator = std.mem.Allocator;
 const osTag = builtin.os.tag;
 const dirName = "yas.tools";
 
@@ -19,7 +22,7 @@ const LuaErrorCode = enum(u3) {
     syntax = lua.LUA_ERRSYNTAX,
     yield = lua.LUA_YIELD,
     file = lua.LUA_ERRFILE,
-};
+    };
 
 const LuaError = error{ OK, RUN, MEM, ERR, SYNTAX, YIELD, FILE };
 
@@ -70,32 +73,17 @@ pub const Runtime = opaque {
     pub fn run(rt: *Runtime, w: anytype, args: [][]u8, env: [][*:0]u8, data: []u8) !void {
         const state: LuaState = @ptrCast(rt);
         _ = lua.luaopen_base(state);
-        _ = lua.lua_pop(state, 1);
         _ = lua.luaopen_package(state);
+        _ = lua.lua_pushvalue(state, -1);
+        _ = lua.lua_setfield(state, 1, "package");
         _ = lua.lua_getfield(state, -1, "preload");
-        const Package = struct {
-            name: []const u8,
-            load: lua.lua_CFunction,
-        };
-        const packages = &[_]Package{
-            Package{ .name = "coroutine", .load = lua.luaopen_coroutine },
-            Package{ .name = "table", .load = lua.luaopen_table },
-            Package{ .name = "io", .load = lua.luaopen_io },
-            Package{ .name = "os", .load = lua.luaopen_os },
-            Package{ .name = "string", .load = lua.luaopen_string },
-            Package{ .name = "math", .load = lua.luaopen_math },
-            Package{ .name = "utf8", .load = lua.luaopen_utf8 },
-            Package{ .name = "debug", .load = lua.luaopen_debug },
-        };
-
-        for (packages) |pkg| {
-            lua.lua_pushcfunction(state, pkg.load);
-            lua.lua_setfield(state, -2, pkg.name.ptr);
+        for (pkg.packages) |p| {
+            lua.lua_pushcfunction(state, p.load);
+            lua.lua_setfield(state, -2, p.name.ptr);
         }
+        _ = lua.lua_pop(state, 4);
 
-        _ = lua.lua_pop(state, 3);
-
-        // Set _G['yas'] with env["VAR"] = val, arg[i], data
+        // Set _G["yas"] with env["VAR"] = val, arg[i], data
         lua.lua_newtable(state);
         lua.lua_newtable(state);
 
@@ -126,7 +114,7 @@ pub const Runtime = opaque {
             try w.print("Error: {s}\n", .{msg});
         }
     }
-};
+    };
 
 fn dataDir(alloc: Allocator) ![]u8 {
     if (osTag == .windows) {
