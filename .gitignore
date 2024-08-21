@@ -1,8 +1,1 @@
-*.o
-*.luac
-/.idea/
-/.vscode/
-/bin/builda
-/lib/
-/node_modules/
-/out/
+bin/

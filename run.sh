@@ -1,5 +1,4 @@
 #!/bin/sh
-set -e
-cd "$(dirname "$0")"
-. ./prep.sh
-exec ./bin/builda run.lua "$@"
+cd "$(dirname $0)"
+set -eux
+go run . "$@"

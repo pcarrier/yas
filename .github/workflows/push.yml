@@ -6,17 +6,13 @@ jobs:
     runs-on: macos-latest
     steps:
     - name: checkout
-      uses: actions/checkout@v1
-    - name: install mise
-      run: brew install mise
-    - name: mise install
-      run: mise install
+      uses: actions/checkout@v4
+    - run: brew install mise
+    - run: mise install
     - name: build
       run: mise exec -- ./build.sh
-    - name: cleanup
-      run: rm out/*.o out/*.obj
     - name: collect
       uses: actions/upload-artifact@v4
       with:
         name: binaries
-        path: out
+        path: bin
