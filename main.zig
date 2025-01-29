@@ -84,8 +84,8 @@ fn WindowProc(hWnd: win32.HWND, msg: c_uint, wParam: win32.WPARAM, lParam: win32
                     @ptrCast(&tfOut),
                 );
                 g_textFormat = tfOut;
-                _ = g_textFormat.?.SetTextAlignment(win32.DWRITE_TEXT_ALIGNMENT_LEADING);
-                _ = g_textFormat.?.SetParagraphAlignment(win32.DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                _ = g_textFormat.?.SetTextAlignment(win32.DWRITE_TEXT_ALIGNMENT_CENTER);
+                _ = g_textFormat.?.SetParagraphAlignment(win32.DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             }
 
             if (g_bigTextFormat == null) {
@@ -101,8 +101,8 @@ fn WindowProc(hWnd: win32.HWND, msg: c_uint, wParam: win32.WPARAM, lParam: win32
                     @ptrCast(&tfBigOut),
                 );
                 g_bigTextFormat = tfBigOut;
-                _ = g_bigTextFormat.?.SetTextAlignment(win32.DWRITE_TEXT_ALIGNMENT_LEADING);
-                _ = g_bigTextFormat.?.SetParagraphAlignment(win32.DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                _ = g_bigTextFormat.?.SetTextAlignment(win32.DWRITE_TEXT_ALIGNMENT_CENTER);
+                _ = g_bigTextFormat.?.SetParagraphAlignment(win32.DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             }
 
             // Get client size
@@ -197,42 +197,36 @@ fn WindowProc(hWnd: win32.HWND, msg: c_uint, wParam: win32.WPARAM, lParam: win32
                 win32.DWRITE_MEASURING_MODE_NATURAL,
             );
 
-            // ---- Draw smaller text (no cursor) below ----
             var y: f32 = adjustedBigTextHeight;
-            // If small text is 0 in width or height, skip tiling
-            if (smallTextWidth >= 1.0 and smallTextHeight >= 1.0) {
-                const smallRows = @divTrunc(clientHeight - y, smallTextHeight);
-                var row_index: f32 = 0;
-                while (row_index < smallRows) : (row_index += 1) {
-                    const cols = @divTrunc(clientWidth, smallTextWidth);
-                    var x2 = (clientWidth - (cols * smallTextWidth)) / 2;
+            const smallRows = @divTrunc(clientHeight - y, smallTextHeight);
+            var row_index: f32 = 0;
+            while (row_index < smallRows) : (row_index += 1) {
+                const cols = @divTrunc(clientWidth, smallTextWidth);
+                var x2 = (clientWidth - (cols * smallTextWidth)) / 2;
 
-                    var col_index: f32 = 0;
-                    while (col_index < cols) : (col_index += 1) {
-                        const layoutRectSmall = win32.D2D_RECT_F{
-                            .left = x2,
-                            .top = y,
-                            .right = x2 + smallTextWidth,
-                            .bottom = y + smallTextHeight,
-                        };
+                var col_index: f32 = 0;
+                while (col_index < cols) : (col_index += 1) {
+                    const layoutRectSmall = win32.D2D_RECT_F{
+                        .left = x2,
+                        .top = y,
+                        .right = x2 + smallTextWidth,
+                        .bottom = y + smallTextHeight,
+                    };
 
-                        g_renderTarget.?.ID2D1RenderTarget.DrawText(
-                            text_ptr,
-                            text_len,
-                            g_textFormat,
-                            &layoutRectSmall,
-                            @ptrCast(g_brush),
-                            win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
-                            win32.DWRITE_MEASURING_MODE_NATURAL,
-                        );
+                    g_renderTarget.?.ID2D1RenderTarget.DrawText(
+                        text_ptr,
+                        text_len,
+                        g_textFormat,
+                        &layoutRectSmall,
+                        @ptrCast(g_brush),
+                        win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        win32.DWRITE_MEASURING_MODE_NATURAL,
+                    );
 
-                        x2 += smallTextWidth;
-                    }
-                    y += smallTextHeight;
+                    x2 += smallTextWidth;
                 }
+                y += smallTextHeight;
             }
-
-            // Clean up
             _ = cursorBrushOut.?.IUnknown.Release();
             _ = layoutBig.?.IUnknown.Release();
             _ = layoutSmall.?.IUnknown.Release();
@@ -252,7 +246,6 @@ fn WindowProc(hWnd: win32.HWND, msg: c_uint, wParam: win32.WPARAM, lParam: win32
                         _ = win32.InvalidateRect(hWnd, null, 1);
                     }
                 },
-                0x0A, 0x0D => {}, // Ignore CR/LF
                 0...7, 9, 0x0B, 0x0C, 0x0E...0x1F => {}, // Ignore other control characters
                 else => { // Accept all other Unicode characters
                     if (g_text_len < g_text_buffer.len - 1) { // Leave room for null terminator
