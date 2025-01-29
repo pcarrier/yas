@@ -148,14 +148,9 @@ fn WindowProc(hWnd: win32.HWND, msg: c_uint, wParam: win32.WPARAM, lParam: win32
             const smallTextHeight = smallMetrics.height;
 
             // Prevent zero height/width for big text so we can still show a cursor
-            var adjustedBigTextWidth = bigTextWidth;
             var adjustedBigTextHeight = bigTextHeight;
             if (adjustedBigTextHeight < 1.0) {
                 adjustedBigTextHeight = 64.0; // some fallback
-            }
-            if (adjustedBigTextWidth < 1.0) {
-                // 40% of the fallback height, for a narrow area to place the cursor
-                adjustedBigTextWidth = adjustedBigTextHeight * 0.4;
             }
 
             // Brush for cursor fade -> now a static brush
@@ -166,12 +161,30 @@ fn WindowProc(hWnd: win32.HWND, msg: c_uint, wParam: win32.WPARAM, lParam: win32
                 @ptrCast(&cursorBrushOut),
             );
 
+            // NEW: Use HitTestTextPosition to handle multiline.
+            var caretX: f32 = 0;
+            var caretY: f32 = 0;
+            var hitMetrics: win32.DWRITE_HIT_TEST_METRICS = undefined;
+            _ = layoutBig.?.HitTestTextPosition(text_len, 0, &caretX, &caretY, &hitMetrics);
+
+            // NEW: add the x offset to caretX
+            caretX += (clientWidth - bigTextWidth) / 2;
+
+            const cursorWidth = 12.0;
+            const cursorRect = win32.D2D_RECT_F{
+                .left = caretX,
+                .top = caretY,
+                .right = caretX + cursorWidth,
+                .bottom = caretY + hitMetrics.height,
+            };
+            g_renderTarget.?.ID2D1RenderTarget.FillRectangle(&cursorRect, @ptrCast(cursorBrushOut));
+
             // ---- Draw the first line (big text) once ----
-            const x: f32 = (clientWidth - adjustedBigTextWidth) / 2;
+            const x: f32 = (clientWidth - bigTextWidth) / 2;
             const layoutRect = win32.D2D_RECT_F{
                 .left = x,
                 .top = 0,
-                .right = x + adjustedBigTextWidth,
+                .right = x + bigTextWidth,
                 .bottom = adjustedBigTextHeight,
             };
             g_renderTarget.?.ID2D1RenderTarget.DrawText(
@@ -183,15 +196,6 @@ fn WindowProc(hWnd: win32.HWND, msg: c_uint, wParam: win32.WPARAM, lParam: win32
                 win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
                 win32.DWRITE_MEASURING_MODE_NATURAL,
             );
-            // Cursor
-            const cursorWidth = adjustedBigTextHeight * 0.1;
-            const cursorRect = win32.D2D_RECT_F{
-                .left = x + adjustedBigTextWidth - cursorWidth,
-                .top = 0,
-                .right = x + adjustedBigTextWidth,
-                .bottom = adjustedBigTextHeight,
-            };
-            g_renderTarget.?.ID2D1RenderTarget.FillRectangle(&cursorRect, @ptrCast(cursorBrushOut));
 
             // ---- Draw smaller text (no cursor) below ----
             var y: f32 = adjustedBigTextHeight;
