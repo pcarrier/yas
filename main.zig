@@ -19,12 +19,6 @@ var g_bigTextFormat: ?*win32.IDWriteTextFormat = null;
 const CLASS_NAME = L("YasWindowClass");
 const WINDOW_NAME = L("Hello world");
 
-fn getTime() f32 {
-    var counter: win32.LARGE_INTEGER = undefined;
-    _ = win32.QueryPerformanceCounter(&counter);
-    return @as(f32, @floatFromInt(counter.QuadPart)) / 10_000_000.0;
-}
-
 fn WindowProc(hWnd: win32.HWND, msg: c_uint, wParam: win32.WPARAM, lParam: win32.LPARAM) callconv(std.os.windows.WINAPI) win32.LRESULT {
     switch (msg) {
         win32.WM_DESTROY => {
@@ -115,121 +109,123 @@ fn WindowProc(hWnd: win32.HWND, msg: c_uint, wParam: win32.WPARAM, lParam: win32
             const text_ptr = @as([*:0]const u16, &g_text_buffer);
             const text_len: u32 = @intCast(g_text_len);
 
-            // 1) Layout for big text
-            var layoutBig: ?*win32.IDWriteTextLayout = null;
-            _ = g_writeFactory.?.CreateTextLayout(
-                text_ptr,
-                text_len,
-                g_bigTextFormat,
-                clientWidth,
-                clientHeight,
-                @ptrCast(&layoutBig),
-            );
-            var bigMetrics: win32.DWRITE_TEXT_METRICS = undefined;
-            _ = layoutBig.?.GetMetrics(&bigMetrics);
+            // Default metrics for empty text
+            var bigTextWidth: f32 = 0;
+            var bigTextHeight: f32 = 64.0; // Default height for empty text
+            var smallTextWidth: f32 = 0;
+            var smallTextHeight: f32 = 32.0; // Default height for empty text
 
-            const bigTextWidth = bigMetrics.widthIncludingTrailingWhitespace;
-            const bigTextHeight = bigMetrics.height;
+            // Only create layouts if we have text
+            if (text_len > 0) {
+                // 1) Layout for big text
+                var layoutBig: ?*win32.IDWriteTextLayout = null;
+                _ = g_writeFactory.?.CreateTextLayout(
+                    text_ptr,
+                    text_len,
+                    g_bigTextFormat,
+                    clientWidth,
+                    clientHeight,
+                    @ptrCast(&layoutBig),
+                );
+                var bigMetrics: win32.DWRITE_TEXT_METRICS = undefined;
+                _ = layoutBig.?.GetMetrics(&bigMetrics);
 
-            // 2) Layout for small text
-            var layoutSmall: ?*win32.IDWriteTextLayout = null;
-            _ = g_writeFactory.?.CreateTextLayout(
-                text_ptr,
-                text_len,
-                g_textFormat,
-                clientWidth,
-                clientHeight,
-                @ptrCast(&layoutSmall),
-            );
-            var smallMetrics: win32.DWRITE_TEXT_METRICS = undefined;
-            _ = layoutSmall.?.GetMetrics(&smallMetrics);
+                bigTextWidth = bigMetrics.widthIncludingTrailingWhitespace;
+                bigTextHeight = bigMetrics.height;
 
-            const smallTextWidth = smallMetrics.widthIncludingTrailingWhitespace;
-            const smallTextHeight = smallMetrics.height;
+                // 2) Layout for small text
+                var layoutSmall: ?*win32.IDWriteTextLayout = null;
+                _ = g_writeFactory.?.CreateTextLayout(
+                    text_ptr,
+                    text_len,
+                    g_textFormat,
+                    clientWidth,
+                    clientHeight,
+                    @ptrCast(&layoutSmall),
+                );
+                var smallMetrics: win32.DWRITE_TEXT_METRICS = undefined;
+                _ = layoutSmall.?.GetMetrics(&smallMetrics);
 
-            // Prevent zero height/width for big text so we can still show a cursor
-            var adjustedBigTextHeight = bigTextHeight;
-            if (adjustedBigTextHeight < 1.0) {
-                adjustedBigTextHeight = 64.0; // some fallback
+                smallTextWidth = smallMetrics.widthIncludingTrailingWhitespace;
+                smallTextHeight = smallMetrics.height;
+
+                // Release layouts
+                _ = layoutBig.?.IUnknown.Release();
+                _ = layoutSmall.?.IUnknown.Release();
             }
 
-            // Brush for cursor fade -> now a static brush
+            // Brush for cursor
             var cursorBrushOut: ?*win32.ID2D1SolidColorBrush = null;
             _ = g_renderTarget.?.ID2D1RenderTarget.CreateSolidColorBrush(
-                &.{ .r = 1, .g = 1, .b = 1, .a = 1.0 }, // Removed pulse, alpha is always 1
+                &.{ .r = 1, .g = 1, .b = 1, .a = 1.0 },
                 null,
                 @ptrCast(&cursorBrushOut),
             );
 
-            // NEW: Use HitTestTextPosition to handle multiline.
-            var caretX: f32 = 0;
-            var caretY: f32 = 0;
-            var hitMetrics: win32.DWRITE_HIT_TEST_METRICS = undefined;
-            _ = layoutBig.?.HitTestTextPosition(text_len, 0, &caretX, &caretY, &hitMetrics);
-
-            // NEW: add the x offset to caretX
-            caretX += (clientWidth - bigTextWidth) / 2;
-
+            // Draw cursor at the appropriate position
             const cursorWidth = 12.0;
             const cursorRect = win32.D2D_RECT_F{
-                .left = caretX,
-                .top = caretY,
-                .right = caretX + cursorWidth,
-                .bottom = caretY + hitMetrics.height,
+                .left = (clientWidth - cursorWidth) / 2,
+                .top = 0,
+                .right = (clientWidth + cursorWidth) / 2,
+                .bottom = bigTextHeight,
             };
             g_renderTarget.?.ID2D1RenderTarget.FillRectangle(&cursorRect, @ptrCast(cursorBrushOut));
 
-            // ---- Draw the first line (big text) once ----
-            const x: f32 = (clientWidth - bigTextWidth) / 2;
-            const layoutRect = win32.D2D_RECT_F{
-                .left = x,
-                .top = 0,
-                .right = x + bigTextWidth,
-                .bottom = adjustedBigTextHeight,
-            };
-            g_renderTarget.?.ID2D1RenderTarget.DrawText(
-                text_ptr,
-                text_len,
-                g_bigTextFormat,
-                &layoutRect,
-                @ptrCast(g_brush),
-                win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
-                win32.DWRITE_MEASURING_MODE_NATURAL,
-            );
+            // Draw text only if we have content
+            if (text_len > 0) {
+                // Draw the first line (big text) once
+                const x: f32 = (clientWidth - bigTextWidth) / 2;
+                const layoutRect = win32.D2D_RECT_F{
+                    .left = x,
+                    .top = 0,
+                    .right = x + bigTextWidth,
+                    .bottom = bigTextHeight,
+                };
+                g_renderTarget.?.ID2D1RenderTarget.DrawText(
+                    text_ptr,
+                    text_len,
+                    g_bigTextFormat,
+                    &layoutRect,
+                    @ptrCast(g_brush),
+                    win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    win32.DWRITE_MEASURING_MODE_NATURAL,
+                );
 
-            var y: f32 = adjustedBigTextHeight;
-            const smallRows = @divTrunc(clientHeight - y, smallTextHeight);
-            var row_index: f32 = 0;
-            while (row_index < smallRows) : (row_index += 1) {
-                const cols = @divTrunc(clientWidth, smallTextWidth);
-                var x2 = (clientWidth - (cols * smallTextWidth)) / 2;
+                // Draw small text copies
+                var y: f32 = bigTextHeight;
+                const smallRows = @divTrunc(clientHeight - y, smallTextHeight);
+                var row_index: f32 = 0;
+                while (row_index < smallRows) : (row_index += 1) {
+                    const cols = @divTrunc(clientWidth, smallTextWidth);
+                    var x2 = (clientWidth - (cols * smallTextWidth)) / 2;
 
-                var col_index: f32 = 0;
-                while (col_index < cols) : (col_index += 1) {
-                    const layoutRectSmall = win32.D2D_RECT_F{
-                        .left = x2,
-                        .top = y,
-                        .right = x2 + smallTextWidth,
-                        .bottom = y + smallTextHeight,
-                    };
+                    var col_index: f32 = 0;
+                    while (col_index < cols) : (col_index += 1) {
+                        const layoutRectSmall = win32.D2D_RECT_F{
+                            .left = x2,
+                            .top = y,
+                            .right = x2 + smallTextWidth,
+                            .bottom = y + smallTextHeight,
+                        };
 
-                    g_renderTarget.?.ID2D1RenderTarget.DrawText(
-                        text_ptr,
-                        text_len,
-                        g_textFormat,
-                        &layoutRectSmall,
-                        @ptrCast(g_brush),
-                        win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
-                        win32.DWRITE_MEASURING_MODE_NATURAL,
-                    );
+                        g_renderTarget.?.ID2D1RenderTarget.DrawText(
+                            text_ptr,
+                            text_len,
+                            g_textFormat,
+                            &layoutRectSmall,
+                            @ptrCast(g_brush),
+                            win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            win32.DWRITE_MEASURING_MODE_NATURAL,
+                        );
 
-                    x2 += smallTextWidth;
+                        x2 += smallTextWidth;
+                    }
+                    y += smallTextHeight;
                 }
-                y += smallTextHeight;
             }
+
             _ = cursorBrushOut.?.IUnknown.Release();
-            _ = layoutBig.?.IUnknown.Release();
-            _ = layoutSmall.?.IUnknown.Release();
 
             _ = g_renderTarget.?.ID2D1RenderTarget.EndDraw(null, null);
 
