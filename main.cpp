@@ -2,10 +2,18 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <string>
+#include <iostream>
 #include <stdexcept>
+#include <vector>
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
+
+inline void ThrowIfFailed(HRESULT hr, const char* message) {
+    if (FAILED(hr)) {
+        throw std::runtime_error(message);
+    }
+}
 
 // RAII helper for COM initialization
 struct ComInit {
@@ -33,37 +41,26 @@ struct ComInit {
 static constexpr const wchar_t *CLASS_NAME = L"YasWindowClass";
 static constexpr const wchar_t *WINDOW_NAME = L"YAS!";
 
-// Forward declaration of our Win32 window procedure
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 class App {
 public:
     App(HINSTANCE hInstance) {
-        // Initialize COM via RAII
-        // (We keep a member ComInit object or create one on the stack in wWinMain.)
-        // In this example, we'll do it externally in wWinMain so the entire app has COM.
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
-        text_ = WINDOW_NAME; // initial text
+        texts_.push_back(L"YAS!");
 
         // Create Direct2D factory
-        HRESULT hr = D2D1CreateFactory(
-            D2D1_FACTORY_TYPE_SINGLE_THREADED,
-            d2dFactory_.GetAddressOf()
+        ThrowIfFailed(
+            D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory_.GetAddressOf()),
+            "Failed to create Direct2D factory"
         );
-        if (FAILED(hr) || !d2dFactory_) {
-            throw std::runtime_error("Failed to create Direct2D factory");
-        }
 
         // Create DirectWrite factory
-        hr = DWriteCreateFactory(
-            DWRITE_FACTORY_TYPE_SHARED,
-            __uuidof(IDWriteFactory),
-            reinterpret_cast<IUnknown **>(writeFactory_.GetAddressOf())
+        ThrowIfFailed(
+            DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                reinterpret_cast<IUnknown **>(writeFactory_.GetAddressOf())),
+            "Failed to create DirectWrite factory"
         );
-        if (FAILED(hr) || !writeFactory_) {
-            throw std::runtime_error("Failed to create DirectWrite factory");
-        }
 
         // Retrieve user locale. If it fails, fall back to 'en-us'.
         wchar_t localeName[LOCALE_NAME_MAX_LENGTH] = {};
@@ -72,32 +69,30 @@ public:
         }
 
         // Create text formats (small and big)
-        hr = writeFactory_->CreateTextFormat(
-            WINDOW_NAME,
-            nullptr,
-            DWRITE_FONT_WEIGHT_REGULAR,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            16.0f,
-            localeName,
-            textFormat_.GetAddressOf()
+        ThrowIfFailed(
+            writeFactory_->CreateTextFormat(
+                WINDOW_NAME,
+                nullptr,
+                DWRITE_FONT_WEIGHT_REGULAR,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                12.0f,
+                localeName,
+                textFormat_.GetAddressOf()),
+            "Failed to create small textFormat"
         );
-        if (FAILED(hr) || !textFormat_) {
-            throw std::runtime_error("Failed to create small textFormat");
-        }
-        hr = writeFactory_->CreateTextFormat(
-            WINDOW_NAME,
-            nullptr,
-            DWRITE_FONT_WEIGHT_BOLD,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            32.0f,
-            localeName,
-            bigTextFormat_.GetAddressOf()
+        ThrowIfFailed(
+            writeFactory_->CreateTextFormat(
+                WINDOW_NAME,
+                nullptr,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                24.0f,
+                localeName,
+                bigTextFormat_.GetAddressOf()),
+            "Failed to create big textFormat"
         );
-        if (FAILED(hr) || !bigTextFormat_) {
-            throw std::runtime_error("Failed to create big textFormat");
-        }
 
         // Register the window class
         WNDCLASSEXW wc{};
@@ -141,8 +136,7 @@ public:
             nullptr,
             nullptr,
             hInstance,
-            this
-        );
+            this);
 
         if (!hwnd_) {
             throw std::runtime_error("CreateWindowExW failed");
@@ -151,34 +145,36 @@ public:
         // Create the render target
         RECT rc{};
         GetClientRect(hwnd_, &rc);
-        D2D1_SIZE_U size = D2D1::SizeU(
-            static_cast<UINT>(rc.right - rc.left),
-            static_cast<UINT>(rc.bottom - rc.top)
+        ThrowIfFailed(
+            d2dFactory_->CreateHwndRenderTarget(
+                D2D1::RenderTargetProperties(),
+                D2D1::HwndRenderTargetProperties(hwnd_,
+                    D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
+                &renderTarget_),
+            "Failed to create HwndRenderTarget"
         );
-        hr = d2dFactory_->CreateHwndRenderTarget(
-            D2D1::RenderTargetProperties(),
-            D2D1::HwndRenderTargetProperties(hwnd_, size),
-            &renderTarget_
-        );
-        if (FAILED(hr) || !renderTarget_) {
-            throw std::runtime_error("Failed to create HwndRenderTarget");
-        }
 
         // Create brushes
-        hr = renderTarget_->CreateSolidColorBrush(
-            D2D1::ColorF(1, 1, 1, 1), // white
-            &brush_
+        ThrowIfFailed(
+            renderTarget_->CreateSolidColorBrush(
+                D2D1::ColorF(1, 1, 1, 1), // white
+                &brush_),
+            "Failed to create white brush"
         );
-        if (FAILED(hr) || !brush_) {
-            throw std::runtime_error("Failed to create white brush");
-        }
-        hr = renderTarget_->CreateSolidColorBrush(
-            D2D1::ColorF(1, 0, 0, 1), // red
-            &redBrush_
+        ThrowIfFailed(
+            renderTarget_->CreateSolidColorBrush(
+                D2D1::ColorF(1, 0, 0, 1), // red
+                &redBrush_),
+            "Failed to create red brush"
         );
-        if (FAILED(hr) || !redBrush_) {
-            throw std::runtime_error("Failed to create red brush");
-        }
+
+        // Create the gray brush
+        ThrowIfFailed(
+            renderTarget_->CreateSolidColorBrush(
+                D2D1::ColorF(0.666f, 0.666f, 0.666f, 1.0f),
+                &brushGray_),
+            "Failed to create gray brush"
+        );
 
         ShowWindow(hwnd_, SW_SHOW);
         UpdateTextLayouts();
@@ -189,160 +185,134 @@ public:
             return;
         }
 
-        layoutBig_.Reset();
-        const UINT32 textLen = static_cast<UINT32>(text_.size());
-        const wchar_t *textPtr = text_.c_str();
+        layoutsBig_.clear();
         auto sizeRT = renderTarget_->GetSize();
 
-        // Create the big layout
-        HRESULT hr = writeFactory_->CreateTextLayout(
-            textPtr,
-            textLen,
-            bigTextFormat_.Get(),
-            sizeRT.width,
-            sizeRT.height,
-            &layoutBig_
-        );
-        if (FAILED(hr)) {
-            layoutBig_.Reset();
-        }
-
-        // Create the small layout + small-text bitmap
-        layoutSmall_.Reset();
-        smallTextBitmap_.Reset();
-        if (textLen > 0) {
-            hr = writeFactory_->CreateTextLayout(
-                textPtr,
-                textLen,
-                textFormat_.Get(),
-                sizeRT.width,
-                sizeRT.height,
-                &layoutSmall_
+        // Build a big layout for each string
+        for (auto &txt : texts_) {
+            ComPtr<IDWriteTextLayout> layout;
+            ThrowIfFailed(
+                writeFactory_->CreateTextLayout(
+                    txt.c_str(),
+                    static_cast<UINT32>(txt.size()),
+                    bigTextFormat_.Get(),
+                    sizeRT.width,
+                    sizeRT.height,
+                    &layout
+                ),
+                "Failed to create text layout"
             );
-            if (FAILED(hr)) {
-                layoutSmall_.Reset();
-                return;
-            }
-
-            // Retrieve metrics to compute width/height
-            DWRITE_TEXT_METRICS smallMetrics{};
-            if (SUCCEEDED(layoutSmall_->GetMetrics(&smallMetrics))) {
-                smallTextWidth_ = smallMetrics.widthIncludingTrailingWhitespace;
-                smallTextHeight_ = smallMetrics.height;
-
-                if (smallTextWidth_ > 0.0f && smallTextHeight_ > 0.0f) {
-                    auto size = D2D1::SizeF(smallTextWidth_, smallTextHeight_);
-                    ComPtr<ID2D1BitmapRenderTarget> bitmapRT;
-                    HRESULT hr2 = renderTarget_->CreateCompatibleRenderTarget(
-                        &size,
-                        nullptr,
-                        nullptr,
-                        D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
-                        &bitmapRT
-                    );
-                    if (SUCCEEDED(hr2) && bitmapRT) {
-                        ComPtr<ID2D1SolidColorBrush> tempBrush;
-                        hr2 = bitmapRT->CreateSolidColorBrush(
-                            D2D1::ColorF(1, 1, 1, 1),
-                            &tempBrush
-                        );
-                        if (SUCCEEDED(hr2) && tempBrush) {
-                            bitmapRT->BeginDraw();
-                            bitmapRT->Clear(D2D1::ColorF(0, 0, 0, 0));
-                            bitmapRT->DrawTextLayout(
-                                D2D1::Point2F(0.0f, 0.0f),
-                                layoutSmall_.Get(),
-                                tempBrush.Get(),
-                                D2D1_DRAW_TEXT_OPTIONS_NONE
-                            );
-                            bitmapRT->EndDraw();
-
-                            ComPtr<ID2D1Bitmap> bmp;
-                            if (SUCCEEDED(bitmapRT->GetBitmap(&bmp)) && bmp) {
-                                smallTextBitmap_ = bmp;
-                            }
-                        }
-                    }
-                }
-            }
+            layoutsBig_.push_back(layout);
         }
     }
 
     void Draw() {
-        if (!renderTarget_) return;
+        if (!renderTarget_)
+            return;
         renderTarget_->BeginDraw();
-
-        // Clear background
         renderTarget_->Clear(D2D1::ColorF(0, 0, 0, 1));
 
-        // Draw big text
-        if (layoutBig_) {
-            renderTarget_->DrawTextLayout(
-                D2D1::Point2F(0.0f, 0.0f),
-                layoutBig_.Get(),
-                brush_.Get(),
-                D2D1_DRAW_TEXT_OPTIONS_NONE
-            );
+        float xOffset = 0.0f;
+        float yOffset = 0.0f;
 
-            // Attempt to place a cursor
-            // We find the trailing edge unless text is empty
-            UINT32 pos = text_.empty() ? 0 : static_cast<UINT32>(text_.size());
-            DWRITE_HIT_TEST_METRICS hit{};
-            float x = 0.0f, y = 0.0f;
-            layoutBig_->HitTestTextPosition(pos, TRUE, &x, &y, &hit);
+        // Track the maximum height of all big text in this row
+        float maxHeight = 0.0f;
 
-            float lineHeight = (hit.height > 0.0f) ? hit.height : 16.0f;
-            float cursorHeight = lineHeight * 0.8f;
-            float cursorX = x;
-            float cursorY = y + (lineHeight - cursorHeight) / 2.0f;
+        for (size_t i = 0; i < layoutsBig_.size(); i++) {
+            ComPtr<IDWriteTextLayout> &layout = layoutsBig_[i];
+            DWRITE_TEXT_METRICS metrics{};
+            layout->GetMetrics(&metrics);
 
-            // Build a small triangle for the cursor
-            ComPtr<ID2D1PathGeometry> geometry;
-            if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&geometry)) && geometry) {
-                ComPtr<ID2D1GeometrySink> sink;
-                if (SUCCEEDED(geometry->Open(&sink)) && sink) {
-                    sink->BeginFigure(
-                        D2D1::Point2F(cursorX, cursorY),
-                        D2D1_FIGURE_BEGIN_FILLED
-                    );
-                    sink->AddLine(D2D1::Point2F(cursorX + 15.0f, cursorY + cursorHeight / 2.0f));
-                    sink->AddLine(D2D1::Point2F(cursorX, cursorY + cursorHeight));
-                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                    sink->Close();
-                }
-                renderTarget_->FillGeometry(geometry.Get(), redBrush_.Get());
+            if (metrics.height > maxHeight) {
+                maxHeight = metrics.height;
             }
+
+            if (i == activeTextIndex_) {
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, 1));
+                renderTarget_->DrawTextLayout(
+                    D2D1::Point2F(xOffset, yOffset),
+                    layout.Get(),
+                    brush_.Get());
+            } else {
+                brushGray_->SetColor(D2D1::ColorF(0.666f, 0.666f, 0.666f, 1.0f));
+                renderTarget_->DrawTextLayout(
+                    D2D1::Point2F(xOffset, yOffset),
+                    layout.Get(),
+                    brushGray_.Get());
+            }
+
+            xOffset += metrics.widthIncludingTrailingWhitespace;
+
+            const float triSize = 16.0f;
+            ComPtr<ID2D1PathGeometry> geometry;
+            ThrowIfFailed(d2dFactory_->CreatePathGeometry(&geometry), "CreatePathGeometry failed");
+
+            ComPtr<ID2D1GeometrySink> sink;
+            ThrowIfFailed(geometry->Open(&sink), "Opening geometry sink failed");
+
+            sink->BeginFigure(D2D1::Point2F(xOffset, yOffset), D2D1_FIGURE_BEGIN_FILLED);
+            sink->AddLine(D2D1::Point2F(xOffset + triSize, yOffset + metrics.height / 2.0f));
+            sink->AddLine(D2D1::Point2F(xOffset, yOffset + metrics.height));
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+
+            ThrowIfFailed(sink->Close(), "Geometry sink close failed");
+
+            if (i == activeTextIndex_) {
+                renderTarget_->FillGeometry(geometry.Get(), redBrush_.Get());
+            } else {
+                renderTarget_->DrawGeometry(geometry.Get(), redBrush_.Get(), 2.0f);
+            }
+            xOffset += triSize;
         }
 
-        // Draw repeated small text if not empty
-        if (!text_.empty() && smallTextBitmap_) {
-            D2D1_SIZE_F size = renderTarget_->GetSize();
-            float cols = floorf(size.width / smallTextWidth_);
-            float rows = floorf(size.height / smallTextHeight_);
+        // Now shift yOffset to move below the big text row
+        yOffset += maxHeight;
 
-            // Position grid under big text's bounding box
-            DWRITE_TEXT_METRICS bigMetrics{};
-            if (layoutBig_) {
-                layoutBig_->GetMetrics(&bigMetrics);
-            }
-            float yGrid = bigMetrics.height; // simple offset from big text
-            for (float row = 0; row < rows; row += 1.0f) {
-                float xGrid = (size.width - (cols * smallTextWidth_)) / 2.0f;
-                for (float col = 0; col < cols; col += 1.0f) {
-                    renderTarget_->DrawBitmap(
-                        smallTextBitmap_.Get(),
-                        D2D1::RectF(
-                            xGrid,
-                            yGrid,
-                            xGrid + smallTextWidth_,
-                            yGrid + smallTextHeight_
-                        ),
-                        1.0f,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
-                    );
-                    xGrid += smallTextWidth_;
+        // Tile the currently active text in the leftover space
+        auto sizeRT = renderTarget_->GetSize();
+        float leftoverHeight = sizeRT.height - yOffset;
+        float leftoverWidth = sizeRT.width;
+
+        if (leftoverHeight > 0) {
+            ComPtr<IDWriteTextLayout> smallLayout;
+            ThrowIfFailed(
+                writeFactory_->CreateTextLayout(
+                    texts_[activeTextIndex_].c_str(),
+                    static_cast<UINT32>(texts_[activeTextIndex_].size()),
+                    textFormat_.Get(), // small font
+                    leftoverWidth,
+                    leftoverHeight,
+                    &smallLayout
+                ),
+                "Failed to create small text layout"
+            );
+
+            if (smallLayout) {
+                DWRITE_TEXT_METRICS smMetrics{};
+                smallLayout->GetMetrics(&smMetrics);
+
+                // how many times the text fits horizontally / vertically
+                int cols = static_cast<int>(leftoverWidth / smMetrics.width);
+                int rows = static_cast<int>(leftoverHeight / smMetrics.height);
+
+                float totalWidth = cols * smMetrics.width;
+                float totalHeight = rows * smMetrics.height;
+
+                // Center the tiled block
+                float offsetX = (leftoverWidth - totalWidth) * 0.5f;
+                float offsetY2 = yOffset + (leftoverHeight - totalHeight) * 0.5f;
+
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, 1)); // white
+                for (int r = 0; r < rows; ++r) {
+                    for (int c = 0; c < cols; ++c) {
+                        float x = offsetX + c * smMetrics.width;
+                        float y = offsetY2 + r * smMetrics.height;
+                        renderTarget_->DrawTextLayout(
+                            D2D1::Point2F(x, y),
+                            smallLayout.Get(),
+                            brush_.Get());
+                    }
                 }
-                yGrid += smallTextHeight_;
             }
         }
 
@@ -352,23 +322,114 @@ public:
     // Called when the user types a character
     void OnChar(WPARAM wParam) {
         wchar_t ch = static_cast<wchar_t>(wParam);
-        switch (ch) {
-            case 8: // backspace
-                if (!text_.empty()) {
-                    text_.pop_back();
+        if (ch == 8) { // backspace
+            if (!texts_.empty()) {
+                auto &activeString = texts_[activeTextIndex_];
+                if (!activeString.empty()) {
+                    activeString.pop_back();
+                    // Remove the empty string if it's not the only text
+                    if (activeString.empty() && texts_.size() > 1) {
+                        texts_.erase(texts_.begin() + activeTextIndex_);
+                        if (activeTextIndex_ >= texts_.size()) {
+                            activeTextIndex_ = texts_.size() - 1;
+                        }
+                    }
                     UpdateTextLayouts();
                     InvalidateRect(hwnd_, nullptr, TRUE);
                 }
-                break;
-            default:
-                text_.push_back(ch);
-                UpdateTextLayouts();
-                InvalidateRect(hwnd_, nullptr, TRUE);
+            }
+        } else if (ch >= 0x20) {
+            texts_[activeTextIndex_].push_back(ch);
+            UpdateTextLayouts();
+            InvalidateRect(hwnd_, nullptr, TRUE);
         }
     }
 
     void OnSize() {
         UpdateTextLayouts();
+    }
+
+    void OnPaint() {
+        Draw();
+    }
+
+    // Create a new OnKeyDown method
+    bool OnKeyDown(WPARAM wParam) {
+        if (wParam == VK_ESCAPE) {
+            PostQuitMessage(0);
+            return true;
+        }
+        switch (wParam) {
+            case VK_TAB:
+                if (GetKeyState(VK_SHIFT) & 0x8000) {
+                    PrevText();
+                } else {
+                    NextText();
+                }
+                UpdateTextLayouts();
+                InvalidateRect(hwnd_, nullptr, TRUE);
+                return false;
+            case VK_LEFT:
+                PrevText();
+                UpdateTextLayouts();
+                InvalidateRect(hwnd_, nullptr, TRUE);
+                return false;
+            case VK_RIGHT:
+                NextText();
+                UpdateTextLayouts();
+                InvalidateRect(hwnd_, nullptr, TRUE);
+                return false;
+            case VK_RETURN:
+                std::cout << "RETURN" << std::endl;
+                return true;
+        }
+        return false;
+    }
+
+    void OnDestroy() {
+        PostQuitMessage(0);
+    }
+
+    void NextText() {
+        // If the current node is empty, remove it
+        if (texts_[activeTextIndex_].empty()) {
+            // Only remove if we have more than one text left
+            if (texts_.size() > 1) {
+                texts_.erase(texts_.begin() + activeTextIndex_);
+                // Now, if we were at the last node, clamp index
+                if (activeTextIndex_ >= texts_.size()) {
+                    activeTextIndex_ = texts_.size() - 1;
+                }
+            }
+            // Otherwise, if there's only one text and it's empty, do nothing
+        } else {
+            // Current node is non-empty: insert a new empty node after it
+            texts_.insert(texts_.begin() + activeTextIndex_ + 1, L"");
+            // Move onto the newly inserted empty node
+            activeTextIndex_++;
+        }
+    }
+
+    void PrevText() {
+        // If the current node is empty, remove it
+        if (texts_[activeTextIndex_].empty()) {
+            if (texts_.size() > 1) {
+                texts_.erase(texts_.begin() + activeTextIndex_);
+                // After removal, move one step left if possible
+                if (activeTextIndex_ > 0) {
+                    activeTextIndex_--;
+                }
+                // If we removed the last text, clamp index
+                if (activeTextIndex_ >= texts_.size()) {
+                    activeTextIndex_ = texts_.size() - 1;
+                }
+            }
+            // If there's only one text total and it's empty, do nothing
+        } else {
+            // Current node is non-empty, insert a new empty node before it
+            texts_.insert(texts_.begin() + activeTextIndex_, L"");
+            // Stay at the same activeTextIndex_, which is now the new empty text
+        }
     }
 
 private:
@@ -377,18 +438,12 @@ private:
     ComPtr<ID2D1HwndRenderTarget> renderTarget_;
     ComPtr<IDWriteTextFormat> textFormat_;
     ComPtr<IDWriteTextFormat> bigTextFormat_;
-    ComPtr<IDWriteTextLayout> layoutBig_;
-    ComPtr<IDWriteTextLayout> layoutSmall_;
-    ComPtr<ID2D1Bitmap> smallTextBitmap_;
     ComPtr<ID2D1SolidColorBrush> brush_;
     ComPtr<ID2D1SolidColorBrush> redBrush_;
-
-    // Basic text data
-    std::wstring text_;
-    float smallTextWidth_ = 0.0f;
-    float smallTextHeight_ = 0.0f;
-
-    // Our window handle
+    ComPtr<ID2D1SolidColorBrush> brushGray_;
+    std::vector<std::wstring> texts_;
+    size_t activeTextIndex_ = 0;
+    std::vector<ComPtr<IDWriteTextLayout> > layoutsBig_;
     HWND hwnd_ = nullptr;
 };
 
@@ -414,6 +469,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     }
 }
 
+// Finally, rewrite WindowProc to delegate to the above methods
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_CREATE) {
         auto cs = reinterpret_cast<CREATESTRUCTW *>(lParam);
@@ -431,7 +487,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_PAINT: {
             PAINTSTRUCT ps;
             BeginPaint(hwnd, &ps);
-            app->Draw();
+            // delegate painting:
+            app->OnPaint();
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -439,17 +496,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             app->OnChar(wParam);
             return 0;
         case WM_KEYDOWN:
-            if (wParam == VK_ESCAPE) {
-                PostQuitMessage(0);
-                return 0;
-            }
-            break;
-        case WM_SIZE: {
+            return app->OnKeyDown(wParam) ? 0 : 1;
+        case WM_SIZE:
             app->OnSize();
             return 0;
-        }
         case WM_DESTROY:
-            PostQuitMessage(0);
+            app->OnDestroy();
             return 0;
     }
 
