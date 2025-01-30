@@ -41,6 +41,11 @@ struct ComInit {
 static constexpr const wchar_t *CLASS_NAME = L"YasWindowClass";
 static constexpr const wchar_t *WINDOW_NAME = L"YAS!";
 
+const float triSize = 16.0f;
+const float smallFontSize = 12.0f;
+const float bigFontSize = 24.0f;
+const float border = 4.0f;
+
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 class App {
@@ -76,7 +81,7 @@ public:
                 DWRITE_FONT_WEIGHT_REGULAR,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                12.0f,
+                smallFontSize,
                 localeName,
                 textFormat_.GetAddressOf()),
             "Failed to create small textFormat"
@@ -88,7 +93,7 @@ public:
                 DWRITE_FONT_WEIGHT_BOLD,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                24.0f,
+                bigFontSize,
                 localeName,
                 bigTextFormat_.GetAddressOf()),
             "Failed to create big textFormat"
@@ -243,7 +248,6 @@ public:
 
             xOffset += metrics.widthIncludingTrailingWhitespace;
 
-            const float triSize = 16.0f;
             ComPtr<ID2D1PathGeometry> geometry;
             ThrowIfFailed(d2dFactory_->CreatePathGeometry(&geometry), "CreatePathGeometry failed");
 
