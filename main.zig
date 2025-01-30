@@ -485,14 +485,19 @@ const App = struct {
     }
 
     pub fn run(self: *App) !void {
-        // Get screen size for fullscreen
-        const hMonitor = win32.MonitorFromPoint(win32.POINT{ .x = 0, .y = 0 }, win32.MONITOR_DEFAULTTOPRIMARY);
+        // Use the cursor position to pick a monitor
+        var pt: win32.POINT = .{ .x = 0, .y = 0 };
+        _ = win32.GetCursorPos(&pt);
+        const hMonitor = win32.MonitorFromPoint(pt, win32.MONITOR_DEFAULTTONEAREST);
+
         var mi: win32.MONITORINFO = @bitCast([_]u8{0} ** (@sizeOf(win32.MONITORINFO)));
         mi.cbSize = @sizeOf(win32.MONITORINFO);
         _ = win32.GetMonitorInfoW(hMonitor, &mi);
 
-        const width = mi.rcMonitor.right - mi.rcMonitor.left;
-        const height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        const activeLeft = mi.rcMonitor.left;
+        const activeTop = mi.rcMonitor.top;
+        const activeWidth = mi.rcMonitor.right - mi.rcMonitor.left;
+        const activeHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
 
         // Get module handle
         const hInstance = win32.GetModuleHandleW(null);
@@ -519,10 +524,10 @@ const App = struct {
             className,
             windowName,
             win32.WINDOW_STYLE{ .POPUP = 1, .VISIBLE = 1 },
-            mi.rcMonitor.left,
-            mi.rcMonitor.top,
-            width,
-            height,
+            activeLeft,
+            activeTop,
+            activeWidth,
+            activeHeight,
             null,
             null,
             hInstance,
@@ -531,7 +536,6 @@ const App = struct {
 
         if (hwnd == null) return error.WindowCreationFailed;
 
-        _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
         _ = win32.UpdateWindow(hwnd);
 
         // Message loop
