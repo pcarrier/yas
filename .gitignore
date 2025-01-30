@@ -1,2 +1,12 @@
-/.zig-cache/
-/zig-out/
+.ninja_*
+/.cmake/
+/.idea/
+/.vs/
+/build.ninja
+/CMakeCache.txt
+/CMakeFiles/
+/Testing/
+*.obj
+*.pdb
+*.ilk
+*.exe
