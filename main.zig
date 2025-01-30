@@ -14,25 +14,23 @@ const className = L("YasWindowClass");
 const windowName = L("YAS!");
 
 const App = struct {
-    factory: ?*win32.ID2D1Factory = null,
-    renderTarget: ?*win32.ID2D1HwndRenderTarget = null,
-    brush: ?*win32.ID2D1SolidColorBrush = null,
-    redBrush: ?*win32.ID2D1SolidColorBrush = null,
-    writeFactory: ?*win32.IDWriteFactory = null,
-    textFormat: ?*win32.IDWriteTextFormat = null,
     bigTextFormat: ?*win32.IDWriteTextFormat = null,
-    smallTextBitmap: ?*win32.ID2D1Bitmap = null,
-    textBuffer: [256:0]u16 = undefined,
-    textLen: usize = 0,
+    brush: ?*win32.ID2D1SolidColorBrush = null,
+    factory: ?*win32.ID2D1Factory = null,
     hwnd: ?win32.HWND = null,
-
-    // Cached layouts and measurements
+    layoutBig: ?*win32.IDWriteTextLayout = null,
     layoutSmall: ?*win32.IDWriteTextLayout = null, // For small text
-    lineHeight: f32 = 0,
-    smallTextWidth: f32 = 0,
-    smallTextHeight: f32 = 0,
-
     localeBuffer: [win32.LOCALE_NAME_MAX_LENGTH:0]u16 = undefined,
+    redBrush: ?*win32.ID2D1SolidColorBrush = null,
+    renderTarget: ?*win32.ID2D1HwndRenderTarget = null,
+    smallTextBitmap: ?*win32.ID2D1Bitmap = null,
+    textFormat: ?*win32.IDWriteTextFormat = null,
+    textLen: usize = 0,
+    writeFactory: ?*win32.IDWriteFactory = null,
+    lineHeight: f32 = 0,
+    smallTextHeight: f32 = 0,
+    smallTextWidth: f32 = 0,
+    textBuffer: [256:0]u16 = undefined,
 
     pub fn init() !App {
         var app = App{};
@@ -71,6 +69,39 @@ const App = struct {
         if (dwriteFactoryOut == null) return error.DWriteFactoryCreateFailed;
         app.writeFactory = dwriteFactoryOut;
 
+        // Now create textFormat
+        var tfOut: ?*win32.IDWriteTextFormat = null;
+        _ = app.writeFactory.?.CreateTextFormat(
+            windowName,
+            null,
+            win32.DWRITE_FONT_WEIGHT_REGULAR,
+            win32.DWRITE_FONT_STYLE_NORMAL,
+            win32.DWRITE_FONT_STRETCH_NORMAL,
+            16.0,
+            @as([*:0]const u16, &app.localeBuffer),
+            @ptrCast(&tfOut),
+        );
+        app.textFormat = tfOut;
+
+        // Now create bigTextFormat
+        var tfBigOut: ?*win32.IDWriteTextFormat = null;
+        _ = app.writeFactory.?.CreateTextFormat(
+            windowName,
+            null,
+            win32.DWRITE_FONT_WEIGHT_BOLD,
+            win32.DWRITE_FONT_STYLE_NORMAL,
+            win32.DWRITE_FONT_STRETCH_NORMAL,
+            32.0,
+            @as([*:0]const u16, &app.localeBuffer),
+            @ptrCast(&tfBigOut),
+        );
+        app.bigTextFormat = tfBigOut;
+
+        // If we have successfully created textFormat and bigTextFormat, build layouts now
+        // We must have a renderTarget for the smallTextBitmap; ensureRenderTarget after we create the window
+        // => So we can do partial creation now (big layout), or call again once the window is up.
+        // The simplest approach is: do partial creation now for bigTextFormat, then call again after window creation
+        // For minimal code, we'll just do it once at the end of init:
         return app;
     }
 
@@ -156,11 +187,10 @@ const App = struct {
             8 => { // Backspace
                 if (self.textLen > 0) {
                     self.textLen -= 1;
-                    self.textBuffer[self.textLen] = 0; // null terminate
-                    if (self.smallTextBitmap != null) {
-                        _ = self.smallTextBitmap.?.IUnknown.Release();
-                        self.smallTextBitmap = null;
-                    }
+                    self.textBuffer[self.textLen] = 0;
+                    _ = self.updateTextLayouts() catch |err| {
+                        std.debug.print("updateTextLayouts failed: {}\n", .{err});
+                    };
                     _ = win32.InvalidateRect(self.hwnd, null, 1);
                 }
             },
@@ -170,6 +200,9 @@ const App = struct {
                     self.textBuffer[self.textLen] = char;
                     self.textLen += 1;
                     self.textBuffer[self.textLen] = 0; // null terminate
+                    _ = self.updateTextLayouts() catch |err| {
+                        std.debug.print("updateTextLayouts failed: {}\n", .{err});
+                    };
                     _ = win32.InvalidateRect(self.hwnd, null, 1);
                 }
             },
@@ -250,44 +283,7 @@ const App = struct {
         self.redBrush = redBrushOut;
     }
 
-    fn ensureTextFormats(self: *App) void {
-        if (self.textFormat == null) {
-            var tfOut: ?*win32.IDWriteTextFormat = null;
-            _ = self.writeFactory.?.CreateTextFormat(
-                windowName,
-                null,
-                win32.DWRITE_FONT_WEIGHT_REGULAR,
-                win32.DWRITE_FONT_STYLE_NORMAL,
-                win32.DWRITE_FONT_STRETCH_NORMAL,
-                16.0,
-                @as([*:0]const u16, &self.localeBuffer),
-                @ptrCast(&tfOut),
-            );
-            self.textFormat = tfOut;
-            _ = self.textFormat.?.SetTextAlignment(win32.DWRITE_TEXT_ALIGNMENT_CENTER);
-            _ = self.textFormat.?.SetParagraphAlignment(win32.DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            _ = self.textFormat.?.SetWordWrapping(win32.DWRITE_WORD_WRAPPING_NO_WRAP);
-        }
-
-        if (self.bigTextFormat == null) {
-            var tfBigOut: ?*win32.IDWriteTextFormat = null;
-            _ = self.writeFactory.?.CreateTextFormat(
-                windowName,
-                null,
-                win32.DWRITE_FONT_WEIGHT_BOLD,
-                win32.DWRITE_FONT_STYLE_NORMAL,
-                win32.DWRITE_FONT_STRETCH_NORMAL,
-                32.0,
-                @as([*:0]const u16, &self.localeBuffer),
-                @ptrCast(&tfBigOut),
-            );
-            self.bigTextFormat = tfBigOut;
-            _ = self.bigTextFormat.?.SetTextAlignment(win32.DWRITE_TEXT_ALIGNMENT_LEADING);
-        }
-    }
-
     fn draw(self: *App) void {
-        self.ensureTextFormats();
         self.renderTarget.?.ID2D1RenderTarget.BeginDraw();
         defer _ = self.renderTarget.?.ID2D1RenderTarget.EndDraw(null, null);
 
@@ -298,39 +294,25 @@ const App = struct {
         const clientWidth: f32 = @floatFromInt(clientRect.right - clientRect.left);
         const clientHeight: f32 = @floatFromInt(clientRect.bottom - clientRect.top);
 
-        const textPtr = @as([*:0]const u16, &self.textBuffer);
         const textLen: u32 = @intCast(self.textLen);
 
-        // Create one layout for the entire text
-        var layoutBig: ?*win32.IDWriteTextLayout = null;
-        _ = self.writeFactory.?.CreateTextLayout(
-            textPtr,
-            textLen,
-            self.bigTextFormat,
-            clientWidth,
-            clientHeight,
-            @ptrCast(&layoutBig),
-        );
-        if (layoutBig != null) {
-            // Update lineHeight if this text block is taller
+        // Draw the big layout if it exists
+        if (self.layoutBig != null) {
             var metrics: win32.DWRITE_TEXT_METRICS = undefined;
-            _ = layoutBig.?.GetMetrics(&metrics);
-            if (metrics.height > self.lineHeight) {
-                self.lineHeight = metrics.height;
-            }
-
-            // Draw big text even if textLen=0 (it'll just be empty)
+            _ = self.layoutBig.?.GetMetrics(&metrics);
             if (textLen > 0) {
+                // Actually draw the big text
                 self.renderTarget.?.ID2D1RenderTarget.DrawTextLayout(
                     .{ .x = 0, .y = 0 },
-                    layoutBig,
+                    self.layoutBig,
                     @ptrCast(self.brush),
                     win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
 
+            // Position the cursor at the trailing edge
             var hitTestMetrics: win32.DWRITE_HIT_TEST_METRICS = undefined;
-            _ = layoutBig.?.HitTestTextPosition(
+            _ = self.layoutBig.?.HitTestTextPosition(
                 textLen,
                 1,
                 &hitTestMetrics.left,
@@ -338,7 +320,6 @@ const App = struct {
                 &hitTestMetrics,
             );
 
-            // Use per-line height from hitTestMetrics
             const lineHeight = hitTestMetrics.height;
             const cursorHeight: f32 = lineHeight * 0.8;
             const cursorY = hitTestMetrics.top + (lineHeight - cursorHeight) / 2;
@@ -367,32 +348,90 @@ const App = struct {
             );
         }
 
-        if (textLen > 0) {
-            // If we haven't cached a layoutSmall or text changed, create it
-            if (self.layoutSmall == null) {
-                var layoutSmallOut: ?*win32.IDWriteTextLayout = null;
-                _ = self.writeFactory.?.CreateTextLayout(
-                    textPtr,
-                    textLen,
-                    self.textFormat,
-                    clientWidth,
-                    clientHeight,
-                    @ptrCast(&layoutSmallOut),
-                );
-                self.layoutSmall = layoutSmallOut;
+        // Draw the small text grid if we have a smallTextBitmap
+        if (self.smallTextBitmap != null and textLen > 0) {
+            const cols = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientWidth)), @as(u32, @intFromFloat(self.smallTextWidth)))));
+            const rows = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientHeight)), @as(u32, @intFromFloat(self.smallTextHeight)))));
 
-                if (self.layoutSmall != null) {
-                    var smallMetrics: win32.DWRITE_TEXT_METRICS = undefined;
-                    _ = self.layoutSmall.?.GetMetrics(&smallMetrics);
-                    self.smallTextWidth = smallMetrics.widthIncludingTrailingWhitespace;
-                    self.smallTextHeight = smallMetrics.height;
+            var yGrid: f32 = (clientHeight - (rows * self.smallTextHeight)) / 2;
+            var row: f32 = 0;
+            while (row < rows) : (row += 1) {
+                var xGrid: f32 = (clientWidth - (cols * self.smallTextWidth)) / 2;
+                var col: f32 = 0;
+                while (col < cols) : (col += 1) {
+                    self.renderTarget.?.ID2D1RenderTarget.DrawBitmap(
+                        self.smallTextBitmap,
+                        &.{
+                            .left = xGrid,
+                            .top = yGrid,
+                            .right = xGrid + self.smallTextWidth,
+                            .bottom = yGrid + self.smallTextHeight,
+                        },
+                        1.0,
+                        win32.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        null,
+                    );
+                    xGrid += self.smallTextWidth;
                 }
+                yGrid += self.smallTextHeight;
             }
+        }
+    }
 
-            // Use cached smallTextWidth/Height
-            if (self.smallTextWidth > 0 and self.smallTextHeight > 0) {
-                // Create or update bitmap if needed
-                if (self.smallTextBitmap == null) {
+    fn updateTextLayouts(self: *App) !void {
+        // If we have existing layouts or the smallTextBitmap, release them so we can recreate
+        if (self.layoutSmall != null) {
+            _ = self.layoutSmall.?.IUnknown.Release();
+            self.layoutSmall = null;
+        }
+        if (self.smallTextBitmap != null) {
+            _ = self.smallTextBitmap.?.IUnknown.Release();
+            self.smallTextBitmap = null;
+        }
+
+        // Build the big layout (for the main text)
+        const textPtr = @as([*:0]const u16, &self.textBuffer);
+        const textLen: u32 = @intCast(self.textLen);
+
+        var layoutBigOut: ?*win32.IDWriteTextLayout = null;
+        // Safety check: self.bigTextFormat might be null if creation failed during init
+        if (self.bigTextFormat != null) {
+            _ = self.writeFactory.?.CreateTextLayout(
+                textPtr,
+                textLen,
+                self.bigTextFormat,
+                1920.0, // some large width, or pass actual client width
+                1080.0, // some large height, or pass actual client height
+                @ptrCast(&layoutBigOut),
+            );
+        }
+        // store the layout in a new field layoutBig
+        if (self.layoutBig != null) {
+            _ = self.layoutBig.?.IUnknown.Release();
+        }
+        self.layoutBig = layoutBigOut;
+
+        // Build the small text layout
+        if (self.textFormat != null and textLen > 0) {
+            var layoutSmallOut: ?*win32.IDWriteTextLayout = null;
+            _ = self.writeFactory.?.CreateTextLayout(
+                textPtr,
+                textLen,
+                self.textFormat,
+                1920.0,
+                1080.0,
+                @ptrCast(&layoutSmallOut),
+            );
+            self.layoutSmall = layoutSmallOut;
+
+            if (self.layoutSmall != null) {
+                var smallMetrics: win32.DWRITE_TEXT_METRICS = undefined;
+                _ = self.layoutSmall.?.GetMetrics(&smallMetrics);
+                self.smallTextWidth = smallMetrics.widthIncludingTrailingWhitespace;
+                self.smallTextHeight = smallMetrics.height;
+
+                // If we have a valid renderTarget, create the smallTextBitmap once
+                if (self.renderTarget != null and self.smallTextWidth > 0 and self.smallTextHeight > 0) {
                     var bitmapRenderTarget: ?*win32.ID2D1BitmapRenderTarget = null;
                     const hr1 = self.renderTarget.?.ID2D1RenderTarget.CreateCompatibleRenderTarget(
                         &win32.D2D_SIZE_F{ .width = self.smallTextWidth, .height = self.smallTextHeight },
@@ -404,81 +443,35 @@ const App = struct {
                         win32.D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
                         @ptrCast(&bitmapRenderTarget),
                     );
-                    if (hr1 != win32.S_OK) {
-                        std.debug.print("Failed to create bitmap render target: {}\n", .{hr1});
-                        return;
-                    }
-                    std.debug.assert(bitmapRenderTarget != null);
-                    defer _ = bitmapRenderTarget.?.IUnknown.Release();
-
-                    // Create brush for bitmap target
-                    var bitmapBrush: ?*win32.ID2D1SolidColorBrush = null;
-                    const hr2 = bitmapRenderTarget.?.ID2D1RenderTarget.CreateSolidColorBrush(
-                        &.{ .r = 1, .g = 1, .b = 1, .a = 1 },
-                        null,
-                        @ptrCast(&bitmapBrush),
-                    );
-                    if (hr2 != win32.S_OK) {
-                        std.debug.print("Failed to create bitmap brush: {}\n", .{hr2});
-                        return;
-                    }
-                    std.debug.assert(bitmapBrush != null);
-                    defer _ = bitmapBrush.?.IUnknown.Release();
-
-                    // Draw text into bitmap render target
-                    bitmapRenderTarget.?.ID2D1RenderTarget.BeginDraw();
-                    bitmapRenderTarget.?.ID2D1RenderTarget.Clear(&.{ .r = 0, .g = 0, .b = 0, .a = 0 });
-                    bitmapRenderTarget.?.ID2D1RenderTarget.DrawTextLayout(
-                        .{ .x = 0, .y = 0 },
-                        self.layoutSmall,
-                        @ptrCast(bitmapBrush),
-                        win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                    const hr3 = bitmapRenderTarget.?.ID2D1RenderTarget.EndDraw(null, null);
-                    if (hr3 != win32.S_OK) {
-                        std.debug.print("Failed to end draw on bitmap target: {}\n", .{hr3});
-                        return;
-                    }
-
-                    // Get bitmap from render target
-                    var bitmap: ?*win32.ID2D1Bitmap = null;
-                    const hr4 = bitmapRenderTarget.?.GetBitmap(@ptrCast(&bitmap));
-                    if (hr4 != win32.S_OK) {
-                        std.debug.print("Failed to get bitmap from render target: {}\n", .{hr4});
-                        return;
-                    }
-                    std.debug.assert(bitmap != null);
-                    self.smallTextBitmap = bitmap;
-
-                    // Debug metrics
-                    std.debug.print("Created bitmap: width={d}, height={d}\n", .{ self.smallTextWidth, self.smallTextHeight });
-                }
-
-                // Use our cached width/height for the grid
-                const cols = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientWidth)), @as(u32, @intFromFloat(self.smallTextWidth)))));
-                const rows = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientHeight)), @as(u32, @intFromFloat(self.smallTextHeight)))));
-
-                var yGrid: f32 = (clientHeight - (rows * self.smallTextHeight)) / 2;
-                var row: f32 = 0;
-                while (row < rows) : (row += 1) {
-                    var xGrid: f32 = (clientWidth - (cols * self.smallTextWidth)) / 2;
-                    var col: f32 = 0;
-                    while (col < cols) : (col += 1) {
-                        self.renderTarget.?.ID2D1RenderTarget.DrawBitmap(
-                            self.smallTextBitmap,
-                            &.{
-                                .left = xGrid,
-                                .top = yGrid,
-                                .right = xGrid + self.smallTextWidth,
-                                .bottom = yGrid + self.smallTextHeight,
-                            },
-                            1.0,
-                            win32.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    if (hr1 == win32.S_OK and bitmapRenderTarget != null) {
+                        // Create brush for bitmap target
+                        var bitmapBrush: ?*win32.ID2D1SolidColorBrush = null;
+                        const hr2 = bitmapRenderTarget.?.ID2D1RenderTarget.CreateSolidColorBrush(
+                            &.{ .r = 1, .g = 1, .b = 1, .a = 1 },
                             null,
+                            @ptrCast(&bitmapBrush),
                         );
-                        xGrid += self.smallTextWidth;
+                        if (hr2 == win32.S_OK and bitmapBrush != null) {
+                            defer _ = bitmapBrush.?.IUnknown.Release();
+                            // Draw text into bitmap render target
+                            bitmapRenderTarget.?.ID2D1RenderTarget.BeginDraw();
+                            bitmapRenderTarget.?.ID2D1RenderTarget.Clear(&.{ .r = 0, .g = 0, .b = 0, .a = 0 });
+                            bitmapRenderTarget.?.ID2D1RenderTarget.DrawTextLayout(
+                                .{ .x = 0, .y = 0 },
+                                self.layoutSmall,
+                                @ptrCast(bitmapBrush),
+                                win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            );
+                            _ = bitmapRenderTarget.?.ID2D1RenderTarget.EndDraw(null, null);
+                            // Get bitmap from render target
+                            var bitmap: ?*win32.ID2D1Bitmap = null;
+                            const hr4 = bitmapRenderTarget.?.GetBitmap(@ptrCast(&bitmap));
+                            if (hr4 == win32.S_OK and bitmap != null) {
+                                self.smallTextBitmap = bitmap;
+                            }
+                        }
+                        _ = bitmapRenderTarget.?.IUnknown.Release();
                     }
-                    yGrid += self.smallTextHeight;
                 }
             }
         }
@@ -535,6 +528,13 @@ const App = struct {
         );
 
         if (hwnd == null) return error.WindowCreationFailed;
+
+        // Now that we have a hwnd, we can ensureRenderTarget,
+        // then call updateTextLayouts so the smallTextBitmap is ready
+        self.ensureRenderTarget() catch |err| {
+            std.debug.print("Failed to ensure render target in run: {}\n", .{err});
+        };
+        try self.updateTextLayouts();
 
         _ = win32.UpdateWindow(hwnd);
 
