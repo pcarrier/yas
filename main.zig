@@ -161,12 +161,60 @@ const App = struct {
 
         // Show and update the window
         _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
-        _ = win32.UpdateWindow(hwnd);
 
-        // Now that we have a hwnd, ensureRenderTarget
-        app.ensureRenderTarget() catch |err| {
-            std.debug.print("Failed to ensure render target in init: {}\n", .{err});
+        var rc: win32.RECT = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 };
+        _ = win32.GetClientRect(app.hwnd, &rc);
+
+        const size: win32.D2D_SIZE_U = .{
+            .width = @intCast(rc.right - rc.left),
+            .height = @intCast(rc.bottom - rc.top),
         };
+
+        const dpi: f32 = @floatFromInt(win32.GetDpiForWindow(app.hwnd));
+
+        var targetProps: win32.D2D1_RENDER_TARGET_PROPERTIES = .{
+            .type = win32.D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            .pixelFormat = .{ .format = win32.DXGI_FORMAT_UNKNOWN, .alphaMode = win32.D2D1_ALPHA_MODE_UNKNOWN },
+            .dpiX = dpi,
+            .dpiY = dpi,
+            .usage = win32.D2D1_RENDER_TARGET_USAGE_NONE,
+            .minLevel = win32.D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        var hwndProps: win32.D2D1_HWND_RENDER_TARGET_PROPERTIES = .{
+            .hwnd = app.hwnd,
+            .pixelSize = size,
+            .presentOptions = win32.D2D1_PRESENT_OPTIONS_NONE,
+        };
+
+        var rtOut: ?*win32.ID2D1HwndRenderTarget = null;
+        const hr = app.factory.?.CreateHwndRenderTarget(
+            &targetProps,
+            &hwndProps,
+            @ptrCast(&rtOut),
+        );
+        if (hr != win32.S_OK or rtOut == null) return error.RenderTargetCreateFailed;
+
+        app.renderTarget = rtOut;
+
+        // Create brushes
+        var brushOut: ?*win32.ID2D1SolidColorBrush = null;
+        _ = app.renderTarget.?.ID2D1RenderTarget.CreateSolidColorBrush(
+            &.{ .r = 1, .g = 1, .b = 1, .a = 1 },
+            null,
+            @ptrCast(&brushOut),
+        );
+        if (brushOut == null) return error.BrushCreateFailed;
+        app.brush = brushOut;
+
+        var redBrushOut: ?*win32.ID2D1SolidColorBrush = null;
+        _ = app.renderTarget.?.ID2D1RenderTarget.CreateSolidColorBrush(
+            &.{ .r = 1, .g = 0, .b = 0, .a = 1 },
+            null,
+            @ptrCast(&redBrushOut),
+        );
+        if (redBrushOut == null) return error.BrushCreateFailed;
+        app.redBrush = redBrushOut;
+
         try app.updateTextLayouts();
 
         return app;
@@ -281,73 +329,8 @@ const App = struct {
         var ps: win32.PAINTSTRUCT = undefined;
         _ = win32.BeginPaint(self.hwnd, &ps);
         defer _ = win32.EndPaint(self.hwnd, &ps);
-
-        self.ensureRenderTarget() catch |err| {
-            std.debug.print("Failed to ensure render target: {}\n", .{err});
-            return 0;
-        };
         self.draw();
-
         return 0;
-    }
-
-    fn ensureRenderTarget(self: *App) !void {
-        if (self.renderTarget != null) return;
-
-        if (self.factory == null) return error.MissingFactory;
-
-        var rc: win32.RECT = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 };
-        _ = win32.GetClientRect(self.hwnd, &rc);
-
-        const size: win32.D2D_SIZE_U = .{
-            .width = @intCast(rc.right - rc.left),
-            .height = @intCast(rc.bottom - rc.top),
-        };
-
-        // Create the HwndRenderTarget
-        var targetProps: win32.D2D1_RENDER_TARGET_PROPERTIES = .{
-            .type = win32.D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            .pixelFormat = .{ .format = win32.DXGI_FORMAT_UNKNOWN, .alphaMode = win32.D2D1_ALPHA_MODE_UNKNOWN },
-            .dpiX = 0,
-            .dpiY = 0,
-            .usage = win32.D2D1_RENDER_TARGET_USAGE_NONE,
-            .minLevel = win32.D2D1_FEATURE_LEVEL_DEFAULT,
-        };
-        var hwndProps: win32.D2D1_HWND_RENDER_TARGET_PROPERTIES = .{
-            .hwnd = self.hwnd,
-            .pixelSize = size,
-            .presentOptions = win32.D2D1_PRESENT_OPTIONS_NONE,
-        };
-
-        var rtOut: ?*win32.ID2D1HwndRenderTarget = null;
-        const hr = self.factory.?.CreateHwndRenderTarget(
-            &targetProps,
-            &hwndProps,
-            @ptrCast(&rtOut),
-        );
-        if (hr != win32.S_OK) return error.RenderTargetCreateFailed;
-        if (rtOut == null) return error.RenderTargetCreateFailed;
-
-        self.renderTarget = rtOut;
-
-        // Create brushes
-        var brushOut: ?*win32.ID2D1SolidColorBrush = null;
-        _ = self.renderTarget.?.ID2D1RenderTarget.CreateSolidColorBrush(
-            &.{ .r = 1, .g = 1, .b = 1, .a = 1 },
-            null,
-            @ptrCast(&brushOut),
-        );
-        if (brushOut == null) return error.BrushCreateFailed;
-        self.brush = brushOut;
-
-        var redBrushOut: ?*win32.ID2D1SolidColorBrush = null;
-        _ = self.renderTarget.?.ID2D1RenderTarget.CreateSolidColorBrush(
-            &.{ .r = 1, .g = 0, .b = 0, .a = 1 },
-            null,
-            @ptrCast(&redBrushOut),
-        );
-        if (redBrushOut == null) return error.BrushCreateFailed;
-        self.redBrush = redBrushOut;
     }
 
     fn draw(self: *App) void {
@@ -358,23 +341,25 @@ const App = struct {
 
         const clientSize = self.renderTarget.?.ID2D1RenderTarget.GetSize();
 
+        if (clientSize.width == 0 or clientSize.height == 0) {
+            _ = win32.MessageBoxW(null, L("Window size is 0"), L("Error"), win32.MB_OK);
+            return;
+        }
+
         const textLen: u32 = @intCast(self.textLen);
         var bigTextHeight: f32 = 0;
 
-        // Draw the big layout if it exists
-        if (self.layoutBig != null) {
-            var metrics: win32.DWRITE_TEXT_METRICS = undefined;
-            _ = self.layoutBig.?.GetMetrics(&metrics);
-            bigTextHeight = metrics.height;
-            if (textLen > 0) {
-                // Actually draw the big text
-                self.renderTarget.?.ID2D1RenderTarget.DrawTextLayout(
-                    .{ .x = 0, .y = 0 },
-                    self.layoutBig,
-                    @ptrCast(self.brush),
-                    win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
-                );
-            }
+        var metrics: win32.DWRITE_TEXT_METRICS = undefined;
+        _ = self.layoutBig.?.GetMetrics(&metrics);
+        bigTextHeight = metrics.height;
+        if (textLen > 0) {
+            // Actually draw the big text
+            self.renderTarget.?.ID2D1RenderTarget.DrawTextLayout(
+                .{ .x = 0, .y = 0 },
+                self.layoutBig,
+                @ptrCast(self.brush),
+                win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
 
             // Position the cursor at the trailing edge
             var hitTestMetrics: win32.DWRITE_HIT_TEST_METRICS = undefined;
@@ -414,8 +399,7 @@ const App = struct {
             );
         }
 
-        // Draw the small text grid if we have a smallTextBitmap
-        if (self.smallTextBitmap != null and textLen > 0) {
+        if (textLen > 0) {
             const cols = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientSize.width)), @as(u32, @intFromFloat(self.smallTextWidth)))));
             const rows = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientSize.height)), @as(u32, @intFromFloat(self.smallTextHeight)))));
 
