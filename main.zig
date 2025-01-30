@@ -39,6 +39,9 @@ const App = struct {
         _ = win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED);
         errdefer win32.CoUninitialize();
 
+        // Enable per-monitor DPI awareness V2
+        _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
         // Initialize text buffer with "Hello"
         const initialText = windowName;
         const initialTextLen = std.mem.len(initialText);
@@ -97,11 +100,66 @@ const App = struct {
         );
         app.bigTextFormat = tfBigOut;
 
-        // If we have successfully created textFormat and bigTextFormat, build layouts now
-        // We must have a renderTarget for the smallTextBitmap; ensureRenderTarget after we create the window
-        // => So we can do partial creation now (big layout), or call again once the window is up.
-        // The simplest approach is: do partial creation now for bigTextFormat, then call again after window creation
-        // For minimal code, we'll just do it once at the end of init:
+        // Choose monitor based on the cursor position
+        var pt: win32.POINT = .{ .x = 0, .y = 0 };
+        _ = win32.GetCursorPos(&pt);
+        const hMonitor = win32.MonitorFromPoint(pt, win32.MONITOR_DEFAULTTONEAREST);
+
+        var mi: win32.MONITORINFO = @bitCast([_]u8{0} ** (@sizeOf(win32.MONITORINFO)));
+        mi.cbSize = @sizeOf(win32.MONITORINFO);
+        _ = win32.GetMonitorInfoW(hMonitor, &mi);
+
+        const activeLeft = mi.rcMonitor.left;
+        const activeTop = mi.rcMonitor.top;
+        const activeWidth = mi.rcMonitor.right - mi.rcMonitor.left;
+        const activeHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+        // Get module handle
+        const hInstance = win32.GetModuleHandleW(null);
+
+        // Register window class
+        _ = win32.RegisterClassExW(&win32.WNDCLASSEXW{
+            .cbSize = @sizeOf(win32.WNDCLASSEXW),
+            .style = win32.WNDCLASS_STYLES{},
+            .lpfnWndProc = App.windowProcThunk,
+            .hInstance = hInstance,
+            .hCursor = win32.LoadCursorW(null, win32.IDC_ARROW),
+            .hbrBackground = null,
+            .lpszClassName = className,
+            .cbClsExtra = 0,
+            .cbWndExtra = 0,
+            .hIcon = null,
+            .lpszMenuName = null,
+            .hIconSm = null,
+        });
+
+        // Create window using the same hInstance
+        const hwnd = win32.CreateWindowExW(
+            win32.WINDOW_EX_STYLE{},
+            className,
+            windowName,
+            win32.WINDOW_STYLE{ .POPUP = 1 },
+            activeLeft,
+            activeTop,
+            activeWidth,
+            activeHeight,
+            null,
+            null,
+            hInstance,
+            &app,
+        );
+        if (hwnd == null) return error.WindowCreationFailed;
+        app.hwnd = hwnd;
+
+        // Ensure the window is actually shown and can receive keyboard focus.
+        _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
+
+        // Now that we have a hwnd, ensureRenderTarget
+        app.ensureRenderTarget() catch |err| {
+            std.debug.print("Failed to ensure render target in init: {}\n", .{err});
+        };
+        try app.updateTextLayouts();
+
         return app;
     }
 
@@ -478,79 +536,14 @@ const App = struct {
             }
         }
     }
-
-    pub fn run(self: *App) !void {
-        // Use the cursor position to pick a monitor
-        var pt: win32.POINT = .{ .x = 0, .y = 0 };
-        _ = win32.GetCursorPos(&pt);
-        const hMonitor = win32.MonitorFromPoint(pt, win32.MONITOR_DEFAULTTONEAREST);
-
-        var mi: win32.MONITORINFO = @bitCast([_]u8{0} ** (@sizeOf(win32.MONITORINFO)));
-        mi.cbSize = @sizeOf(win32.MONITORINFO);
-        _ = win32.GetMonitorInfoW(hMonitor, &mi);
-
-        const activeLeft = mi.rcMonitor.left;
-        const activeTop = mi.rcMonitor.top;
-        const activeWidth = mi.rcMonitor.right - mi.rcMonitor.left;
-        const activeHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
-
-        // Get module handle
-        const hInstance = win32.GetModuleHandleW(null);
-
-        // Inline the WNDCLASSEXW instead of using a variable
-        _ = win32.RegisterClassExW(&win32.WNDCLASSEXW{
-            .cbSize = @sizeOf(win32.WNDCLASSEXW),
-            .style = win32.WNDCLASS_STYLES{},
-            .lpfnWndProc = App.windowProcThunk,
-            .hInstance = hInstance,
-            .hCursor = win32.LoadCursorW(null, win32.IDC_ARROW),
-            .hbrBackground = null,
-            .lpszClassName = className,
-            .cbClsExtra = 0,
-            .cbWndExtra = 0,
-            .hIcon = null,
-            .lpszMenuName = null,
-            .hIconSm = null,
-        });
-
-        // Create window using the same hInstance
-        const hwnd = win32.CreateWindowExW(
-            win32.WINDOW_EX_STYLE{},
-            className,
-            windowName,
-            win32.WINDOW_STYLE{ .POPUP = 1, .VISIBLE = 1 },
-            activeLeft,
-            activeTop,
-            activeWidth,
-            activeHeight,
-            null,
-            null,
-            hInstance,
-            self,
-        );
-
-        if (hwnd == null) return error.WindowCreationFailed;
-
-        // Now that we have a hwnd, we can ensureRenderTarget,
-        // then call updateTextLayouts so the smallTextBitmap is ready
-        self.ensureRenderTarget() catch |err| {
-            std.debug.print("Failed to ensure render target in run: {}\n", .{err});
-        };
-        try self.updateTextLayouts();
-
-        _ = win32.UpdateWindow(hwnd);
-
-        // Message loop
-        var msg: win32.MSG = undefined;
-        while (win32.GetMessageW(&msg, null, 0, 0) != 0) {
-            _ = win32.TranslateMessage(&msg);
-            _ = win32.DispatchMessageW(&msg);
-        }
-    }
 };
 
 pub fn main() !void {
     var app = try App.init();
     defer app.deinit();
-    try app.run();
+    var msg: win32.MSG = undefined;
+    while (win32.GetMessageW(&msg, null, 0, 0) != 0) {
+        _ = win32.TranslateMessage(&msg);
+        _ = win32.DispatchMessageW(&msg);
+    }
 }
