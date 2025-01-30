@@ -30,7 +30,7 @@ const App = struct {
     lineHeight: f32 = 0,
     smallTextHeight: f32 = 0,
     smallTextWidth: f32 = 0,
-    textBuffer: [256:0]u16 = undefined,
+    textBuffer: [1024:0]u16 = undefined,
 
     pub fn init() !App {
         var app = App{};
@@ -295,11 +295,13 @@ const App = struct {
         const clientHeight: f32 = @floatFromInt(clientRect.bottom - clientRect.top);
 
         const textLen: u32 = @intCast(self.textLen);
+        var bigTextHeight: f32 = 0;
 
         // Draw the big layout if it exists
         if (self.layoutBig != null) {
             var metrics: win32.DWRITE_TEXT_METRICS = undefined;
             _ = self.layoutBig.?.GetMetrics(&metrics);
+            bigTextHeight = metrics.height;
             if (textLen > 0) {
                 // Actually draw the big text
                 self.renderTarget.?.ID2D1RenderTarget.DrawTextLayout(
@@ -353,7 +355,7 @@ const App = struct {
             const cols = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientWidth)), @as(u32, @intFromFloat(self.smallTextWidth)))));
             const rows = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientHeight)), @as(u32, @intFromFloat(self.smallTextHeight)))));
 
-            var yGrid: f32 = (clientHeight - (rows * self.smallTextHeight)) / 2;
+            var yGrid: f32 = bigTextHeight;
             var row: f32 = 0;
             while (row < rows) : (row += 1) {
                 var xGrid: f32 = (clientWidth - (cols * self.smallTextWidth)) / 2;
@@ -501,7 +503,7 @@ const App = struct {
             .style = win32.WNDCLASS_STYLES{},
             .lpfnWndProc = App.windowProcThunk,
             .hInstance = hInstance,
-            .hCursor = win32.LoadCursorW(null, win32.IDC_NO),
+            .hCursor = win32.LoadCursorW(null, win32.IDC_ARROW),
             .hbrBackground = null,
             .lpszClassName = className,
             .cbClsExtra = 0,
