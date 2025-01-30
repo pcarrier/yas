@@ -286,8 +286,8 @@ const App = struct {
                 if (self.textLen > 0) {
                     self.textLen -= 1;
                     self.textBuffer[self.textLen] = 0;
-                    _ = self.updateTextLayouts() catch |err| {
-                        std.debug.print("updateTextLayouts failed: {}\n", .{err});
+                    _ = self.updateTextLayouts() catch {
+                        _ = win32.MessageBoxW(null, L("updateTextLayouts failed"), L("Error"), win32.MB_OK);
                     };
                     _ = win32.InvalidateRect(self.hwnd, null, 1);
                 }
@@ -298,8 +298,8 @@ const App = struct {
                     self.textBuffer[self.textLen] = char;
                     self.textLen += 1;
                     self.textBuffer[self.textLen] = 0; // null terminate
-                    _ = self.updateTextLayouts() catch |err| {
-                        std.debug.print("updateTextLayouts failed: {}\n", .{err});
+                    _ = self.updateTextLayouts() catch {
+                        _ = win32.MessageBoxW(null, L("updateTextLayouts failed"), L("Error"), win32.MB_OK);
                     };
                     _ = win32.InvalidateRect(self.hwnd, null, 1);
                 }

@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    win32.addCMacro("WIDL_EXPLICIT_AGGREGATE_RETURNS", "1");
 
     exe.root_module.addImport("win32", win32);
 
