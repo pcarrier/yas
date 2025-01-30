@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.12)
+project(yas LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(yas WIN32 main.cpp)
+target_link_libraries(yas PRIVATE d2d1 dwrite ole32 user32 gdi32)
+target_compile_definitions(yas PRIVATE UNICODE)

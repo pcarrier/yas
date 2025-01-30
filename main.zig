@@ -34,15 +34,12 @@ const App = struct {
 
     pub fn init() !App {
         var app = App{
-            .layoutBig = undefined,
-            .factory = undefined,
-            .hwnd = undefined,
-            .writeFactory = undefined,
-            .textFormat = undefined,
-            .bigTextFormat = undefined,
-            .brush = undefined,
-            .redBrush = undefined,
-            .renderTarget = undefined,
+            .layoutSmall = null,
+            .smallTextBitmap = null,
+            .lineHeight = 0,
+            .smallTextHeight = 0,
+            .smallTextWidth = 0,
+            .textLen = 0,
         };
 
         // Initialize COM
@@ -76,8 +73,8 @@ const App = struct {
             null,
             @ptrCast(&factoryOut),
         );
-        if (hr1 != win32.S_OK) return error.D2DFactoryCreateFailed;
-        app.factory = factoryOut.?;
+        if (hr1 != win32.S_OK or factoryOut == null) return error.D2DFactoryCreateFailed;
+        app.factory = factoryOut;
 
         // Create DirectWrite factory
         var dwriteFactoryOut: ?*win32.IDWriteFactory = null;
@@ -86,8 +83,8 @@ const App = struct {
             win32.IID_IDWriteFactory,
             @ptrCast(&dwriteFactoryOut),
         );
-        if (hr2 != win32.S_OK) return error.DWriteFactoryCreateFailed;
-        app.writeFactory = dwriteFactoryOut.?;
+        if (hr2 != win32.S_OK or dwriteFactoryOut == null) return error.DWriteFactoryCreateFailed;
+        app.writeFactory = dwriteFactoryOut;
 
         // Create textFormat => must succeed before we store it
         var tfOut: ?*win32.IDWriteTextFormat = null;
@@ -101,7 +98,8 @@ const App = struct {
             @as([*:0]const u16, &app.localeBuffer),
             @ptrCast(&tfOut),
         );
-        app.textFormat = tfOut.?;
+        if (tfOut == null) return error.TextFormatCreateFailed;
+        app.textFormat = tfOut;
 
         // Create bigTextFormat => likewise must succeed
         var tfBigOut: ?*win32.IDWriteTextFormat = null;
@@ -115,7 +113,8 @@ const App = struct {
             @as([*:0]const u16, &app.localeBuffer),
             @ptrCast(&tfBigOut),
         );
-        app.bigTextFormat = tfBigOut.?;
+        if (tfBigOut == null) return error.TextFormatCreateFailed;
+        app.bigTextFormat = tfBigOut;
 
         // Choose monitor based on the cursor position
         var pt: win32.POINT = .{ .x = 0, .y = 0 };
@@ -174,7 +173,7 @@ const App = struct {
             _ = win32.MessageBoxW(null, L("CreateWindowExW failed"), L("Error"), win32.MB_OK);
             return error.WindowCreationFailed;
         }
-        app.hwnd = hwnd.?;
+        app.hwnd = hwnd;
 
         // Show and update the window
         _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
@@ -198,7 +197,7 @@ const App = struct {
             @ptrCast(&rtOut),
         );
         if (hrRT != win32.S_OK or rtOut == null) return error.RenderTargetCreateFailed;
-        app.renderTarget = rtOut.?;
+        app.renderTarget = rtOut;
 
         // Create brushes => must not fail
         var brushOut: ?*win32.ID2D1SolidColorBrush = null;
@@ -208,7 +207,7 @@ const App = struct {
             @ptrCast(&brushOut),
         );
         if (brushOut == null) return error.BrushCreateFailed;
-        app.brush = brushOut.?;
+        app.brush = brushOut;
 
         var redBrushOut: ?*win32.ID2D1SolidColorBrush = null;
         _ = app.renderTarget.ID2D1RenderTarget.CreateSolidColorBrush(
@@ -217,7 +216,7 @@ const App = struct {
             @ptrCast(&redBrushOut),
         );
         if (redBrushOut == null) return error.BrushCreateFailed;
-        app.redBrush = redBrushOut.?;
+        app.redBrush = redBrushOut;
 
         try app.updateTextLayouts();
 
