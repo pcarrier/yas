@@ -118,7 +118,7 @@ const App = struct {
         const hInstance = win32.GetModuleHandleW(null);
 
         // Register window class
-        _ = win32.RegisterClassExW(&win32.WNDCLASSEXW{
+        const atom = win32.RegisterClassExW(&win32.WNDCLASSEXW{
             .cbSize = @sizeOf(win32.WNDCLASSEXW),
             .style = win32.WNDCLASS_STYLES{},
             .lpfnWndProc = App.windowProcThunk,
@@ -133,12 +133,17 @@ const App = struct {
             .hIconSm = null,
         });
 
+        if (atom == 0) {
+            _ = win32.MessageBoxW(null, L("RegisterClassExW failed"), L("Error"), win32.MB_OK);
+            return error.WindowCreationFailed;
+        }
+
         // Create window using the same hInstance
         const hwnd = win32.CreateWindowExW(
             win32.WINDOW_EX_STYLE{},
             className,
             windowName,
-            win32.WINDOW_STYLE{ .POPUP = 1 },
+            win32.WINDOW_STYLE{ .POPUP = 1, .VISIBLE = 1 },
             activeLeft,
             activeTop,
             activeWidth,
@@ -148,11 +153,15 @@ const App = struct {
             hInstance,
             &app,
         );
-        if (hwnd == null) return error.WindowCreationFailed;
+        if (hwnd == null) {
+            _ = win32.MessageBoxW(null, L("CreateWindowExW failed"), L("Error"), win32.MB_OK);
+            return error.WindowCreationFailed;
+        }
         app.hwnd = hwnd;
 
-        // Ensure the window is actually shown and can receive keyboard focus.
+        // Show and update the window
         _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
+        _ = win32.UpdateWindow(hwnd);
 
         // Now that we have a hwnd, ensureRenderTarget
         app.ensureRenderTarget() catch |err| {
@@ -347,10 +356,7 @@ const App = struct {
 
         self.renderTarget.?.ID2D1RenderTarget.Clear(&win32.D2D_COLOR_F{ .r = 0, .g = 0, .b = 0, .a = 1 });
 
-        var clientRect: win32.RECT = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 };
-        _ = win32.GetClientRect(self.hwnd, &clientRect);
-        const clientWidth: f32 = @floatFromInt(clientRect.right - clientRect.left);
-        const clientHeight: f32 = @floatFromInt(clientRect.bottom - clientRect.top);
+        const clientSize = self.renderTarget.?.ID2D1RenderTarget.GetSize();
 
         const textLen: u32 = @intCast(self.textLen);
         var bigTextHeight: f32 = 0;
@@ -410,13 +416,13 @@ const App = struct {
 
         // Draw the small text grid if we have a smallTextBitmap
         if (self.smallTextBitmap != null and textLen > 0) {
-            const cols = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientWidth)), @as(u32, @intFromFloat(self.smallTextWidth)))));
-            const rows = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientHeight)), @as(u32, @intFromFloat(self.smallTextHeight)))));
+            const cols = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientSize.width)), @as(u32, @intFromFloat(self.smallTextWidth)))));
+            const rows = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientSize.height)), @as(u32, @intFromFloat(self.smallTextHeight)))));
 
             var yGrid: f32 = bigTextHeight;
             var row: f32 = 0;
             while (row < rows) : (row += 1) {
-                var xGrid: f32 = (clientWidth - (cols * self.smallTextWidth)) / 2;
+                var xGrid: f32 = (clientSize.width - (cols * self.smallTextWidth)) / 2;
                 var col: f32 = 0;
                 while (col < cols) : (col += 1) {
                     self.renderTarget.?.ID2D1RenderTarget.DrawBitmap(
