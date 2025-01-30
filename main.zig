@@ -162,25 +162,13 @@ const App = struct {
         // Show and update the window
         _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
 
-        var rc: win32.RECT = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 };
-        _ = win32.GetClientRect(app.hwnd, &rc);
-
         const size: win32.D2D_SIZE_U = .{
-            .width = @intCast(rc.right - rc.left),
-            .height = @intCast(rc.bottom - rc.top),
+            .width = @intCast(win32.GetSystemMetrics(win32.SM_CXSCREEN)),
+            .height = @intCast(win32.GetSystemMetrics(win32.SM_CYSCREEN)),
         };
 
-        const dpi: f32 = @floatFromInt(win32.GetDpiForWindow(app.hwnd));
-
-        var targetProps: win32.D2D1_RENDER_TARGET_PROPERTIES = .{
-            .type = win32.D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            .pixelFormat = .{ .format = win32.DXGI_FORMAT_UNKNOWN, .alphaMode = win32.D2D1_ALPHA_MODE_UNKNOWN },
-            .dpiX = dpi,
-            .dpiY = dpi,
-            .usage = win32.D2D1_RENDER_TARGET_USAGE_NONE,
-            .minLevel = win32.D2D1_FEATURE_LEVEL_DEFAULT,
-        };
-        var hwndProps: win32.D2D1_HWND_RENDER_TARGET_PROPERTIES = .{
+        const targetProps: win32.D2D1_RENDER_TARGET_PROPERTIES = @bitCast([_]u8{0} ** (@sizeOf(win32.D2D1_RENDER_TARGET_PROPERTIES)));
+        const hwndProps: win32.D2D1_HWND_RENDER_TARGET_PROPERTIES = .{
             .hwnd = app.hwnd,
             .pixelSize = size,
             .presentOptions = win32.D2D1_PRESENT_OPTIONS_NONE,
@@ -270,6 +258,7 @@ const App = struct {
         if (self) |app| {
             return app.windowProc(hwnd, msg, wp, lp);
         }
+
         return win32.DefWindowProcW(hwnd, msg, wp, lp);
     }
 
@@ -334,70 +323,63 @@ const App = struct {
     }
 
     fn draw(self: *App) void {
-        self.renderTarget.?.ID2D1RenderTarget.BeginDraw();
+        _ = self.renderTarget.?.ID2D1RenderTarget.BeginDraw();
         defer _ = self.renderTarget.?.ID2D1RenderTarget.EndDraw(null, null);
 
         self.renderTarget.?.ID2D1RenderTarget.Clear(&win32.D2D_COLOR_F{ .r = 0, .g = 0, .b = 0, .a = 1 });
-
         const clientSize = self.renderTarget.?.ID2D1RenderTarget.GetSize();
-
-        if (clientSize.width == 0 or clientSize.height == 0) {
-            _ = win32.MessageBoxW(null, L("Window size is 0"), L("Error"), win32.MB_OK);
-            return;
-        }
-
+        // const clientSize: win32.D2D_SIZE_F = .{ .width = 100, .height = 100 };
         const textLen: u32 = @intCast(self.textLen);
-        var bigTextHeight: f32 = 0;
-
         var metrics: win32.DWRITE_TEXT_METRICS = undefined;
         _ = self.layoutBig.?.GetMetrics(&metrics);
-        bigTextHeight = metrics.height;
-        if (textLen > 0) {
-            // Actually draw the big text
-            self.renderTarget.?.ID2D1RenderTarget.DrawTextLayout(
-                .{ .x = 0, .y = 0 },
-                self.layoutBig,
-                @ptrCast(self.brush),
-                win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
+        const bigTextHeight = metrics.height;
 
-            // Position the cursor at the trailing edge
-            var hitTestMetrics: win32.DWRITE_HIT_TEST_METRICS = undefined;
-            _ = self.layoutBig.?.HitTestTextPosition(
-                textLen,
-                1,
-                &hitTestMetrics.left,
-                &hitTestMetrics.top,
-                &hitTestMetrics,
-            );
+        // Always call DrawTextLayout (does nothing visually if textLen=0, but sets up geometry).
+        self.renderTarget.?.ID2D1RenderTarget.DrawTextLayout(
+            .{ .x = 0, .y = 0 },
+            self.layoutBig,
+            @ptrCast(self.brush),
+            win32.D2D1_DRAW_TEXT_OPTIONS_NONE,
+        );
 
-            const lineHeight = hitTestMetrics.height;
-            const cursorHeight: f32 = lineHeight * 0.8;
-            const cursorY = hitTestMetrics.top + (lineHeight - cursorHeight) / 2;
-            const cursorX = hitTestMetrics.left;
+        // Position the cursor at the trailing edge if textLen>0, or at the top-left if 0
+        var hitTestMetrics: win32.DWRITE_HIT_TEST_METRICS = undefined;
+        const position = if (textLen > 0) textLen else 0;
+        _ = self.layoutBig.?.HitTestTextPosition(
+            position,
+            1,
+            &hitTestMetrics.left,
+            &hitTestMetrics.top,
+            &hitTestMetrics,
+        );
 
-            const cursorPath = blk: {
-                var geometry: ?*win32.ID2D1PathGeometry = null;
-                _ = self.factory.?.CreatePathGeometry(@ptrCast(&geometry));
-                var sink: ?*win32.ID2D1GeometrySink = null;
-                _ = geometry.?.Open(@ptrCast(&sink));
+        const actualLineHeight = if (hitTestMetrics.height > 0) hitTestMetrics.height else 16.0;
+        const cursorHeight: f32 = actualLineHeight * 0.8;
+        const cursorY = hitTestMetrics.top + (actualLineHeight - cursorHeight) / 2;
+        const cursorX = hitTestMetrics.left;
 
-                sink.?.ID2D1SimplifiedGeometrySink.BeginFigure(.{ .x = cursorX, .y = cursorY }, win32.D2D1_FIGURE_BEGIN_FILLED);
-                sink.?.AddLine(.{ .x = cursorX + 15, .y = cursorY + cursorHeight / 2 });
-                sink.?.AddLine(.{ .x = cursorX, .y = cursorY + cursorHeight });
-                sink.?.ID2D1SimplifiedGeometrySink.EndFigure(win32.D2D1_FIGURE_END_CLOSED);
-                _ = sink.?.ID2D1SimplifiedGeometrySink.Close();
-                _ = sink.?.IUnknown.Release();
-                break :blk geometry;
-            };
-            defer _ = cursorPath.?.IUnknown.Release();
+        // Build cursor triangle geometry
+        const cursorPath = blk: {
+            var geometry: ?*win32.ID2D1PathGeometry = null;
+            _ = self.factory.?.CreatePathGeometry(@ptrCast(&geometry));
+            var sink: ?*win32.ID2D1GeometrySink = null;
+            _ = geometry.?.Open(@ptrCast(&sink));
 
-            self.renderTarget.?.ID2D1RenderTarget.FillGeometry(
-                @ptrCast(cursorPath),
-                @ptrCast(self.redBrush),
-                null,
-            );
-        }
+            sink.?.ID2D1SimplifiedGeometrySink.BeginFigure(.{ .x = cursorX, .y = cursorY }, win32.D2D1_FIGURE_BEGIN_FILLED);
+            sink.?.AddLine(.{ .x = cursorX + 15, .y = cursorY + cursorHeight / 2 });
+            sink.?.AddLine(.{ .x = cursorX, .y = cursorY + cursorHeight });
+            sink.?.ID2D1SimplifiedGeometrySink.EndFigure(win32.D2D1_FIGURE_END_CLOSED);
+            _ = sink.?.ID2D1SimplifiedGeometrySink.Close();
+            _ = sink.?.IUnknown.Release();
+            break :blk geometry;
+        };
+        defer _ = cursorPath.?.IUnknown.Release();
+
+        self.renderTarget.?.ID2D1RenderTarget.FillGeometry(
+            @ptrCast(cursorPath),
+            @ptrCast(self.redBrush),
+            null,
+        );
 
         if (textLen > 0) {
             const cols = @as(f32, @floatFromInt(@divFloor(@as(u32, @intFromFloat(clientSize.width)), @as(u32, @intFromFloat(self.smallTextWidth)))));
@@ -481,7 +463,7 @@ const App = struct {
                 self.smallTextHeight = smallMetrics.height;
 
                 // If we have a valid renderTarget, create the smallTextBitmap once
-                if (self.renderTarget != null and self.smallTextWidth > 0 and self.smallTextHeight > 0) {
+                if (self.smallTextWidth > 0 and self.smallTextHeight > 0) {
                     var bitmapRenderTarget: ?*win32.ID2D1BitmapRenderTarget = null;
                     const hr1 = self.renderTarget.?.ID2D1RenderTarget.CreateCompatibleRenderTarget(
                         &win32.D2D_SIZE_F{ .width = self.smallTextWidth, .height = self.smallTextHeight },
