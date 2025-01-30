@@ -185,12 +185,14 @@ public:
     }
 
     void UpdateTextLayouts() {
+        if (!renderTarget_) {
+            return;
+        }
+
         layoutBig_.Reset();
         const UINT32 textLen = static_cast<UINT32>(text_.size());
         const wchar_t *textPtr = text_.c_str();
-        MessageBox(nullptr, L"UpdateTextLayouts", L"UpdateTextLayouts", MB_OK);
         auto sizeRT = renderTarget_->GetSize();
-        MessageBox(nullptr, L"UpdateTextLayouts2", L"UpdateTextLayouts2", MB_OK);
 
         // Create the big layout
         HRESULT hr = writeFactory_->CreateTextLayout(
@@ -221,6 +223,7 @@ public:
                 layoutSmall_.Reset();
                 return;
             }
+
             // Retrieve metrics to compute width/height
             DWRITE_TEXT_METRICS smallMetrics{};
             if (SUCCEEDED(layoutSmall_->GetMetrics(&smallMetrics))) {
@@ -358,13 +361,9 @@ public:
                 }
                 break;
             default:
-                // Printables (>=32)
-                if (ch >= 32) {
-                    text_.push_back(ch);
-                    UpdateTextLayouts();
-                    InvalidateRect(hwnd_, nullptr, TRUE);
-                }
-                break;
+                text_.push_back(ch);
+                UpdateTextLayouts();
+                InvalidateRect(hwnd_, nullptr, TRUE);
         }
     }
 
