@@ -2,10 +2,12 @@
 /.cmake/
 /.idea/
 /.vs/
+/.vscode/
 /build.ninja
 /CMakeCache.txt
 /CMakeFiles/
 /Testing/
+*.cmake
 *.obj
 *.pdb
 *.ilk
