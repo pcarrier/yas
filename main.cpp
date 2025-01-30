@@ -15,7 +15,6 @@ inline void ThrowIfFailed(HRESULT hr, const char* message) {
     }
 }
 
-// RAII helper for COM initialization
 struct ComInit {
     ComInit() {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -30,11 +29,8 @@ struct ComInit {
 
     // Non-copyable, non-movable
     ComInit(const ComInit &) = delete;
-
     ComInit &operator=(const ComInit &) = delete;
-
     ComInit(ComInit &&) = delete;
-
     ComInit &operator=(ComInit &&) = delete;
 };
 
@@ -54,26 +50,22 @@ public:
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         texts_.push_back(L"YAS!");
 
-        // Create Direct2D factory
         ThrowIfFailed(
             D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory_.GetAddressOf()),
             "Failed to create Direct2D factory"
         );
 
-        // Create DirectWrite factory
         ThrowIfFailed(
             DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                 reinterpret_cast<IUnknown **>(writeFactory_.GetAddressOf())),
             "Failed to create DirectWrite factory"
         );
 
-        // Retrieve user locale. If it fails, fall back to 'en-us'.
         wchar_t localeName[LOCALE_NAME_MAX_LENGTH] = {};
         if (0 == GetUserDefaultLocaleName(localeName, LOCALE_NAME_MAX_LENGTH)) {
             wcscpy_s(localeName, L"en-us");
         }
 
-        // Create text formats (small and big)
         ThrowIfFailed(
             writeFactory_->CreateTextFormat(
                 WINDOW_NAME,
@@ -99,7 +91,6 @@ public:
             "Failed to create big textFormat"
         );
 
-        // Register the window class
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
         wc.hInstance = hInstance;
@@ -111,24 +102,20 @@ public:
             throw std::runtime_error("RegisterClassExW failed");
         }
 
-        // Step 1: get current mouse position
         POINT pt;
         GetCursorPos(&pt);
 
-        // Step 2: find the monitor from this point
         HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST); // or MONITOR_DEFAULTTOPRIMARY
         MONITORINFO mi{};
         mi.cbSize = sizeof(mi);
         if (!GetMonitorInfoW(hMonitor, &mi)) {
             throw std::runtime_error("GetMonitorInfoW failed");
         }
-        // Step 3: retrieve bounding rect
         int x = mi.rcMonitor.left;
         int y = mi.rcMonitor.top;
         int w = mi.rcMonitor.right - mi.rcMonitor.left;
         int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
 
-        // Step 4: create the window to fill that monitor
         hwnd_ = CreateWindowExW(
             0,
             CLASS_NAME,
@@ -147,7 +134,6 @@ public:
             throw std::runtime_error("CreateWindowExW failed");
         }
 
-        // Create the render target
         RECT rc{};
         GetClientRect(hwnd_, &rc);
         ThrowIfFailed(
@@ -159,7 +145,6 @@ public:
             "Failed to create HwndRenderTarget"
         );
 
-        // Create brushes
         ThrowIfFailed(
             renderTarget_->CreateSolidColorBrush(
                 D2D1::ColorF(1, 1, 1, 1), // white
@@ -173,7 +158,6 @@ public:
             "Failed to create red brush"
         );
 
-        // Create the gray brush
         ThrowIfFailed(
             renderTarget_->CreateSolidColorBrush(
                 D2D1::ColorF(0.666f, 0.666f, 0.666f, 1.0f),
@@ -193,7 +177,6 @@ public:
         layoutsBig_.clear();
         auto sizeRT = renderTarget_->GetSize();
 
-        // Build a big layout for each string
         for (auto &txt : texts_) {
             ComPtr<IDWriteTextLayout> layout;
             ThrowIfFailed(
@@ -217,10 +200,9 @@ public:
         renderTarget_->BeginDraw();
         renderTarget_->Clear(D2D1::ColorF(0, 0, 0, 1));
 
-        float xOffset = 0.0f;
-        float yOffset = 0.0f;
+        float xOffset = border;
+        float yOffset = border;
 
-        // Track the maximum height of all big text in this row
         float maxHeight = 0.0f;
 
         for (size_t i = 0; i < layoutsBig_.size(); i++) {
@@ -258,7 +240,6 @@ public:
             sink->AddLine(D2D1::Point2F(xOffset + triSize, yOffset + metrics.height / 2.0f));
             sink->AddLine(D2D1::Point2F(xOffset, yOffset + metrics.height));
             sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-
             ThrowIfFailed(sink->Close(), "Geometry sink close failed");
 
             if (i == activeTextIndex_) {
@@ -266,18 +247,17 @@ public:
             } else {
                 renderTarget_->DrawGeometry(geometry.Get(), redBrush_.Get(), 2.0f);
             }
+
             xOffset += triSize;
         }
 
-        // Now shift yOffset to move below the big text row
-        yOffset += maxHeight;
+        yOffset += maxHeight + border;
 
-        // Tile the currently active text in the leftover space
         auto sizeRT = renderTarget_->GetSize();
-        float leftoverHeight = sizeRT.height - yOffset;
-        float leftoverWidth = sizeRT.width;
+        float leftoverHeight = sizeRT.height - yOffset - 2 * border;
+        float leftoverWidth = sizeRT.width - 2 * border;
 
-        if (leftoverHeight > 0) {
+        if (leftoverHeight > 0 && leftoverWidth > 0) {
             ComPtr<IDWriteTextLayout> smallLayout;
             ThrowIfFailed(
                 writeFactory_->CreateTextLayout(
@@ -295,18 +275,16 @@ public:
                 DWRITE_TEXT_METRICS smMetrics{};
                 smallLayout->GetMetrics(&smMetrics);
 
-                // how many times the text fits horizontally / vertically
                 int cols = static_cast<int>(leftoverWidth / smMetrics.width);
                 int rows = static_cast<int>(leftoverHeight / smMetrics.height);
 
                 float totalWidth = cols * smMetrics.width;
                 float totalHeight = rows * smMetrics.height;
 
-                // Center the tiled block
-                float offsetX = (leftoverWidth - totalWidth) * 0.5f;
-                float offsetY2 = yOffset + (leftoverHeight - totalHeight) * 0.5f;
+                float offsetX = (leftoverWidth - totalWidth) * 0.5f + border;
+                float offsetY2 = yOffset + border + (leftoverHeight - totalHeight) * 0.5f;
 
-                brush_->SetColor(D2D1::ColorF(1, 1, 1, 1)); // white
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, 1));
                 for (int r = 0; r < rows; ++r) {
                     for (int c = 0; c < cols; ++c) {
                         float x = offsetX + c * smMetrics.width;
@@ -323,15 +301,13 @@ public:
         renderTarget_->EndDraw();
     }
 
-    // Called when the user types a character
     void OnChar(WPARAM wParam) {
         wchar_t ch = static_cast<wchar_t>(wParam);
-        if (ch == 8) { // backspace
+        if (ch == 8) {
             if (!texts_.empty()) {
                 auto &activeString = texts_[activeTextIndex_];
                 if (!activeString.empty()) {
                     activeString.pop_back();
-                    // Remove the empty string if it's not the only text
                     if (activeString.empty() && texts_.size() > 1) {
                         texts_.erase(texts_.begin() + activeTextIndex_);
                         if (activeTextIndex_ >= texts_.size()) {
@@ -357,7 +333,6 @@ public:
         Draw();
     }
 
-    // Create a new OnKeyDown method
     bool OnKeyDown(WPARAM wParam) {
         if (wParam == VK_ESCAPE) {
             PostQuitMessage(0);
@@ -395,44 +370,32 @@ public:
     }
 
     void NextText() {
-        // If the current node is empty, remove it
         if (texts_[activeTextIndex_].empty()) {
-            // Only remove if we have more than one text left
             if (texts_.size() > 1) {
                 texts_.erase(texts_.begin() + activeTextIndex_);
-                // Now, if we were at the last node, clamp index
                 if (activeTextIndex_ >= texts_.size()) {
                     activeTextIndex_ = texts_.size() - 1;
                 }
             }
-            // Otherwise, if there's only one text and it's empty, do nothing
         } else {
-            // Current node is non-empty: insert a new empty node after it
             texts_.insert(texts_.begin() + activeTextIndex_ + 1, L"");
-            // Move onto the newly inserted empty node
             activeTextIndex_++;
         }
     }
 
     void PrevText() {
-        // If the current node is empty, remove it
         if (texts_[activeTextIndex_].empty()) {
             if (texts_.size() > 1) {
                 texts_.erase(texts_.begin() + activeTextIndex_);
-                // After removal, move one step left if possible
                 if (activeTextIndex_ > 0) {
                     activeTextIndex_--;
                 }
-                // If we removed the last text, clamp index
                 if (activeTextIndex_ >= texts_.size()) {
                     activeTextIndex_ = texts_.size() - 1;
                 }
             }
-            // If there's only one text total and it's empty, do nothing
         } else {
-            // Current node is non-empty, insert a new empty node before it
             texts_.insert(texts_.begin() + activeTextIndex_, L"");
-            // Stay at the same activeTextIndex_, which is now the new empty text
         }
     }
 
@@ -473,7 +436,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     }
 }
 
-// Finally, rewrite WindowProc to delegate to the above methods
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_CREATE) {
         auto cs = reinterpret_cast<CREATESTRUCTW *>(lParam);
@@ -491,7 +453,6 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_PAINT: {
             PAINTSTRUCT ps;
             BeginPaint(hwnd, &ps);
-            // delegate painting:
             app->OnPaint();
             EndPaint(hwnd, &ps);
             return 0;
