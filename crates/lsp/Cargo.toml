@@ -1,0 +1,18 @@
+[package]
+name = "yas-lsp"
+version = "0.1.0"
+edition.workspace = true
+description = "Language intelligence engine: warm shared language servers projected into yas records"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+yas-fssync = { workspace = true }
+blake3 = { version = "1", default-features = false }
+lz4_flex = { version = "0.13", default-features = false, features = ["safe-encode", "safe-decode"] }
+notify = "8"
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

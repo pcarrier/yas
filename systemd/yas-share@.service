@@ -1,0 +1,12 @@
+[Unit]
+Description=Yas share %i
+After=network.target
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/yas/share-%i.env
+ExecStart=yas share --quiet
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,715 @@
+schema = 1
+family = "yas.surface"
+
+limits = [
+  { name = "MAX_SURFACES_PER_SESSION", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_VIEWS_PER_SESSION", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_VIEW_DIMENSION", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_VIEW_PIXELS", tag = 4, type = "u64", required = true, hard_min = 1, hard_max = 16777216 },
+  { name = "MAX_FRAME_RATE", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 240 },
+  { name = "MAX_INLINE_CURSOR_BYTES", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_REMOTE_CONTACTS", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+  { name = "MAX_APP_ENDPOINTS_PER_SESSION", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_APP_ENDPOINT_LIFETIME_NS", tag = 9, type = "u64", required = true, hard_min = 1, hard_max = 86400000000000 },
+]
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+[[request]]
+name = "CREATE_APP_ENDPOINT"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],application_id:string_u16,Extensions; ResultPrefix + app_handle:u64,expires_server_ns:u64,environment_count:u16,repeated key:bytes_u16,value:bytes_u32,Extensions"
+[[request]]
+name = "OPEN_VIEW"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "surface_handle:u64,width:u32,height:u32,max_fps:u16,decoder_capacity:u8,codec_count:u8,repeated codec_version:u16,Extensions; ResultPrefix + ViewResult"
+[[request]]
+name = "CONFIGURE_VIEW"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,width:u32,height:u32,max_fps:u16,decoder_capacity:u8,reserved:u8=0,latency_target_ns:u64,Extensions; ResultPrefix"
+[[request]]
+name = "RESET_VIEW"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32; ResultPrefix"
+[[request]]
+name = "CLOSE_VIEW"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32; ResultPrefix"
+[[request]]
+name = "CAPTURE"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "surface_handle:u64,revision:u64,initial_receive_credit:u64,format_count:u8,reserved:[u8;3]=0,repeated format:u8,Extensions; ResultPrefix + InlineOrTransfer"
+[[request]]
+name = "RESIZE"
+kind = 0x0008
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "surface_handle:u64,operation_id:[u8;16],logical_width_32_32:i64,logical_height_32_32:i64,Extensions; ResultPrefix + state_revision:u64"
+[[request]]
+name = "FOCUS"
+kind = 0x0009
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "surface_handle:u64,operation_id:[u8;16],focused:u8,reserved:[u8;7]=0,Extensions; ResultPrefix + state_revision:u64"
+[[request]]
+name = "CLOSE"
+kind = 0x000a
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "surface_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix"
+[[request]]
+name = "RELEASE_APP_ENDPOINT"
+kind = 0x000b
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "app_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<SurfaceRecord>"
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+[[event]]
+name = "KEY"
+kind = 0x0010
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,feedback:FrameFeedback,client_monotonic_ns:u64,key_code:u16,state:u8,reserved:u8=0,modifiers:u32"
+[[event]]
+name = "TEXT"
+kind = 0x0011
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,feedback:FrameFeedback,client_monotonic_ns:u64,text:string_u32"
+[[event]]
+name = "PREEDIT"
+kind = 0x0012
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,client_monotonic_ns:u64,selection_start:u32,selection_end:u32,cursor:u32,text:string_u32"
+[[event]]
+name = "POINTER"
+kind = 0x0013
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,feedback:FrameFeedback,client_monotonic_ns:u64,phase:u8,button:u8,reserved:u16=0,x_32_32:i64,y_32_32:i64"
+[[event]]
+name = "AXIS"
+kind = 0x0014
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,feedback:FrameFeedback,client_monotonic_ns:u64,source:u8,flags:u8,reserved:u16=0,dx_32_32:i64,dy_32_32:i64,steps_x:i32,steps_y:i32"
+[[event]]
+name = "TOUCH"
+kind = 0x0015
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,client_monotonic_ns:u64,phase:u8,reserved:u8=0,contact_count:u16,repeated contact_id:u32,x_32_32:i64,y_32_32:i64"
+[[event]]
+name = "FRAME_ACK"
+kind = 0x0016
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,presented_sequence:u64,decoder_queue_depth:u16,available_slots:u16"
+[[event]]
+name = "FRAME"
+kind = 0x0020
+direction = "server_to_client"
+sensitive = "required"
+compression = "forbidden"
+datagram = "surface_frame"
+layout = "view_id:u32,sequence:u64,base_sequence:u64,capture_ns:u64,presentation_ns:u64,flags:u16,codec_version:u16,fragment_index:u16,fragment_count:u16,complete_len:u32,payload:remaining"
+[[event]]
+name = "REMOTE_INPUT"
+kind = 0x0021
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "surface_handle:u64,seat_handle:u64,expires_server_ns:u64,input_kind:u8,reserved:u8=0,contact_count:u16,repeated contact_id:u32,x_32_32:i64,y_32_32:i64; POINTER requires exactly one contact with contact_id=0, TOUCH permits 0..MAX_REMOTE_CONTACTS unique contacts"
+
+[[type]]
+name = "surface_record"
+layout = "surface_handle:u64,revision:u64,parent_handle:u64,app_handle:u64,lifecycle:u8,reserved:u8=0,composite_width:u32,composite_height:u32,logical_width_32_32:i64,logical_height_32_32:i64,application_id:string_u16,title:string_u16,Extensions"
+[[type]]
+name = "view_result"
+layout = "view_id:u32,codec_version:u16,max_inflight_frames:u16,max_encoded_frame:u32,max_decoded_frame:u32,first_sequence:u64,Extensions"
+
+[[type]]
+name = "cursor_state"
+layout = "kind:u8,reserved:[u8;3]=0; NAMED name:string_u16, HIDDEN empty, CUSTOM hotspot_x:i32,hotspot_y:i32,width:u32,height:u32,scale_120:u16,reserved:u16=0,png:bytes_u32 (at most 32768 bytes)"
+[[type]]
+name = "text_input_state"
+layout = "flags:u16,reserved:u16=0,content_hint:u32,content_purpose:u32; when HAS_CURSOR_RECT x:i32,y:i32,width:i32,height:i32"
+[[constant]]
+name = "STATE_ACTIVATION_REVISION_EXTENSION"
+value = 1
+[[constant]]
+name = "STATE_CURSOR_EXTENSION"
+value = 2
+[[constant]]
+name = "STATE_TEXT_INPUT_EXTENSION"
+value = 3
+[[constant]]
+name = "RESIZE_SCALE_120_EXTENSION"
+value = 4
+[[constant]]
+name = "STATE_MAXIMIZE_REQUEST_EXTENSION"
+value = 5
+[[constant]]
+name = "MAX_INLINE_CURSOR_BYTES"
+value = 32768
+[[constant]]
+name = "CURSOR_NAMED"
+value = 0
+[[constant]]
+name = "CURSOR_HIDDEN"
+value = 1
+[[constant]]
+name = "CURSOR_CUSTOM"
+value = 2
+[[constant]]
+name = "TEXT_INPUT_ENABLED"
+value = 1
+[[constant]]
+name = "TEXT_INPUT_REQUESTED"
+value = 2
+[[constant]]
+name = "TEXT_INPUT_HAS_CURSOR_RECT"
+value = 4
+[[constant]]
+name = "TEXT_INPUT_FLAGS_MASK"
+value = 7
+
+[[constant]]
+name = "CAPTURE_PNG"
+value = 1
+[[constant]]
+name = "CAPTURE_AVIF"
+value = 2
+[[constant]]
+name = "FRAME_KEYFRAME"
+value = 1
+[[constant]]
+name = "FRAME_CODEC_CONFIG"
+value = 2
+[[constant]]
+name = "FRAME_DISCARDABLE"
+value = 4
+[[constant]]
+name = "FRAME_END_OF_STREAM"
+value = 8
+[[constant]]
+name = "FRAME_GAP"
+value = 16
+[[constant]]
+name = "FRAME_DATAGRAM_ELIGIBLE"
+value = 32
+[[constant]]
+name = "FRAME_FLAGS_MASK"
+value = 63
+
+[[constant]]
+name = "REMOTE_INPUT_POINTER"
+value = 0
+[[constant]]
+name = "REMOTE_INPUT_TOUCH"
+value = 1
+[[constant]]
+name = "MAX_REMOTE_CONTACTS"
+value = 64
+
+[[constant]]
+name = "MAX_SURFACES_PER_SESSION"
+value = 4096
+[[constant]]
+name = "MAX_VIEWS_PER_SESSION"
+value = 4096
+[[constant]]
+name = "MAX_VIEW_DIMENSION"
+value = 4096
+[[constant]]
+name = "MAX_VIEW_PIXELS"
+value = 16777216
+[[constant]]
+name = "MAX_FRAME_RATE"
+value = 240
+[[constant]]
+name = "MAX_APP_ENDPOINTS_PER_SESSION"
+value = 1024
+[[constant]]
+name = "MAX_APP_ENDPOINT_LIFETIME_NS"
+value = 86400000000000
+
+[[constant]]
+name = "LIMIT_MAX_SURFACES_PER_SESSION"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_VIEWS_PER_SESSION"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_VIEW_DIMENSION"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_VIEW_PIXELS"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_FRAME_RATE"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_INLINE_CURSOR_BYTES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_REMOTE_CONTACTS"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_APP_ENDPOINTS_PER_SESSION"
+value = 8
+[[constant]]
+name = "LIMIT_MAX_APP_ENDPOINT_LIFETIME_NS"
+value = 9
+
+[[constant]]
+name = "KEY_STATE_RELEASED"
+value = 0
+[[constant]]
+name = "KEY_STATE_PRESSED"
+value = 1
+[[constant]]
+name = "KEY_STATE_REPEAT"
+value = 2
+[[constant]]
+name = "MODIFIER_SHIFT"
+value = 1
+[[constant]]
+name = "MODIFIER_CONTROL"
+value = 2
+[[constant]]
+name = "MODIFIER_ALT"
+value = 4
+[[constant]]
+name = "MODIFIER_SUPER"
+value = 8
+[[constant]]
+name = "MODIFIER_CAPS_LOCK"
+value = 16
+[[constant]]
+name = "MODIFIER_NUM_LOCK"
+value = 32
+[[constant]]
+name = "MODIFIER_MASK"
+value = 63
+
+# YAS physical-key registry v1. Values follow USB HID keyboard-page positions.
+[[constant]]
+name = "KEY_A"
+value = 0x04
+[[constant]]
+name = "KEY_B"
+value = 0x05
+[[constant]]
+name = "KEY_C"
+value = 0x06
+[[constant]]
+name = "KEY_D"
+value = 0x07
+[[constant]]
+name = "KEY_E"
+value = 0x08
+[[constant]]
+name = "KEY_F"
+value = 0x09
+[[constant]]
+name = "KEY_G"
+value = 0x0a
+[[constant]]
+name = "KEY_H"
+value = 0x0b
+[[constant]]
+name = "KEY_I"
+value = 0x0c
+[[constant]]
+name = "KEY_J"
+value = 0x0d
+[[constant]]
+name = "KEY_K"
+value = 0x0e
+[[constant]]
+name = "KEY_L"
+value = 0x0f
+[[constant]]
+name = "KEY_M"
+value = 0x10
+[[constant]]
+name = "KEY_N"
+value = 0x11
+[[constant]]
+name = "KEY_O"
+value = 0x12
+[[constant]]
+name = "KEY_P"
+value = 0x13
+[[constant]]
+name = "KEY_Q"
+value = 0x14
+[[constant]]
+name = "KEY_R"
+value = 0x15
+[[constant]]
+name = "KEY_S"
+value = 0x16
+[[constant]]
+name = "KEY_T"
+value = 0x17
+[[constant]]
+name = "KEY_U"
+value = 0x18
+[[constant]]
+name = "KEY_V"
+value = 0x19
+[[constant]]
+name = "KEY_W"
+value = 0x1a
+[[constant]]
+name = "KEY_X"
+value = 0x1b
+[[constant]]
+name = "KEY_Y"
+value = 0x1c
+[[constant]]
+name = "KEY_Z"
+value = 0x1d
+[[constant]]
+name = "KEY_1"
+value = 0x1e
+[[constant]]
+name = "KEY_2"
+value = 0x1f
+[[constant]]
+name = "KEY_3"
+value = 0x20
+[[constant]]
+name = "KEY_4"
+value = 0x21
+[[constant]]
+name = "KEY_5"
+value = 0x22
+[[constant]]
+name = "KEY_6"
+value = 0x23
+[[constant]]
+name = "KEY_7"
+value = 0x24
+[[constant]]
+name = "KEY_8"
+value = 0x25
+[[constant]]
+name = "KEY_9"
+value = 0x26
+[[constant]]
+name = "KEY_0"
+value = 0x27
+[[constant]]
+name = "KEY_ENTER"
+value = 0x28
+[[constant]]
+name = "KEY_ESCAPE"
+value = 0x29
+[[constant]]
+name = "KEY_BACKSPACE"
+value = 0x2a
+[[constant]]
+name = "KEY_TAB"
+value = 0x2b
+[[constant]]
+name = "KEY_SPACE"
+value = 0x2c
+[[constant]]
+name = "KEY_MINUS"
+value = 0x2d
+[[constant]]
+name = "KEY_EQUAL"
+value = 0x2e
+[[constant]]
+name = "KEY_BRACKET_LEFT"
+value = 0x2f
+[[constant]]
+name = "KEY_BRACKET_RIGHT"
+value = 0x30
+[[constant]]
+name = "KEY_BACKSLASH"
+value = 0x31
+[[constant]]
+name = "KEY_SEMICOLON"
+value = 0x33
+[[constant]]
+name = "KEY_QUOTE"
+value = 0x34
+[[constant]]
+name = "KEY_BACKQUOTE"
+value = 0x35
+[[constant]]
+name = "KEY_COMMA"
+value = 0x36
+[[constant]]
+name = "KEY_PERIOD"
+value = 0x37
+[[constant]]
+name = "KEY_SLASH"
+value = 0x38
+[[constant]]
+name = "KEY_CAPS_LOCK"
+value = 0x39
+[[constant]]
+name = "KEY_F1"
+value = 0x3a
+[[constant]]
+name = "KEY_F2"
+value = 0x3b
+[[constant]]
+name = "KEY_F3"
+value = 0x3c
+[[constant]]
+name = "KEY_F4"
+value = 0x3d
+[[constant]]
+name = "KEY_F5"
+value = 0x3e
+[[constant]]
+name = "KEY_F6"
+value = 0x3f
+[[constant]]
+name = "KEY_F7"
+value = 0x40
+[[constant]]
+name = "KEY_F8"
+value = 0x41
+[[constant]]
+name = "KEY_F9"
+value = 0x42
+[[constant]]
+name = "KEY_F10"
+value = 0x43
+[[constant]]
+name = "KEY_F11"
+value = 0x44
+[[constant]]
+name = "KEY_F12"
+value = 0x45
+[[constant]]
+name = "KEY_PRINT_SCREEN"
+value = 0x46
+[[constant]]
+name = "KEY_SCROLL_LOCK"
+value = 0x47
+[[constant]]
+name = "KEY_PAUSE"
+value = 0x48
+[[constant]]
+name = "KEY_INSERT"
+value = 0x49
+[[constant]]
+name = "KEY_HOME"
+value = 0x4a
+[[constant]]
+name = "KEY_PAGE_UP"
+value = 0x4b
+[[constant]]
+name = "KEY_DELETE"
+value = 0x4c
+[[constant]]
+name = "KEY_END"
+value = 0x4d
+[[constant]]
+name = "KEY_PAGE_DOWN"
+value = 0x4e
+[[constant]]
+name = "KEY_ARROW_RIGHT"
+value = 0x4f
+[[constant]]
+name = "KEY_ARROW_LEFT"
+value = 0x50
+[[constant]]
+name = "KEY_ARROW_DOWN"
+value = 0x51
+[[constant]]
+name = "KEY_ARROW_UP"
+value = 0x52
+[[constant]]
+name = "KEY_NUM_LOCK"
+value = 0x53
+[[constant]]
+name = "KEY_CONTROL_LEFT"
+value = 0xe0
+[[constant]]
+name = "KEY_SHIFT_LEFT"
+value = 0xe1
+[[constant]]
+name = "KEY_ALT_LEFT"
+value = 0xe2
+[[constant]]
+name = "KEY_SUPER_LEFT"
+value = 0xe3
+[[constant]]
+name = "KEY_CONTROL_RIGHT"
+value = 0xe4
+[[constant]]
+name = "KEY_SHIFT_RIGHT"
+value = 0xe5
+[[constant]]
+name = "KEY_ALT_RIGHT"
+value = 0xe6
+[[constant]]
+name = "KEY_SUPER_RIGHT"
+value = 0xe7
+
+[[constant]]
+name = "POINTER_PHASE_MOVE"
+value = 0
+[[constant]]
+name = "POINTER_PHASE_DOWN"
+value = 1
+[[constant]]
+name = "POINTER_PHASE_UP"
+value = 2
+[[constant]]
+name = "POINTER_PHASE_ENTER"
+value = 3
+[[constant]]
+name = "POINTER_PHASE_LEAVE"
+value = 4
+[[constant]]
+name = "POINTER_BUTTON_NONE"
+value = 0
+[[constant]]
+name = "POINTER_BUTTON_PRIMARY"
+value = 1
+[[constant]]
+name = "POINTER_BUTTON_SECONDARY"
+value = 2
+[[constant]]
+name = "POINTER_BUTTON_MIDDLE"
+value = 3
+[[constant]]
+name = "POINTER_BUTTON_BACK"
+value = 4
+[[constant]]
+name = "POINTER_BUTTON_FORWARD"
+value = 5
+[[constant]]
+name = "AXIS_SOURCE_WHEEL"
+value = 0
+[[constant]]
+name = "AXIS_SOURCE_FINGER"
+value = 1
+[[constant]]
+name = "AXIS_SOURCE_CONTINUOUS"
+value = 2
+[[constant]]
+name = "AXIS_SOURCE_WHEEL_TILT"
+value = 3
+[[constant]]
+name = "AXIS_STOP_X"
+value = 1
+[[constant]]
+name = "AXIS_STOP_Y"
+value = 2
+[[constant]]
+name = "AXIS_INVERTED_X"
+value = 4
+[[constant]]
+name = "AXIS_INVERTED_Y"
+value = 8
+[[constant]]
+name = "AXIS_FLAGS_MASK"
+value = 15
+[[constant]]
+name = "TOUCH_PHASE_DOWN"
+value = 0
+[[constant]]
+name = "TOUCH_PHASE_MOVE"
+value = 1
+[[constant]]
+name = "TOUCH_PHASE_UP"
+value = 2
+[[constant]]
+name = "TOUCH_PHASE_CANCEL"
+value = 3
+[[constant]]
+name = "TOUCH_PHASE_FRAME"
+value = 4
+
+[[type]]
+name = "family_limits"
+layout = "ordered optional extensions: tags 1..9 encode max surfaces/session:u32,views/session:u32,view dimension:u32,view pixels:u64,frame rate:u32,inline cursor bytes:u32,remote contacts:u32,app endpoints/session:u32,app endpoint lifetime ns:u64; all tags are present in a selected family descriptor"

@@ -1,0 +1,13 @@
+{
+  "//": [
+    "A successful oneshot is a staged build result: rerunning it leaves the",
+    "current server alive while Cargo works. Muster restarts dependents only",
+    "after the replacement build exits successfully, and leaves the working",
+    "server untouched if the build fails."
+  ],
+  "description": "Yas profiling server build (${INSTANCE})",
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-build"],
+  "type": "oneshot",
+  "timeoutStart": "10m",
+  "keep": 3
+}

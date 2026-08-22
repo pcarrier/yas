@@ -1,0 +1,1998 @@
+//! Direct NVENC encoder — no ffmpeg dependency.
+//!
+//! Uses the NVIDIA Video Codec SDK via `dlopen("libnvidia-encode.so")`.
+//! All encoders share one CUDA primary context per device, retained via
+//! `dlopen("libcuda.so")` — a private context per encoder costs tens of MB
+//! of driver host memory plus driver threads each.
+//!
+//! The encoder is fed YUV that is already limited-range BT.601 — normally
+//! the compositor's compute shaders, via a zero-copy `OPAQUE_FD` import.  It
+//! is never handed packed RGB so the matrix and rounding remain identical
+//! across paths instead of depending on NVENC's implicit conversion.
+
+#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+
+use crate::gpu_libs;
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::ptr;
+
+// ---------------------------------------------------------------------------
+// NVENC API constants
+// ---------------------------------------------------------------------------
+
+const NV_ENC_SUCCESS: u32 = 0;
+/// `NVENCSTATUS` ordinal, counted from nvEncodeAPI.h — 10 is
+/// `NV_ENC_ERR_OUT_OF_MEMORY`, which this was set to.  The encode paths
+/// treat this status as "no output for this frame yet", so an encoder that
+/// ran out of memory reported nothing at all, while a genuine request for
+/// more input was raised as a hard failure.
+const NV_ENC_ERR_NEED_MORE_INPUT: u32 = 17;
+
+// API version whose struct layouts we target.  Must match a version the
+// driver is backward-compatible with.  We use 12.1 — matching the widely
+// deployed nv-codec-headers (used by ffmpeg/gstreamer), so this is the
+// ABI version most drivers are tested against.
+const NVENCAPI_MAJOR_VERSION: u32 = 12;
+const NVENCAPI_MINOR_VERSION: u32 = 1;
+
+/// NVENCAPI_VERSION = major | (minor << 24)
+const NVENCAPI_VERSION: u32 = NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24);
+
+/// NVENCAPI_STRUCT_VERSION(v) = NVENCAPI_VERSION | (v << 16) | (0x7 << 28)
+const fn nvencapi_struct_version(typ_ver: u32) -> u32 {
+    NVENCAPI_VERSION | (typ_ver << 16) | (0x7 << 28)
+}
+
+// Struct version tags (nv-codec-headers 12.1.14.0).
+// Some structs set bit 31 to signal extended feature support.
+const NV_ENC_OPEN_ENCODE_SESSION_EX_VER: u32 = nvencapi_struct_version(1);
+const NV_ENC_INITIALIZE_PARAMS_VER: u32 = nvencapi_struct_version(6) | (1 << 31);
+const NV_ENC_PRESET_CONFIG_VER: u32 = nvencapi_struct_version(4) | (1 << 31);
+const NV_ENC_CONFIG_VER: u32 = nvencapi_struct_version(8) | (1 << 31);
+const NV_ENC_CREATE_BITSTREAM_BUFFER_VER: u32 = nvencapi_struct_version(1);
+const NV_ENC_PIC_PARAMS_VER: u32 = nvencapi_struct_version(6) | (1 << 31);
+const NV_ENC_LOCK_BITSTREAM_VER: u32 = nvencapi_struct_version(1) | (1 << 31);
+const NV_ENC_RECONFIGURE_PARAMS_VER: u32 = nvencapi_struct_version(1) | (1 << 31);
+
+// Buffer formats (from nv-codec-headers 12.1)
+const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
+// YUV444 is only reached from the OPAQUE_FD import path, which is Linux-only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const NV_ENC_BUFFER_FORMAT_YUV444: u32 = 0x00001000; // planar Y,U,V — NOT 0x10, that's YV12
+
+// Encoder capability query.  The values are ordinals into `NV_ENC_CAPS`
+// (nvEncodeAPI.h) — count the enum, don't guess: `SUPPORT_YUV444_ENCODE`
+// was long spelled 15 here, which is `SEPARATE_COLOUR_PLANE`.  It happened
+// to answer the same way on the GPUs we had, so nothing caught it.
+const NV_ENC_CAPS_PARAM_VER: u32 = nvencapi_struct_version(1);
+const NV_ENC_CAPS_PARAM_SIZE: usize = 256;
+const NV_ENC_CAPS_WIDTH_MAX: u32 = 16;
+const NV_ENC_CAPS_HEIGHT_MAX: u32 = 17;
+const NV_ENC_CAPS_SUPPORT_YUV444_ENCODE: u32 = 33;
+const NV_ENC_CAPS_WIDTH_MIN: u32 = 45;
+const NV_ENC_CAPS_HEIGHT_MIN: u32 = 46;
+const NV_ENC_CAPS_NUM_ENCODER_ENGINES: u32 = 49;
+
+// Resource types for nvEncRegisterResource
+const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: u32 = 0x01;
+const NV_ENC_REGISTER_RESOURCE_VER: u32 = nvencapi_struct_version(4);
+const NV_ENC_MAP_INPUT_RESOURCE_VER: u32 = nvencapi_struct_version(4);
+
+// NV_ENC_REGISTER_RESOURCE struct size (must cover all fields + reserved[245] + reserved2[61])
+const NVENC_REGISTER_RESOURCE_SIZE: usize = 2048;
+// NV_ENC_MAP_INPUT_RESOURCE struct size (includes reserved fields)
+const NVENC_MAP_INPUT_RESOURCE_SIZE: usize = 2048;
+
+// Codec GUIDs (H.264 and AV1)
+const NV_ENC_CODEC_H264_GUID: NvGuid = NvGuid(
+    0x6BC82762,
+    0x4E63,
+    0x4CA4,
+    [0xAA, 0x85, 0x1E, 0x50, 0xF3, 0x21, 0xF6, 0xBF],
+);
+const NV_ENC_CODEC_AV1_GUID: NvGuid = NvGuid(
+    0x0A352289,
+    0x0AA7,
+    0x4759,
+    [0x86, 0x2D, 0x5D, 0x15, 0xCD, 0x16, 0xD2, 0x54],
+);
+
+// Preset GUIDs P1 (fastest) … P7 (slowest), from nvEncodeAPI.h.
+const NV_ENC_PRESET_GUIDS: [NvGuid; 7] = [
+    NvGuid(
+        0xFC0A8D3E,
+        0x45F8,
+        0x4CF8,
+        [0x80, 0xC7, 0x29, 0x88, 0x71, 0x59, 0x0E, 0xBF],
+    ),
+    NvGuid(
+        0xF581CFB8,
+        0x88D6,
+        0x4381,
+        [0x93, 0xF0, 0xDF, 0x13, 0xF9, 0xC2, 0x7D, 0xAB],
+    ),
+    NvGuid(
+        0x36850110,
+        0x3A07,
+        0x441F,
+        [0x94, 0xD5, 0x36, 0x70, 0x63, 0x1F, 0x91, 0xF6],
+    ),
+    NvGuid(
+        0x90A7B826,
+        0xDF06,
+        0x4862,
+        [0xB9, 0xD2, 0xCD, 0x6D, 0x73, 0xA0, 0x86, 0x81],
+    ),
+    NvGuid(
+        0x21C6E6B4,
+        0x297A,
+        0x4CBA,
+        [0x99, 0x8F, 0xB6, 0xCB, 0xDE, 0x72, 0xAD, 0xE3],
+    ),
+    NvGuid(
+        0x8E75C279,
+        0x6299,
+        0x4AB6,
+        [0x83, 0x02, 0x0B, 0x21, 0x5A, 0x33, 0x5C, 0xF5],
+    ),
+    NvGuid(
+        0x84848C12,
+        0x6F71,
+        0x4C13,
+        [0x93, 0x1B, 0x53, 0xE2, 0x83, 0xF5, 0x79, 0x74],
+    ),
+];
+
+/// `preset` is 1 (P1, fastest) … 7 (P7, slowest); out-of-range clamps to P1.
+fn preset_guid(preset: u8) -> NvGuid {
+    NV_ENC_PRESET_GUIDS[(preset.clamp(1, 7) - 1) as usize]
+}
+
+// H.264 profile GUID — High 4:4:4 Predictive (from nvEncodeAPI.h)
+const NV_ENC_H264_PROFILE_HIGH_444_GUID: NvGuid = NvGuid(
+    0x7AC663CB,
+    0xA598,
+    0x49D8,
+    [0xB1, 0x0E, 0x10, 0x38, 0x6E, 0x79, 0xCB, 0x1B],
+);
+
+// Tuning info (NV_ENC_TUNING_INFO enum from nv-codec-headers 12.1)
+// 1 = HIGH_QUALITY, 2 = LOW_LATENCY, 3 = ULTRA_LOW_LATENCY
+const NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY: u32 = 3;
+
+// Picture types (from nvEncodeAPI.h NV_ENC_PIC_TYPE / NV_ENC_PIC_FLAG)
+const NV_ENC_PIC_TYPE_I: u32 = 2;
+const NV_ENC_PIC_TYPE_IDR: u32 = 3;
+const NV_ENC_PIC_FLAGS_FORCEIDR: u32 = 2;
+
+// Rate control modes
+const NV_ENC_PARAMS_RC_CONSTQP: u32 = 0;
+
+// ---------------------------------------------------------------------------
+// NVENC API types
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NvGuid(u32, u16, u16, [u8; 8]);
+
+/// The NVENC function pointer table.  We only declare the functions we use.
+/// The full table has ~30 entries but we only need ~10.
+///
+/// The struct layout must match NV_ENCODE_API_FUNCTION_LIST exactly — unused
+/// entries are `*const c_void` placeholders.
+#[repr(C)]
+struct NvEncFunctionList {
+    version: u32,
+    _reserved: u32,
+    nvEncOpenEncodeSession: *const c_void,
+    nvEncGetEncodeGUIDCount: *const c_void,
+    // Order matters: the driver fills this table positionally, so a field
+    // holds whichever entry the SDK puts at that index regardless of what we
+    // named it.  The profile-GUID pair precedes nvEncGetEncodeGUIDs in
+    // nvEncodeAPI.h — see NV_ENCODE_API_FUNCTION_LIST.
+    nvEncGetEncodeProfileGUIDCount: *const c_void,
+    nvEncGetEncodeProfileGUIDs: *const c_void,
+    nvEncGetEncodeGUIDs: *const c_void,
+    nvEncGetInputFormatCount: *const c_void,
+    nvEncGetInputFormats: *const c_void,
+    nvEncGetEncodeCaps: unsafe extern "C" fn(
+        encoder: *mut c_void,
+        encode_guid: NvGuid,
+        caps_param: *mut c_void,
+        caps_val: *mut i32,
+    ) -> u32,
+    nvEncGetEncodePresetCount: *const c_void,
+    nvEncGetEncodePresetGUIDs: *const c_void,
+    nvEncGetEncodePresetConfig: *const c_void,
+    nvEncInitializeEncoder: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
+    nvEncCreateInputBuffer: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
+    nvEncDestroyInputBuffer: unsafe extern "C" fn(encoder: *mut c_void, buffer: *mut c_void) -> u32,
+    nvEncCreateBitstreamBuffer:
+        unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
+    nvEncDestroyBitstreamBuffer:
+        unsafe extern "C" fn(encoder: *mut c_void, buffer: *mut c_void) -> u32,
+    nvEncEncodePicture: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
+    nvEncLockBitstream: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
+    nvEncUnlockBitstream: unsafe extern "C" fn(encoder: *mut c_void, buffer: *mut c_void) -> u32,
+    nvEncLockInputBuffer: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
+    nvEncUnlockInputBuffer: unsafe extern "C" fn(encoder: *mut c_void, buffer: *mut c_void) -> u32,
+    nvEncGetEncodeStats: *const c_void,
+    nvEncGetSequenceParams: *const c_void,
+    nvEncRegisterAsyncEvent: *const c_void,
+    nvEncUnregisterAsyncEvent: *const c_void,
+    nvEncMapInputResource: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
+    nvEncUnmapInputResource:
+        unsafe extern "C" fn(encoder: *mut c_void, resource: *mut c_void) -> u32,
+    nvEncDestroyEncoder: unsafe extern "C" fn(encoder: *mut c_void) -> u32,
+    nvEncInvalidateRefFrames: *const c_void,
+    nvEncOpenEncodeSessionEx:
+        unsafe extern "C" fn(params: *mut c_void, encoder: *mut *mut c_void) -> u32,
+    nvEncRegisterResource: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
+    nvEncUnregisterResource:
+        unsafe extern "C" fn(encoder: *mut c_void, resource: *mut c_void) -> u32,
+    nvEncReconfigureEncoder: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
+    _reserved1: *const c_void,
+    nvEncCreateMVBuffer: *const c_void,
+    nvEncDestroyMVBuffer: *const c_void,
+    nvEncRunMotionEstimationOnly: *const c_void,
+    nvEncGetLastErrorString: *const c_void,
+    nvEncSetIOCudaStreams: *const c_void,
+    nvEncGetEncodePresetConfigEx: unsafe extern "C" fn(
+        encoder: *mut c_void,
+        encode_guid: NvGuid,
+        preset_guid: NvGuid,
+        tuning_info: u32,
+        preset_config: *mut c_void,
+    ) -> u32,
+    nvEncGetSequenceParamEx: *const c_void,
+    nvEncRestoreEncoderState: *const c_void,
+    nvEncLookaheadPicture: *const c_void,
+    // NV_ENCODE_API_FUNCTION_LIST::reserved2, which the SDK declares as
+    // `void* reserved2[275]` and documents as "[in]: Reserved and must be set
+    // to NULL".  It is the caller's job to supply that storage: the driver is
+    // entitled to read it, and a shorter struct would have it reading our
+    // stack.  Sizing it exactly as the header does also leaves room for
+    // entries a future SDK appends, which is what the padding here was
+    // originally for.
+    reserved2: [*const c_void; 275],
+}
+
+// NvEncodeAPICreateInstance fills this table positionally from the driver's
+// own layout, so an entry declared in the wrong slot silently aliases a
+// different function — a mistake that surfaces as an unrelated call
+// misbehaving at runtime, not as a load error.  Pin the offsets against
+// nv-codec-headers 12.1 (taken from `offsetof`, not counted by hand) so that
+// reordering or dropping an entry fails to compile instead.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(offset_of!(NvEncFunctionList, nvEncGetEncodeGUIDs) == 40);
+    assert!(offset_of!(NvEncFunctionList, nvEncGetEncodeCaps) == 64);
+    assert!(offset_of!(NvEncFunctionList, nvEncInitializeEncoder) == 96);
+    assert!(offset_of!(NvEncFunctionList, nvEncEncodePicture) == 136);
+    assert!(offset_of!(NvEncFunctionList, nvEncLockBitstream) == 144);
+    assert!(offset_of!(NvEncFunctionList, nvEncMapInputResource) == 208);
+    assert!(offset_of!(NvEncFunctionList, nvEncDestroyEncoder) == 224);
+    assert!(offset_of!(NvEncFunctionList, nvEncOpenEncodeSessionEx) == 240);
+    assert!(offset_of!(NvEncFunctionList, nvEncRegisterResource) == 248);
+    assert!(offset_of!(NvEncFunctionList, nvEncReconfigureEncoder) == 264);
+    assert!(offset_of!(NvEncFunctionList, nvEncGetLastErrorString) == 304);
+    assert!(offset_of!(NvEncFunctionList, nvEncGetEncodePresetConfigEx) == 320);
+    assert!(offset_of!(NvEncFunctionList, nvEncRestoreEncoderState) == 336);
+    assert!(offset_of!(NvEncFunctionList, nvEncLookaheadPicture) == 344);
+    assert!(offset_of!(NvEncFunctionList, reserved2) == 352);
+    assert!(size_of::<NvEncFunctionList>() == 2552);
+};
+
+// SAFETY: NvEncFunctionList is a C function-pointer table loaded once via
+// dlopen.  The raw `*const c_void` fields are either unused placeholders or
+// function pointers that are safe to share across threads (they point into
+// read-only driver code).  The table is never mutated after initialization.
+unsafe impl Send for NvEncFunctionList {}
+unsafe impl Sync for NvEncFunctionList {}
+
+// ---------------------------------------------------------------------------
+// NVENC structs — opaque byte arrays sized to match nv-codec-headers 12.1.
+// Fields are accessed at verified offsets (like vaapi_encode.rs) rather than
+// fragile #[repr(C)] struct translation.
+// ---------------------------------------------------------------------------
+
+// Sizes from nv-codec-headers 12.1.14.0 (verified via sizeof/offsetof).
+const NVENC_OPEN_ENCODE_SESSION_EX_SIZE: usize = 1552;
+const NVENC_CONFIG_SIZE: usize = 3584;
+const NVENC_PRESET_CONFIG_SIZE: usize = 5128;
+const NVENC_INITIALIZE_PARAMS_SIZE: usize = 1808;
+// NV_ENC_RECONFIGURE_PARAMS: u32 version, 4 bytes of alignment padding, an
+// embedded NV_ENC_INITIALIZE_PARAMS, then the resetEncoder/forceIDR bitfield.
+const NVENC_RECONFIGURE_PARAMS_SIZE: usize = 1824;
+const NVENC_RECONFIGURE_INIT_PARAMS_OFFSET: usize = 8;
+const NVENC_RECONFIGURE_FLAGS_OFFSET: usize = 1816;
+const NVENC_CREATE_BITSTREAM_BUFFER_SIZE: usize = 776;
+const NVENC_PIC_PARAMS_SIZE: usize = 3360;
+const NVENC_LOCK_BITSTREAM_SIZE: usize = 1552;
+/// `NV_ENC_CONFIG.encodeCodecConfig.h264Config.chromaFormatIDC`, as a byte
+/// offset from the start of NV_ENC_CONFIG (encodeCodecConfig itself sits at
+/// 168).  1 = yuv420, 3 = yuv444.
+const NVENC_H264_CHROMA_FORMAT_IDC_OFFSET: usize = 360;
+/// `NV_ENC_CONFIG.encodeCodecConfig.h264Config.h264VUIParameters`, from the
+/// start of NV_ENC_CONFIG.  All four offsets below verified with
+/// offsetof() against nv-codec-headers sdk/12.1 (same header that agrees
+/// with NVENC_CONFIG_SIZE=3584 and chromaFormatIDC=360 above).
+const NVENC_H264_VUI_OFFSET: usize = 240;
+/// Offsets within NV_ENC_CONFIG_H264_VUI_PARAMETERS.
+const NVENC_VUI_VIDEO_SIGNAL_TYPE_PRESENT: usize = 8;
+const NVENC_VUI_VIDEO_FORMAT: usize = 12;
+const NVENC_VUI_VIDEO_FULL_RANGE: usize = 16;
+/// `NV_ENC_CONFIG.encodeCodecConfig.av1Config.colorRange` (0 = studio
+/// swing, 1 = full swing), from the start of NV_ENC_CONFIG.
+const NVENC_AV1_COLOR_RANGE_OFFSET: usize = 248;
+/// `av1Config.colorPrimaries` / `.transferCharacteristics` /
+/// `.matrixCoefficients`, from the start of NV_ENC_CONFIG.  Zero is *not*
+/// "unspecified" for any of these: `NV_ENC_VUI_COLOR_PRIMARIES_RESERVED0`,
+/// `NV_ENC_VUI_TRANSFER_CHARACTERISTIC_RESERVED0` and — worst —
+/// `NV_ENC_VUI_MATRIX_COEFFS_RGB` (MC_IDENTITY, which on a 4:2:0 stream is
+/// spec-invalid and tells a conforming decoder to read the planes as GBR).
+/// YAS uses BT.709 primaries/transfer and the SMPTE-170M (BT.601) matrix.
+/// NVENC emits an AV1 sequence header that both dav1d and libaom reject when
+/// `IEC61966_2_1` is paired with its 4:2:0 output, even though that transfer
+/// characteristic is valid in isolation. BT.709 is the interoperable
+/// declaration for the nonlinear desktop pixels this path carries.
+const NVENC_AV1_COLOR_PRIMARIES_OFFSET: usize = 236;
+const NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET: usize = 240;
+const NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET: usize = 244;
+const NVENC_VUI_COLOR_PRIMARIES_BT709: u32 = 1;
+const NVENC_VUI_TRANSFER_CHARACTERISTIC_BT709: u32 = 1;
+const NVENC_VUI_MATRIX_COEFFS_SMPTE170M: u32 = 6;
+/// NVIDIA's documented low-latency setting: keep one reference chain until
+/// the application explicitly requests recovery instead of inserting an IDR
+/// every fixed number of frames. A frame-count GOP scales keyframe bandwidth
+/// with refresh rate (120 meant every 500 ms at 240 Hz).
+const NVENC_INFINITE_GOPLENGTH: u32 = u32::MAX;
+/// Bit position of `NV_ENC_INITIALIZE_PARAMS::splitEncodeMode` inside the
+/// packed flags word at offset 68 (five one-bit flags precede it).
+const NVENC_SPLIT_ENCODE_MODE_SHIFT: u32 = 5;
+/// `NV_ENC_SPLIT_TWO_FORCED_MODE`: use two strips when the GPU has multiple
+/// NVENC engines, falling back to one strip when it does not.
+const NVENC_SPLIT_TWO_FORCED_MODE: u32 = 2;
+/// Split-frame setup is overhead at ordinary sizes. At 3840-wide AV1 it lets
+/// multi-NVENC Ada GPUs share the frame instead of making one engine carry a
+/// 4K/240-Hz-equivalent pixel rate alone.
+const NVENC_SPLIT_MIN_WIDTH: u32 = 3840;
+
+fn w32(buf: &mut [u8], off: usize, val: u32) {
+    buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
+}
+fn w64(buf: &mut [u8], off: usize, val: u64) {
+    buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+}
+fn wptr(buf: &mut [u8], off: usize, val: *mut c_void) {
+    buf[off..off + 8].copy_from_slice(&(val as u64).to_ne_bytes());
+}
+fn wguid(buf: &mut [u8], off: usize, g: NvGuid) {
+    w32(buf, off, g.0);
+    buf[off + 4..off + 6].copy_from_slice(&g.1.to_ne_bytes());
+    buf[off + 6..off + 8].copy_from_slice(&g.2.to_ne_bytes());
+    buf[off + 8..off + 16].copy_from_slice(&g.3);
+}
+/// Write `NV_ENC_RC_PARAMS::constQP` (qpInterP / qpInterB / qpIntra) inside
+/// an `NV_ENC_CONFIG` buffer.
+fn write_const_qp(config_buf: &mut [u8], qp: u32) {
+    w32(config_buf, 48, qp); // constQP.qpInterP
+    w32(config_buf, 52, qp); // constQP.qpInterB
+    w32(config_buf, 56, qp); // constQP.qpIntra
+}
+
+fn write_stream_gop(config_buf: &mut [u8]) {
+    // NV_ENC_CONFIG::gopLength / frameIntervalP. NVIDIA requires IPP (1)
+    // when the infinite-GOP sentinel is used.
+    w32(config_buf, 20, NVENC_INFINITE_GOPLENGTH);
+    w32(config_buf, 24, 1);
+}
+
+/// Write a complete AV1 colour description so the sequence header and the
+/// WebCodecs configuration describe the same conversion across decoder
+/// creation and reset.
+fn write_av1_color_description(config_buf: &mut [u8]) {
+    w32(config_buf, NVENC_AV1_COLOR_RANGE_OFFSET, 0);
+    w32(
+        config_buf,
+        NVENC_AV1_COLOR_PRIMARIES_OFFSET,
+        NVENC_VUI_COLOR_PRIMARIES_BT709,
+    );
+    w32(
+        config_buf,
+        NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET,
+        NVENC_VUI_TRANSFER_CHARACTERISTIC_BT709,
+    );
+    w32(
+        config_buf,
+        NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET,
+        NVENC_VUI_MATRIX_COEFFS_SMPTE170M,
+    );
+}
+
+fn write_split_encode_mode(init_buf: &mut [u8], codec: &str, width: u32) {
+    if codec == "av1" && width >= NVENC_SPLIT_MIN_WIDTH {
+        let flags = r32(init_buf, 68);
+        w32(
+            init_buf,
+            68,
+            flags | (NVENC_SPLIT_TWO_FORCED_MODE << NVENC_SPLIT_ENCODE_MODE_SHIFT),
+        );
+    }
+}
+
+fn r32(buf: &[u8], off: usize) -> u32 {
+    u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap())
+}
+fn rptr(buf: &[u8], off: usize) -> *mut c_void {
+    u64::from_ne_bytes(buf[off..off + 8].try_into().unwrap()) as *mut c_void
+}
+
+// ---------------------------------------------------------------------------
+// NvencDirectEncoder
+// ---------------------------------------------------------------------------
+
+/// A compositor NV12 buffer imported into CUDA and registered with NVENC.
+/// Held for the encoder's lifetime so the per-frame path is map/encode/unmap
+/// only; see `NvencDirectEncoder::nv12_imports`.
+struct Nv12Import {
+    ext_mem: gpu_libs::CUexternalMemory,
+    registered: *mut c_void,
+}
+
+/// CPU-readable NV12 fallback resources.
+///
+/// The normal compositor path imports device-local memory directly into
+/// CUDA, so allocating these for every encoder wastes pinned system RAM and
+/// a CUDA surface. They are created only if an encoder is actually handed a
+/// CPU NV12 frame.
+struct Nv12Upload {
+    pinned_host: *mut u8,
+    pinned_size: usize,
+    cuda_devptr: gpu_libs::CUdeviceptr,
+    registered: *mut c_void,
+    pitch: u32,
+}
+
+fn nv12_upload_size(pitch: usize, height: u32) -> Option<usize> {
+    let height = height as usize;
+    pitch.checked_mul(height.checked_add(height / 2)?)
+}
+
+pub struct NvencDirectEncoder {
+    encoder: *mut c_void,
+    output_buffer: *mut c_void,
+    width: u32,
+    height: u32,
+    frame_idx: u32,
+    force_idr: bool,
+    codec_flag: u8, // semantic encoded-codec discriminator
+    fns: &'static NvEncFunctionList,
+    cuda_ctx: gpu_libs::CUcontext,
+    /// Lazily allocated CUDA upload surface and pinned staging memory for
+    /// CPU-readable NV12 input. Zero-copy imports do not need either.
+    nv12_upload: Option<Nv12Upload>,
+    /// Session chroma: true = 4:4:4.  Zero-copy buffers must arrive in
+    /// the matching layout (planar YUV444 vs NV12).  Read only by the
+    /// OPAQUE_FD encode path, which is Linux-only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    session_is_444: bool,
+    verbose: bool,
+    /// Cached SPS+PPS NAL units (Annex B with start codes) from the first
+    /// IDR frame.  Prepended to subsequent IDR frames that NVENC emits
+    /// without SPS/PPS (the default unless repeatSPSPPS is set, which
+    /// requires fragile struct-offset manipulation).
+    h264_sps_pps: Vec<u8>,
+    /// Imported NV12 buffers for the zero-copy path, keyed by the
+    /// compositor's `buf_id`.
+    ///
+    /// Importing and registering costs far more than the encode does, and
+    /// the compositor round-robins a small fixed set of buffers, so doing
+    /// it per frame would spend most of the win back. Keyed on `buf_id`
+    /// rather than the fd number because the kernel recycles fd numbers as
+    /// buffers are freed, and a stale hit would hand NVENC freed VRAM.
+    nv12_imports: HashMap<u64, Nv12Import>,
+    /// `NV_ENC_INITIALIZE_PARAMS` and `NV_ENC_CONFIG` as initialized.
+    /// Retained because `nvEncReconfigureEncoder` wants a complete
+    /// `NV_ENC_INITIALIZE_PARAMS` again, and the driver forbids changing
+    /// anything but rate control across a reconfigure — so the way to
+    /// change only the QP is to re-submit these bytes with the QP edited.
+    init_params: Vec<u8>,
+    encode_config: Vec<u8>,
+}
+
+// NVENC encoder handle and CUDA context are thread-safe with proper push/pop.
+unsafe impl Send for NvencDirectEncoder {}
+
+/// Unwinds what `try_new` has acquired when it bails out partway.
+///
+/// `try_new` has a dozen early-error paths after the encode session is
+/// opened, and every one of them used to return without releasing it —
+/// so each rejected configuration leaked one.  That is not a slow drip:
+/// the server retries encoder creation per surface, per client, per
+/// tick, so a host that refuses the first configuration tried (4:4:4,
+/// say) burns through device memory until *every* encoder fails to
+/// initialize and the whole pipeline silently falls back to CPU
+/// encoding.
+///
+/// Only the session is unwound here.  The CUDA context is the shared
+/// device primary context (see [`primary_ctx`]), retained for the
+/// process lifetime and used by other encoders — destroying it on an
+/// error path would take live encoders down with it.
+struct NvencInitGuard<'a> {
+    fns: Option<&'a NvEncFunctionList>,
+    encoder: *mut c_void,
+}
+
+impl NvencInitGuard<'_> {
+    /// Hand ownership of the session to the encoder being returned, so it
+    /// outlives this guard.
+    fn disarm(mut self) {
+        self.encoder = ptr::null_mut();
+    }
+}
+
+impl Drop for NvencInitGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(fns) = self.fns
+                && !self.encoder.is_null()
+            {
+                (fns.nvEncDestroyEncoder)(self.encoder);
+            }
+        }
+    }
+}
+
+/// What this host's NVENC engine will accept for one codec.
+///
+/// Every field is a property of the device and the driver, which is what
+/// makes it worth answering once and keeping — unlike the failure to build
+/// one particular encoder, which usually says something about the frame.
+/// Keeping those apart is the point: a 256x54 dock thumbnail is under
+/// `min_height` for AV1, and reading its refusal as "this host has no NVENC"
+/// took hardware encoding away from every viewer until the server restarted.
+#[derive(Clone, Copy, Debug)]
+pub struct NvencCaps {
+    pub min_width: u32,
+    pub min_height: u32,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub yuv444: bool,
+    pub encoder_engines: u32,
+}
+
+impl NvencCaps {
+    /// Why this engine will not take a `width`x`height` frame — `None` if it
+    /// will.  The caller is expected to fall down the encoder chain rather
+    /// than write the backend off: this is a verdict on the frame.
+    pub(crate) fn refuse(&self, width: u32, height: u32) -> Option<String> {
+        (width < self.min_width
+            || height < self.min_height
+            || width > self.max_width
+            || height > self.max_height)
+            .then(|| {
+                format!(
+                    "{width}x{height} is outside NVENC's {}x{}–{}x{} range",
+                    self.min_width, self.min_height, self.max_width, self.max_height,
+                )
+            })
+    }
+}
+
+/// Read one `NV_ENC_CAPS` ordinal.  Failures report as `None`, which the
+/// caller turns into a conservative answer rather than a hard error — a
+/// driver that cannot answer a caps query can still encode.
+fn encode_cap(
+    fns: &NvEncFunctionList,
+    encoder: *mut c_void,
+    codec_guid: NvGuid,
+    cap: u32,
+) -> Option<u32> {
+    let mut caps_param = vec![0u8; NV_ENC_CAPS_PARAM_SIZE];
+    w32(&mut caps_param, 0, NV_ENC_CAPS_PARAM_VER);
+    w32(&mut caps_param, 4, cap);
+    let mut value: i32 = 0;
+    // SAFETY: `encoder` is an open session, and `caps_param` is a
+    // NV_ENC_CAPS_PARAM of the declared version.
+    let status = unsafe {
+        (fns.nvEncGetEncodeCaps)(
+            encoder,
+            codec_guid,
+            caps_param.as_mut_ptr() as *mut c_void,
+            &mut value,
+        )
+    };
+    (status == NV_ENC_SUCCESS && value > 0).then_some(value as u32)
+}
+
+/// Codec GUID and wire codec flag for a codec name.
+fn nvenc_codec(codec: &str) -> Result<(NvGuid, u8), String> {
+    match codec {
+        "h264" => Ok((
+            NV_ENC_CODEC_H264_GUID,
+            crate::surface_encoder::ENCODED_CODEC_H264,
+        )),
+        "av1" => Ok((
+            NV_ENC_CODEC_AV1_GUID,
+            crate::surface_encoder::ENCODED_CODEC_AV1,
+        )),
+        _ => Err(format!("unsupported NVENC codec: {codec}")),
+    }
+}
+
+/// What this host's NVENC will take for `codec`, asked once per process.
+///
+/// The query needs a session of its own, so it costs one open/close the first
+/// time and nothing after that.  Both the answer *and* the reason there isn't
+/// one are cached: "no CUDA on this box" is as durable a fact as the maximum
+/// frame size, and re-running `cuInit` on every surface resize is what the
+/// cache is for.
+pub fn caps(codec: &str, verbose: bool) -> Result<NvencCaps, String> {
+    static CAPS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Result<NvencCaps, String>>>> =
+        std::sync::OnceLock::new();
+    let cache = CAPS.get_or_init(Default::default);
+    if let Ok(map) = cache.lock()
+        && let Some(hit) = map.get(codec)
+    {
+        return hit.clone();
+    }
+
+    let answer = (|| {
+        let (codec_guid, _) = nvenc_codec(codec)?;
+        let cuda = gpu_libs::cuda().map_err(|e| format!("CUDA: {e}"))?;
+        let (fns, _ctx, encoder) = open_session(cuda)?;
+        // Releases the session when this scope ends — it existed only to
+        // answer the query.  The shared context stays.
+        let guard = NvencInitGuard {
+            fns: Some(fns),
+            encoder,
+        };
+        let caps = NvencCaps {
+            // A driver that will not name a minimum is saying it has none.
+            min_width: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_WIDTH_MIN).unwrap_or(1),
+            min_height: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_HEIGHT_MIN).unwrap_or(1),
+            // …and one that will not name a maximum gets the largest frame
+            // any AV1 or H.264 level admits, so the chain's own ceilings
+            // stay the binding constraint rather than this fallback.
+            max_width: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_WIDTH_MAX)
+                .unwrap_or(u16::MAX as u32),
+            max_height: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_HEIGHT_MAX)
+                .unwrap_or(u16::MAX as u32),
+            yuv444: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE)
+                .is_some(),
+            encoder_engines: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_NUM_ENCODER_ENGINES)
+                .unwrap_or(1),
+        };
+        drop(guard);
+        Ok(caps)
+    })();
+
+    if verbose {
+        match &answer {
+            Ok(c) => eprintln!(
+                "[nvenc] {codec}: {}x{}–{}x{}, 4:4:4 {}, engines={}",
+                c.min_width,
+                c.min_height,
+                c.max_width,
+                c.max_height,
+                if c.yuv444 { "yes" } else { "no" },
+                c.encoder_engines,
+            ),
+            Err(e) => eprintln!("[nvenc] {codec}: unavailable — {e}"),
+        }
+    }
+    if let Ok(mut map) = cache.lock() {
+        map.insert(codec.to_string(), answer.clone());
+    }
+    answer
+}
+
+/// Retain the device's primary context, once per process and device.
+///
+/// Every encoder used to create a private context with `cuCtxCreate_v2`,
+/// and encoders are per-(surface, client): three live encoders meant three
+/// contexts, each costing tens of MB of NVIDIA driver host memory plus its
+/// own driver threads (`cuda-EvtHandlr` & co).  The primary context is
+/// shared instead; NVENC sessions on it are independent objects, so
+/// concurrent encoders only need the context *current* on their calling
+/// thread, which the encode paths already arrange with push/pop.
+///
+/// The retain is never released — a process-lifetime "leak" on purpose,
+/// like the GBM device in vaapi_encode.rs: releasing it while another
+/// encoder still runs would destroy its allocations.
+fn primary_ctx(
+    cuda: &gpu_libs::CudaFns,
+    device: gpu_libs::CUdevice,
+) -> Result<gpu_libs::CUcontext, String> {
+    // `CUcontext` is a raw pointer and not `Send`; the map stores it as
+    // `usize`.  It is a process-wide driver handle, valid on any thread.
+    static PRIMARY_CTXS: std::sync::OnceLock<std::sync::Mutex<HashMap<gpu_libs::CUdevice, usize>>> =
+        std::sync::OnceLock::new();
+    let map = PRIMARY_CTXS.get_or_init(Default::default);
+    let mut map = map
+        .lock()
+        .map_err(|_| "primary context lock poisoned".to_string())?;
+    if let Some(&ctx) = map.get(&device) {
+        return Ok(ctx as gpu_libs::CUcontext);
+    }
+    let mut ctx: gpu_libs::CUcontext = ptr::null_mut();
+    let status = unsafe { (cuda.cuDevicePrimaryCtxRetain)(&mut ctx, device) };
+    if status != 0 {
+        return Err(format!(
+            "cuDevicePrimaryCtxRetain({device}) failed: {status}"
+        ));
+    }
+    map.insert(device, ctx as usize);
+    Ok(ctx)
+}
+
+/// Open an NVENC session on the shared device primary context, and make
+/// that context current on the calling thread.  The session belongs to
+/// the caller, who must hand it to an [`NvencInitGuard`] or an encoder;
+/// the context is process-shared and must not be destroyed.
+fn open_session(
+    cuda: &'static gpu_libs::CudaFns,
+) -> Result<(&'static NvEncFunctionList, gpu_libs::CUcontext, *mut c_void), String> {
+    let nvenc_fns = gpu_libs::nvenc().map_err(|e| format!("NVENC: {e}"))?;
+
+    let mut status = unsafe { (cuda.cuInit)(0) };
+    if status != 0 {
+        return Err(format!("cuInit failed: {status}"));
+    }
+
+    let cuda_device_idx: i32 = std::env::var("YAS_CUDA_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let mut device: gpu_libs::CUdevice = 0;
+    status = unsafe { (cuda.cuDeviceGet)(&mut device, cuda_device_idx) };
+    if status != 0 {
+        return Err(format!("cuDeviceGet({cuda_device_idx}) failed: {status}"));
+    }
+
+    let ctx = primary_ctx(cuda, device)?;
+    // Retaining the primary context does not make it current on this
+    // thread (cuCtxCreate_v2 did); the allocations below need it current.
+    status = unsafe { (cuda.cuCtxSetCurrent)(ctx) };
+    if status != 0 {
+        return Err(format!("cuCtxSetCurrent failed: {status}"));
+    }
+
+    // NVENC function table — initialized once, reused across all sessions.
+    static NVENC_FN_LIST: std::sync::OnceLock<Result<NvEncFunctionList, String>> =
+        std::sync::OnceLock::new();
+    let result = NVENC_FN_LIST.get_or_init(|| {
+        let fn_list_ver = nvencapi_struct_version(2);
+        let mut fl = std::mem::MaybeUninit::<NvEncFunctionList>::zeroed();
+        // SAFETY: version is the first field (offset 0) in the repr(C) struct.
+        unsafe { (*fl.as_mut_ptr()).version = fn_list_ver };
+        let nv_status = unsafe { (nvenc_fns.NvEncodeAPICreateInstance)(fl.as_mut_ptr().cast()) };
+        // SAFETY: NvEncodeAPICreateInstance fills all function pointers.
+        let fl = unsafe { fl.assume_init() };
+        if nv_status != NV_ENC_SUCCESS {
+            return Err(format!("NvEncodeAPICreateInstance failed: {nv_status}"));
+        }
+        Ok(fl)
+    });
+    let fns = match result {
+        Ok(fl) => fl,
+        Err(e) => return Err(e.clone()),
+    };
+    let fns: &'static NvEncFunctionList =
+        // SAFETY: OnceLock guarantees the value lives for 'static.
+        unsafe { &*(fns as *const NvEncFunctionList) };
+
+    let mut open_buf = vec![0u8; NVENC_OPEN_ENCODE_SESSION_EX_SIZE];
+    w32(&mut open_buf, 0, NV_ENC_OPEN_ENCODE_SESSION_EX_VER); // version @ 0
+    w32(&mut open_buf, 4, 1); // deviceType = CUDA @ 4
+    wptr(&mut open_buf, 8, ctx); // device @ 8
+    // _reserved ptr @ 16 = NULL
+    w32(&mut open_buf, 24, NVENCAPI_VERSION); // apiVersion @ 24
+
+    let mut encoder: *mut c_void = ptr::null_mut();
+    let nv_status = unsafe {
+        (fns.nvEncOpenEncodeSessionEx)(open_buf.as_mut_ptr() as *mut c_void, &mut encoder)
+    };
+    if nv_status != NV_ENC_SUCCESS {
+        return Err(format!("nvEncOpenEncodeSessionEx failed: {nv_status}"));
+    }
+    Ok((fns, ctx, encoder))
+}
+
+impl NvencDirectEncoder {
+    /// Try to create an NVENC encoder for the given codec and dimensions.
+    ///
+    /// `codec` should be `"h264"` or `"av1"`.
+    /// `qp` is the constant QP value (0–51 for H.264, 0–255 for AV1).
+    /// `preset` is the NVENC preset index, 1 (P1, fastest) … 7 (P7, slowest).
+    pub fn try_new(
+        codec: &str,
+        width: u32,
+        height: u32,
+        qp: u32,
+        preset: u8,
+        verbose: bool,
+        chroma: crate::surface_encoder::ChromaSubsampling,
+    ) -> Result<Self, String> {
+        let (codec_guid, codec_flag) = nvenc_codec(codec)?;
+
+        // Ask the device what it takes before building anything.  Both
+        // answers below are settled here rather than by watching an
+        // `nvEncInitializeEncoder` fail: a frame outside the engine's range
+        // — a 256x54 dock thumbnail, say — comes back as a plain refusal
+        // that costs no session and says nothing about the host.
+        let caps = caps(codec, verbose)?;
+        if chroma.is_444() && !caps.yuv444 {
+            return Err(format!(
+                "NVENC {codec} does not support 4:4:4 encoding on this GPU"
+            ));
+        }
+        if let Some(refusal) = caps.refuse(width, height) {
+            return Err(refusal);
+        }
+
+        let cuda = gpu_libs::cuda().map_err(|e| format!("CUDA: {e}"))?;
+        let (fns, ctx, encoder) = open_session(cuda)?;
+        // From here on every `return Err` must release the session and any
+        // allocation already made; the guard does the session so new
+        // early-exits cannot reintroduce the leak.
+        let guard = NvencInitGuard {
+            fns: Some(fns),
+            encoder,
+        };
+        // Get preset config — uses exact SDK struct sizes to avoid version
+        // mismatch (the driver validates struct size via the version tag).
+        let mut preset_buf = vec![0u8; NVENC_PRESET_CONFIG_SIZE];
+        w32(&mut preset_buf, 0, NV_ENC_PRESET_CONFIG_VER); // version @ 0
+        w32(&mut preset_buf, 8, NV_ENC_CONFIG_VER); // presetCfg.version @ 8
+
+        let nv_status = unsafe {
+            (fns.nvEncGetEncodePresetConfigEx)(
+                encoder,
+                codec_guid,
+                preset_guid(preset),
+                NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                preset_buf.as_mut_ptr() as *mut c_void,
+            )
+        };
+        if nv_status != NV_ENC_SUCCESS {
+            return Err(format!("nvEncGetEncodePresetConfigEx failed: {nv_status}"));
+        }
+
+        // Extract the preset's NV_ENC_CONFIG (starts at offset 8 in preset_buf)
+        // and apply our overrides.
+        let mut config_buf = vec![0u8; NVENC_CONFIG_SIZE];
+        config_buf.copy_from_slice(&preset_buf[8..8 + NVENC_CONFIG_SIZE]);
+        // gopLength @ 20, frameIntervalP @ 24. This transport is reliable and
+        // ordered; startup, decoder recovery, and reference-chain loss request
+        // IDRs explicitly, so periodic keyframes only waste encode/wire time.
+        write_stream_gop(&mut config_buf);
+        // rcParams starts at config offset 40 (after version=0, profileGUID=4,
+        // gopLength=20, frameIntervalP=24, monoChromeEncoding=28,
+        // frameFieldMode=32, mvPrecision=36).  NV_ENC_RC_PARAMS itself opens
+        // with its own u32 version, which the preset config already filled —
+        // so rateControlMode is at 44 and constQP (qpInterP/qpInterB/qpIntra)
+        // at 48/52/56.
+        w32(&mut config_buf, 44, NV_ENC_PARAMS_RC_CONSTQP);
+        write_const_qp(&mut config_buf, qp);
+
+        // Set 4:4:4 profile when requested.  For H.264 this is the High 4:4:4
+        // Predictive profile; for AV1 the SDK auto-selects the right profile
+        // based on chromaFormatIDC in the codec config.
+        if chroma.is_444() && codec == "h264" {
+            // profileGUID @ offset 4 in NV_ENC_CONFIG
+            wguid(&mut config_buf, 4, NV_ENC_H264_PROFILE_HIGH_444_GUID);
+            // The profile GUID alone is not enough: NV_ENC_CONFIG_H264
+            // carries its own chromaFormatIDC, which the preset left at 1
+            // (yuv420).  A High 4:4:4 profile against a 4:2:0 codec config
+            // is contradictory, and nvEncInitializeEncoder rejects the pair
+            // with NV_ENC_ERR_INVALID_PARAM.
+            w32(&mut config_buf, NVENC_H264_CHROMA_FORMAT_IDC_OFFSET, 3);
+        }
+
+        // Signal the same BT.601 studio swing used by the compositor shader.
+        // Limited range is deliberate: Firefox's WebCodecs output path can
+        // lose a full-range flag before converting decoded YUV to RGB.
+        if codec == "h264" {
+            let vui = NVENC_H264_VUI_OFFSET;
+            w32(
+                &mut config_buf,
+                vui + NVENC_VUI_VIDEO_SIGNAL_TYPE_PRESENT,
+                1,
+            );
+            w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FORMAT, 5); // unspecified
+            w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FULL_RANGE, 0);
+        } else {
+            write_av1_color_description(&mut config_buf);
+        }
+
+        // Initialize encoder
+        let mut init_buf = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
+        w32(&mut init_buf, 0, NV_ENC_INITIALIZE_PARAMS_VER);
+        wguid(&mut init_buf, 4, codec_guid); // encodeGUID @ 4
+        wguid(&mut init_buf, 20, preset_guid(preset)); // presetGUID @ 20
+        w32(&mut init_buf, 36, width); // encodeWidth @ 36
+        w32(&mut init_buf, 40, height); // encodeHeight @ 40
+        w32(&mut init_buf, 44, width); // darWidth @ 44
+        w32(&mut init_buf, 48, height); // darHeight @ 48
+        w32(&mut init_buf, 52, 60); // frameRateNum @ 52
+        w32(&mut init_buf, 56, 1); // frameRateDen @ 56
+        w32(&mut init_buf, 64, 1); // enablePTD @ 64
+        write_split_encode_mode(&mut init_buf, codec, width);
+        wptr(&mut init_buf, 88, config_buf.as_mut_ptr() as *mut c_void); // encodeConfig ptr @ 88
+        w32(&mut init_buf, 96, width); // maxEncodeWidth @ 96
+        w32(&mut init_buf, 100, height); // maxEncodeHeight @ 100
+        w32(&mut init_buf, 136, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY); // tuningInfo @ 136
+
+        let nv_status =
+            unsafe { (fns.nvEncInitializeEncoder)(encoder, init_buf.as_mut_ptr() as *mut c_void) };
+        if nv_status != NV_ENC_SUCCESS {
+            return Err(format!("nvEncInitializeEncoder failed: {nv_status}"));
+        }
+        if verbose {
+            let split_mode = (r32(&init_buf, 68) >> NVENC_SPLIT_ENCODE_MODE_SHIFT) & 0xf;
+            eprintln!(
+                "[nvenc] initialized {codec} {width}x{height} engines={} split_mode={split_mode}",
+                caps.encoder_engines,
+            );
+        }
+
+        // Create bitstream (output) buffer
+        let mut output_buf = vec![0u8; NVENC_CREATE_BITSTREAM_BUFFER_SIZE];
+        w32(&mut output_buf, 0, NV_ENC_CREATE_BITSTREAM_BUFFER_VER);
+
+        let nv_status = unsafe {
+            (fns.nvEncCreateBitstreamBuffer)(encoder, output_buf.as_mut_ptr() as *mut c_void)
+        };
+        if nv_status != NV_ENC_SUCCESS {
+            return Err(format!("nvEncCreateBitstreamBuffer failed: {nv_status}"));
+        }
+        let output_buffer_ptr = rptr(&output_buf, 16); // bitstreamBuffer @ 16
+
+        if verbose {
+            eprintln!(
+                "[nvenc-direct] initialized {codec} encoder for {width}x{height} (zero-copy; CPU upload lazy)"
+            );
+        }
+
+        // Construction succeeded — the encoder below owns the session now
+        // and frees it (and its allocations) in its own Drop.  The context
+        // is shared and stays retained.
+        guard.disarm();
+
+        Ok(Self {
+            encoder,
+            output_buffer: output_buffer_ptr,
+            width,
+            height,
+            frame_idx: 0,
+            force_idr: false,
+            codec_flag,
+            fns,
+            cuda_ctx: ctx,
+            nv12_upload: None,
+            session_is_444: chroma.is_444(),
+            verbose,
+            h264_sps_pps: Vec::new(),
+            nv12_imports: HashMap::new(),
+            init_params: init_buf,
+            encode_config: config_buf,
+        })
+    }
+
+    pub fn request_keyframe(&mut self) {
+        self.force_idr = true;
+    }
+
+    /// Move the constant QP without tearing the session down.
+    ///
+    /// `resetEncoder` stays 0: resetting rate-control state also forces an
+    /// IDR when `enablePTD` is set (it is), and a keyframe is the last thing
+    /// wanted when the reason for the change is congestion.  Returns false
+    /// if the driver rejects the reconfigure, leaving the encoder at its
+    /// current QP so the caller can decide whether a rebuild is worth it.
+    pub fn set_qp(&mut self, qp: u32) -> bool {
+        let cuda = match gpu_libs::cuda() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        write_const_qp(&mut self.encode_config, qp);
+        let mut params = vec![0u8; NVENC_RECONFIGURE_PARAMS_SIZE];
+        w32(&mut params, 0, NV_ENC_RECONFIGURE_PARAMS_VER);
+        params[NVENC_RECONFIGURE_INIT_PARAMS_OFFSET
+            ..NVENC_RECONFIGURE_INIT_PARAMS_OFFSET + NVENC_INITIALIZE_PARAMS_SIZE]
+            .copy_from_slice(&self.init_params);
+        // The retained init params carry a pointer to the config buffer; it
+        // is still valid (a Vec's allocation does not move with the struct)
+        // but re-point it anyway rather than depend on that.
+        wptr(
+            &mut params,
+            NVENC_RECONFIGURE_INIT_PARAMS_OFFSET + 88,
+            self.encode_config.as_mut_ptr() as *mut c_void,
+        );
+        w32(&mut params, NVENC_RECONFIGURE_FLAGS_OFFSET, 0);
+
+        unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
+        let status = unsafe {
+            (self.fns.nvEncReconfigureEncoder)(self.encoder, params.as_mut_ptr() as *mut c_void)
+        };
+        let mut dummy: gpu_libs::CUcontext = std::ptr::null_mut();
+        unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+
+        if status != NV_ENC_SUCCESS {
+            if self.verbose {
+                eprintln!("[nvenc] nvEncReconfigureEncoder(qp={qp}) failed: {status}");
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Check whether the NVENC-reported picture type indicates a keyframe.
+    ///
+    /// For H.264 only `NV_ENC_PIC_TYPE_IDR` (3) is a true key frame.
+    /// For AV1 the driver may report either `NV_ENC_PIC_TYPE_IDR` or
+    /// `NV_ENC_PIC_TYPE_I` (2) — AV1 has no separate IDR concept, so
+    /// both intra types correspond to key frames in practice (the
+    /// ultra-low-latency preset never emits intra-only non-key frames).
+    fn is_keyframe_pic_type(&self, pic_type: u32) -> bool {
+        if pic_type == NV_ENC_PIC_TYPE_IDR {
+            return true;
+        }
+        if self.codec_flag == crate::surface_encoder::ENCODED_CODEC_AV1
+            && pic_type == NV_ENC_PIC_TYPE_I
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Ensure an H.264 IDR frame includes SPS/PPS NAL units.
+    ///
+    /// NVENC only includes SPS/PPS in the very first IDR unless the
+    /// `repeatSPSPPS` config flag is set (which requires fragile
+    /// struct-offset writes).  Instead we cache the SPS+PPS from the
+    /// first IDR and prepend them to subsequent IDRs that lack them.
+    fn ensure_h264_sps_pps(&mut self, data: &mut Vec<u8>, is_idr: bool) {
+        if self.codec_flag != crate::surface_encoder::ENCODED_CODEC_H264 || !is_idr {
+            return;
+        }
+        // Scan for SPS (NAL type 7) and PPS (NAL type 8).
+        let has_sps_pps = h264_has_sps_pps(data);
+        if has_sps_pps {
+            // Cache the SPS+PPS prefix (everything before the first IDR
+            // slice NAL, type 5).
+            if self.h264_sps_pps.is_empty()
+                && let Some(prefix) = h264_extract_sps_pps_prefix(data)
+            {
+                self.h264_sps_pps = prefix;
+            }
+        } else if !self.h264_sps_pps.is_empty() {
+            // Prepend cached SPS+PPS.
+            let mut full = self.h264_sps_pps.clone();
+            full.append(data);
+            *data = full;
+        }
+    }
+
+    /// Zero-copy encode of an NV12 buffer the compositor exported as
+    /// `OPAQUE_FD` — the pixels never leave the GPU.
+    ///
+    /// This is the only zero-copy import NVENC gets. The handle type is what
+    /// makes it work: CUDA imports an `OPAQUE_FD` (verified on nvidia-x11
+    /// 595.84 / RTX 4090, including a byte-pattern round trip through the
+    /// mapped pointer) and refuses a `dma_buf`.
+    ///
+    /// `sync_fd` is not optional in practice. An `OPAQUE_FD` allocation
+    /// carries none of the implicit fencing a `dma_buf` does, so without
+    /// waiting for the compositor's BGRA→NV12 compute pass we would encode
+    /// a partially-written buffer — intermittently, and worst under load.
+    ///
+    /// Returns `None` on any failure. Unlike the BGRA path there is no CPU
+    /// fallback available here: the allocation is DEVICE_LOCAL VRAM behind
+    /// a handle nothing can mmap, so a caller that wants one must arrange
+    /// not to be given this variant at all.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_nv12_opaque_fd(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        buf_id: u64,
+        allocation_size: u64,
+        stride: u32,
+        uv_offset: u32,
+        width: u32,
+        height: u32,
+        is_444: bool,
+        sync_fd: Option<std::os::fd::RawFd>,
+    ) -> Option<(Vec<u8>, bool)> {
+        // The buffer's format must match the session's chroma: NVENC
+        // rejects (or worse, garbles) a picture whose registered format
+        // disagrees with the encode config.  A mismatch means the server's
+        // target registration and this encoder have drifted apart.
+        if is_444 != self.session_is_444 {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nvenc-zerocopy] buffer is_444={is_444} but session is {}; refusing",
+                    if self.session_is_444 {
+                        "4:4:4"
+                    } else {
+                        "4:2:0"
+                    },
+                );
+            }
+            return None;
+        }
+        // Neither layout has an independent chroma offset: NVENC assumes
+        // the first chroma plane starts at exactly stride*height (NV12
+        // interleaved UV, or the YUV444 U plane with V one plane later).
+        // The compute shaders write that layout, so a mismatch means the
+        // two sides have drifted apart and the encode would sample chroma
+        // from the wrong place — better to refuse than to emit wrong
+        // colour.
+        if uv_offset != stride * height {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nvenc-zerocopy] uv_offset {uv_offset} != stride*height {}; refusing",
+                    stride * height,
+                );
+            }
+            return None;
+        }
+
+        let timing_start = std::time::Instant::now();
+
+        // Wait for the compute pass before touching the buffer.
+        if let Some(sync) = sync_fd {
+            let mut pfd = libc::pollfd {
+                fd: sync,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // 10 ms: at 60 fps the whole frame budget is ~16 ms, and the
+            // compute pass has normally long since finished by the time
+            // the encoder thread gets here — this is a guard, not a
+            // scheduling point. Timing out means we fall through and
+            // encode anyway, which is the same race we would have had
+            // without the fence; it is preferable to stalling delivery.
+            let n = unsafe { libc::poll(&mut pfd, 1, 10) };
+            if n <= 0 {
+                static LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[nvenc-zerocopy] sync_fd poll timed out; frame may tear");
+                }
+            }
+        }
+        let timing_after_fence = std::time::Instant::now();
+
+        let cuda = gpu_libs::cuda().ok()?;
+        unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
+
+        // The session was created at self.width/self.height (even-rounded
+        // and clamped to the caps). Encoding at the source dimensions
+        // instead would hand NVENC dimensions the session was not
+        // configured for.
+        let enc_w = self.width;
+        let enc_h = self.height;
+
+        // The session's dimensions are even-rounded, so they can exceed the
+        // compositor's by a pixel; anything more means the two disagree
+        // about the frame, and encoding would read past the buffer's rows.
+        if width < enc_w || height < enc_h {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nvenc-zerocopy] NV12 buffer {width}x{height} smaller than session {enc_w}x{enc_h}; refusing",
+                );
+            }
+            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+            return None;
+        }
+
+        let registered = match self.nv12_import(
+            cuda,
+            fd,
+            buf_id,
+            allocation_size,
+            stride,
+            height,
+            enc_w,
+            enc_h,
+            is_444,
+        ) {
+            Some(r) => r,
+            None => {
+                let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+                unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+                return None;
+            }
+        };
+
+        // Map, encode, unmap. The registration is cached; the mapping is
+        // per-frame, as NVENC requires.
+        let mut map_buf = vec![0u8; NVENC_MAP_INPUT_RESOURCE_SIZE];
+        w32(&mut map_buf, 0, NV_ENC_MAP_INPUT_RESOURCE_VER);
+        wptr(&mut map_buf, 16, registered);
+        let nv_status = unsafe {
+            (self.fns.nvEncMapInputResource)(self.encoder, map_buf.as_mut_ptr() as *mut c_void)
+        };
+        if nv_status != NV_ENC_SUCCESS {
+            eprintln!("[nvenc-zerocopy] nvEncMapInputResource failed: {nv_status}");
+            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+            return None;
+        }
+        let mapped_resource = rptr(&map_buf, 24);
+        let timing_after_map = std::time::Instant::now();
+
+        let mut pic_buf = vec![0u8; NVENC_PIC_PARAMS_SIZE];
+        w32(&mut pic_buf, 0, NV_ENC_PIC_PARAMS_VER);
+        w32(&mut pic_buf, 4, enc_w);
+        w32(&mut pic_buf, 8, enc_h);
+        w32(&mut pic_buf, 12, stride);
+        w32(&mut pic_buf, 20, self.frame_idx);
+        w64(&mut pic_buf, 24, self.frame_idx as u64);
+        wptr(&mut pic_buf, 40, mapped_resource);
+        wptr(&mut pic_buf, 48, self.output_buffer);
+        w32(
+            &mut pic_buf,
+            64,
+            if is_444 {
+                NV_ENC_BUFFER_FORMAT_YUV444
+            } else {
+                NV_ENC_BUFFER_FORMAT_NV12
+            },
+        );
+        w32(&mut pic_buf, 68, 1); // NV_ENC_PIC_STRUCT_FRAME
+        if self.force_idr {
+            // OUTPUT_SPSPPS (0x4) so AV1 keyframes carry the sequence
+            // header OBU and H.264 IDRs carry SPS/PPS — decoders joining
+            // mid-stream cannot decode a forced keyframe without it.
+            w32(&mut pic_buf, 16, NV_ENC_PIC_FLAGS_FORCEIDR | 0x4);
+            w32(&mut pic_buf, 72, NV_ENC_PIC_TYPE_IDR);
+        }
+        self.frame_idx += 1;
+
+        let nv_status = unsafe {
+            (self.fns.nvEncEncodePicture)(self.encoder, pic_buf.as_mut_ptr() as *mut c_void)
+        };
+        let timing_after_submit = std::time::Instant::now();
+        let result = if nv_status == NV_ENC_SUCCESS {
+            self.force_idr = false;
+            let mut lock_buf = vec![0u8; NVENC_LOCK_BITSTREAM_SIZE];
+            w32(&mut lock_buf, 0, NV_ENC_LOCK_BITSTREAM_VER);
+            wptr(&mut lock_buf, 8, self.output_buffer);
+            let lock_status = unsafe {
+                (self.fns.nvEncLockBitstream)(self.encoder, lock_buf.as_mut_ptr() as *mut c_void)
+            };
+            let timing_after_lock = std::time::Instant::now();
+            if lock_status == NV_ENC_SUCCESS {
+                let size = r32(&lock_buf, 36) as usize;
+                let buf_ptr = rptr(&lock_buf, 56) as *const u8;
+                let nal_data = if !buf_ptr.is_null() && size > 0 {
+                    unsafe { std::slice::from_raw_parts(buf_ptr, size) }.to_vec()
+                } else {
+                    Vec::new()
+                };
+                let is_idr = self.is_keyframe_pic_type(r32(&lock_buf, 64));
+                unsafe { (self.fns.nvEncUnlockBitstream)(self.encoder, self.output_buffer) };
+                let timing_after_copy = std::time::Instant::now();
+                if self.verbose && (self.frame_idx <= 3 || self.frame_idx.is_multiple_of(1200)) {
+                    let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1_000.0;
+                    eprintln!(
+                        "[nvenc-timing] frame={} fence={:.3}ms map={:.3}ms submit={:.3}ms lock={:.3}ms copy={:.3}ms total={:.3}ms",
+                        self.frame_idx,
+                        ms(timing_after_fence.duration_since(timing_start)),
+                        ms(timing_after_map.duration_since(timing_after_fence)),
+                        ms(timing_after_submit.duration_since(timing_after_map)),
+                        ms(timing_after_lock.duration_since(timing_after_submit)),
+                        ms(timing_after_copy.duration_since(timing_after_lock)),
+                        ms(timing_after_copy.duration_since(timing_start)),
+                    );
+                }
+                if nal_data.is_empty() {
+                    if self.verbose {
+                        eprintln!(
+                            "[nvenc-zerocopy] empty locked bitstream frame={} hw_status={} slices={} size={} ptr={buf_ptr:p} picture_type={}",
+                            self.frame_idx,
+                            r32(&lock_buf, 28),
+                            r32(&lock_buf, 32),
+                            size,
+                            r32(&lock_buf, 64),
+                        );
+                    }
+                    None
+                } else {
+                    let mut nal_data = nal_data;
+                    self.ensure_h264_sps_pps(&mut nal_data, is_idr);
+                    Some((nal_data, is_idr))
+                }
+            } else {
+                None
+            }
+        } else {
+            if nv_status != NV_ENC_ERR_NEED_MORE_INPUT {
+                eprintln!("[nvenc-zerocopy] nvEncEncodePicture failed: {nv_status}");
+            }
+            None
+        };
+
+        unsafe { (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource) };
+        let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+        unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+
+        if result.is_some() {
+            static LOGGED_OK: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED_OK.swap(true, std::sync::atomic::Ordering::Relaxed) && self.verbose {
+                eprintln!("[nvenc-zerocopy] zero-copy encode ok {enc_w}x{enc_h} stride={stride}");
+            }
+        }
+        result
+    }
+
+    /// Import + register an NV12 `OPAQUE_FD` buffer, or return the cached
+    /// registration for one we have already imported.  Caller must hold the
+    /// CUDA context.  Returns the NVENC registered-resource handle.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn nv12_import(
+        &mut self,
+        cuda: &gpu_libs::CudaFns,
+        fd: std::os::fd::RawFd,
+        buf_id: u64,
+        allocation_size: u64,
+        stride: u32,
+        height: u32,
+        enc_w: u32,
+        enc_h: u32,
+        is_444: bool,
+    ) -> Option<*mut c_void> {
+        if let Some(prev) = self.nv12_imports.get(&buf_id) {
+            return Some(prev.registered);
+        }
+        let cu_import = cuda.cuImportExternalMemory?;
+        let cu_get_buf = cuda.cuExternalMemoryGetMappedBuffer?;
+        let cu_destroy = cuda.cuDestroyExternalMemory?;
+
+        // A buffer we imported can be destroyed compositor-side — on
+        // resize, or when a subscriber needing CPU pixels joins and the
+        // NV12 target is revoked. Those entries are never hit again (any
+        // replacement carries a fresh buf_id) but each holds a CUDA object,
+        // an NVENC registration and a dup'd fd, so left alone they
+        // accumulate for the encoder's lifetime. The compositor rotates
+        // three buffers per target, so passing this cap means the set has
+        // been replaced: drop everything and let whatever is still live
+        // re-import on its next frame. Nothing is mapped at this point —
+        // the encode path unmaps before returning — so this is safe.
+        const MAX_CACHED_IMPORTS: usize = 6;
+        if self.nv12_imports.len() >= MAX_CACHED_IMPORTS {
+            let stale: Vec<Nv12Import> = self.nv12_imports.drain().map(|(_, v)| v).collect();
+            for imp in stale {
+                unsafe {
+                    (self.fns.nvEncUnregisterResource)(self.encoder, imp.registered);
+                    cu_destroy(imp.ext_mem);
+                }
+            }
+            if self.verbose {
+                eprintln!("[nvenc-zerocopy] import cache full; dropped stale imports");
+            }
+        }
+
+        let payload_size = if is_444 {
+            (stride as u64) * (height as u64) * 3
+        } else {
+            (stride as u64) * (height as u64) * 3 / 2
+        };
+        if allocation_size < payload_size {
+            eprintln!(
+                "[nvenc-zerocopy] allocation {allocation_size} is smaller than payload {payload_size}; refusing"
+            );
+            return None;
+        }
+
+        // CUDA takes ownership of the fd on success, so hand it a dup —
+        // the compositor still owns the original and reuses it every frame.
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            return None;
+        }
+
+        // See gpu_libs::cu_ext_mem_desc for why these offsets are what they
+        // are; getting `size` wrong fails every import with INVALID_VALUE.
+        let mut desc = [0u8; gpu_libs::cu_ext_mem_desc::BYTES];
+        let d = &mut desc;
+        d[gpu_libs::cu_ext_mem_desc::TYPE..][..4]
+            .copy_from_slice(&gpu_libs::CU_EXTERNAL_HANDLE_TYPE_OPAQUE_FD.to_ne_bytes());
+        d[gpu_libs::cu_ext_mem_desc::FD..][..4].copy_from_slice(&dup_fd.to_ne_bytes());
+        d[gpu_libs::cu_ext_mem_desc::SIZE..][..8].copy_from_slice(&allocation_size.to_ne_bytes());
+        d[gpu_libs::cu_ext_mem_desc::FLAGS..][..4]
+            .copy_from_slice(&gpu_libs::CU_EXTERNAL_MEMORY_DEDICATED.to_ne_bytes());
+
+        let mut ext_mem: gpu_libs::CUexternalMemory = ptr::null_mut();
+        let status = unsafe { cu_import(&mut ext_mem, desc.as_ptr() as *const _) };
+        if status != 0 {
+            unsafe { libc::close(dup_fd) };
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[nvenc-zerocopy] cuImportExternalMemory failed: {status}");
+            }
+            return None;
+        }
+        // fd ownership transferred to CUDA — do not close dup_fd.
+
+        let mut buf_desc = [0u8; 128];
+        buf_desc[8..16].copy_from_slice(&allocation_size.to_ne_bytes()); // size @ 8
+        let mut devptr: gpu_libs::CUdeviceptr = 0;
+        let status = unsafe { cu_get_buf(&mut devptr, ext_mem, buf_desc.as_ptr() as *const _) };
+        if status != 0 {
+            unsafe { cu_destroy(ext_mem) };
+            eprintln!("[nvenc-zerocopy] cuExternalMemoryGetMappedBuffer failed: {status}");
+            return None;
+        }
+
+        let mut reg_buf = vec![0u8; NVENC_REGISTER_RESOURCE_SIZE];
+        w32(&mut reg_buf, 0, NV_ENC_REGISTER_RESOURCE_VER);
+        w32(&mut reg_buf, 4, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
+        w32(&mut reg_buf, 8, enc_w);
+        w32(&mut reg_buf, 12, enc_h);
+        w32(&mut reg_buf, 16, stride);
+        wptr(&mut reg_buf, 24, devptr as *mut c_void);
+        w32(
+            &mut reg_buf,
+            40,
+            if is_444 {
+                NV_ENC_BUFFER_FORMAT_YUV444
+            } else {
+                NV_ENC_BUFFER_FORMAT_NV12
+            },
+        );
+        let nv_status = unsafe {
+            (self.fns.nvEncRegisterResource)(self.encoder, reg_buf.as_mut_ptr() as *mut c_void)
+        };
+        if nv_status != NV_ENC_SUCCESS {
+            unsafe { cu_destroy(ext_mem) };
+            eprintln!("[nvenc-zerocopy] nvEncRegisterResource failed: {nv_status}");
+            return None;
+        }
+        let registered = rptr(&reg_buf, 32);
+
+        if self.verbose {
+            eprintln!(
+                "[nvenc-zerocopy] imported {} buf_id={buf_id} {enc_w}x{enc_h} stride={stride} payload={payload_size} allocation={allocation_size}",
+                if is_444 { "YUV444" } else { "NV12" },
+            );
+        }
+        self.nv12_imports.insert(
+            buf_id,
+            Nv12Import {
+                ext_mem,
+                registered,
+            },
+        );
+        Some(registered)
+    }
+
+    pub fn codec_flag(&self) -> u8 {
+        self.codec_flag
+    }
+
+    // -----------------------------------------------------------------------
+    // NV12 path — avoids NV12→RGBA→BGRA CPU conversion
+    // -----------------------------------------------------------------------
+
+    /// Allocate the CPU-upload path on first use.
+    ///
+    /// A zero-copy encoder imports compositor buffers directly and never
+    /// reaches this method. Keeping the allocation here avoids pinning host
+    /// pages and reserving a CUDA surface for every live subscription.
+    fn ensure_nv12_upload(&mut self) -> Result<(), String> {
+        if self.nv12_upload.is_some() {
+            return Ok(());
+        }
+
+        let cuda = gpu_libs::cuda().map_err(|e| format!("CUDA: {e}"))?;
+        let status = unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
+        if status != 0 {
+            return Err(format!("cuCtxPushCurrent failed: {status}"));
+        }
+
+        let result = (|| {
+            // Semi-planar NV12 is one full-height Y plane plus one
+            // half-height interleaved UV plane, both at the same pitch.
+            let alloc_height = self.height as usize + self.height as usize / 2;
+            let mut cuda_devptr: gpu_libs::CUdeviceptr = 0;
+            let mut pitch_bytes = 0usize;
+            let status = unsafe {
+                (cuda.cuMemAllocPitch_v2)(
+                    &mut cuda_devptr,
+                    &mut pitch_bytes,
+                    self.width as usize,
+                    alloc_height,
+                    16,
+                )
+            };
+            if status != 0 {
+                return Err(format!("cuMemAllocPitch (NV12) failed: {status}"));
+            }
+
+            let pitch = match u32::try_from(pitch_bytes) {
+                Ok(pitch) => pitch,
+                Err(_) => {
+                    unsafe { (cuda.cuMemFree_v2)(cuda_devptr) };
+                    return Err(format!(
+                        "CUDA returned an NV12 pitch too large: {pitch_bytes}"
+                    ));
+                }
+            };
+            let pinned_size = match nv12_upload_size(pitch_bytes, self.height) {
+                Some(size) => size,
+                None => {
+                    unsafe { (cuda.cuMemFree_v2)(cuda_devptr) };
+                    return Err("NV12 upload size overflow".to_string());
+                }
+            };
+
+            let mut register = vec![0u8; NVENC_REGISTER_RESOURCE_SIZE];
+            w32(&mut register, 0, NV_ENC_REGISTER_RESOURCE_VER);
+            w32(&mut register, 4, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
+            w32(&mut register, 8, self.width);
+            w32(&mut register, 12, self.height);
+            w32(&mut register, 16, pitch);
+            wptr(&mut register, 24, cuda_devptr as *mut c_void);
+            w32(&mut register, 40, NV_ENC_BUFFER_FORMAT_NV12);
+            let status = unsafe {
+                (self.fns.nvEncRegisterResource)(self.encoder, register.as_mut_ptr() as *mut c_void)
+            };
+            if status != NV_ENC_SUCCESS {
+                unsafe { (cuda.cuMemFree_v2)(cuda_devptr) };
+                return Err(format!("nvEncRegisterResource (NV12) failed: {status}"));
+            }
+            let registered = rptr(&register, 32);
+
+            // Pageable input makes the driver pin pages afresh on every
+            // transfer. A persistent page-locked staging area is still the
+            // right choice for CPU frames, but it is exactly NV12-sized
+            // instead of the old four-bytes-per-pixel over-allocation.
+            let mut pinned_host: *mut c_void = ptr::null_mut();
+            let status = unsafe { (cuda.cuMemAllocHost_v2)(&mut pinned_host, pinned_size) };
+            if status != 0 {
+                unsafe {
+                    (self.fns.nvEncUnregisterResource)(self.encoder, registered);
+                    (cuda.cuMemFree_v2)(cuda_devptr);
+                }
+                return Err(format!("cuMemAllocHost failed: {status}"));
+            }
+
+            Ok(Nv12Upload {
+                pinned_host: pinned_host as *mut u8,
+                pinned_size,
+                cuda_devptr,
+                registered,
+                pitch,
+            })
+        })();
+
+        let mut previous: gpu_libs::CUcontext = ptr::null_mut();
+        unsafe { (cuda.cuCtxPopCurrent_v2)(&mut previous) };
+
+        let upload = result?;
+        if self.verbose {
+            eprintln!(
+                "[nvenc-direct] allocated CPU NV12 fallback: {} bytes pinned, pitch={}",
+                upload.pinned_size, upload.pitch
+            );
+        }
+        self.nv12_upload = Some(upload);
+        Ok(())
+    }
+
+    /// Encode from NV12 data directly.  Uploads Y+UV to the NV12-registered
+    /// CUDA buffer so NVENC reads it natively — no colorspace conversion.
+    ///
+    /// `data` is contiguous: Y plane at [0..y_stride*src_h], UV at
+    /// [y_stride*src_h..].  `y_stride` / `uv_stride` are source pitches.
+    /// `src_h` is the original surface height before any encoder padding.
+    pub fn encode_nv12(
+        &mut self,
+        data: &[u8],
+        y_stride: usize,
+        uv_stride: usize,
+        src_h: usize,
+    ) -> Option<(Vec<u8>, bool)> {
+        if let Err(e) = self.ensure_nv12_upload() {
+            eprintln!("[nvenc-direct] cannot allocate CPU NV12 fallback: {e}");
+            return None;
+        }
+        let upload = self.nv12_upload.as_ref().expect("NV12 upload was ensured");
+        let enc_w = self.width as usize;
+        let enc_h = self.height as usize;
+        let nv12_pitch = upload.pitch as usize;
+        let y_plane_size = nv12_pitch * enc_h;
+        let uv_h = enc_h / 2;
+        let nv12_total = y_plane_size + nv12_pitch * uv_h;
+
+        // Pack into pinned host memory with encoder pitch (strip source padding).
+        assert!(nv12_total <= upload.pinned_size);
+        let dst = upload.pinned_host;
+
+        // Y plane — copy row by row to strip source stride padding.
+        for row in 0..enc_h {
+            let sr = row.min(src_h.saturating_sub(1));
+            let src_off = sr * y_stride;
+            let dst_off = row * nv12_pitch;
+            let copy_len = enc_w.min(y_stride);
+            if src_off + copy_len <= data.len() {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr().add(src_off),
+                        dst.add(dst_off),
+                        copy_len,
+                    );
+                }
+            }
+            // Zero padding bytes between Y data and pitch.
+            if enc_w < nv12_pitch {
+                unsafe { ptr::write_bytes(dst.add(dst_off + enc_w), 0, nv12_pitch - enc_w) };
+            }
+        }
+
+        // UV plane — interleaved U/V, same width as Y, half height.
+        let src_uv_h = src_h / 2;
+        let uv_src_base = y_stride * src_h;
+        for row in 0..uv_h {
+            let sr = row.min(src_uv_h.saturating_sub(1));
+            let src_off = uv_src_base + sr * uv_stride;
+            let dst_off = y_plane_size + row * nv12_pitch;
+            let copy_len = enc_w.min(uv_stride);
+            if src_off + copy_len <= data.len() {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr().add(src_off),
+                        dst.add(dst_off),
+                        copy_len,
+                    );
+                }
+            }
+            if enc_w < nv12_pitch {
+                unsafe { ptr::write_bytes(dst.add(dst_off + enc_w), 0, nv12_pitch - enc_w) };
+            }
+        }
+
+        let devptr = upload.cuda_devptr;
+        let registered = upload.registered;
+        let pitch = upload.pitch;
+        self.upload_and_encode_planar(
+            nv12_total,
+            dst as *const c_void,
+            devptr,
+            registered,
+            pitch,
+            NV_ENC_BUFFER_FORMAT_NV12,
+        )
+    }
+
+    /// Upload `upload_bytes` of pinned staging into `devptr` and encode it
+    /// through `registered` with `fmt`.
+    fn upload_and_encode_planar(
+        &mut self,
+        upload_bytes: usize,
+        pinned_host: *const c_void,
+        devptr: gpu_libs::CUdeviceptr,
+        registered: *mut c_void,
+        pitch: u32,
+        fmt: u32,
+    ) -> Option<(Vec<u8>, bool)> {
+        let cuda = crate::gpu_libs::cuda().expect("CUDA loaded during init");
+
+        unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
+
+        let status = unsafe { (cuda.cuMemcpyHtoD_v2)(devptr, pinned_host, upload_bytes) };
+        if status != 0 {
+            eprintln!("[nvenc-direct] cuMemcpyHtoD (fmt={fmt:#x}) failed: {status}");
+            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+            return None;
+        }
+
+        unsafe { (cuda.cuStreamSynchronize)(ptr::null_mut()) };
+
+        // Map the registered resource.
+        let mut map_buf = vec![0u8; NVENC_MAP_INPUT_RESOURCE_SIZE];
+        w32(&mut map_buf, 0, NV_ENC_MAP_INPUT_RESOURCE_VER);
+        wptr(&mut map_buf, 16, registered);
+
+        let status = unsafe {
+            (self.fns.nvEncMapInputResource)(self.encoder, map_buf.as_mut_ptr() as *mut c_void)
+        };
+        if status != NV_ENC_SUCCESS {
+            eprintln!("[nvenc-direct] nvEncMapInputResource (fmt={fmt:#x}) failed: {status}");
+            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+            return None;
+        }
+        let mapped_resource = rptr(&map_buf, 24);
+
+        let mut pic_buf = vec![0u8; NVENC_PIC_PARAMS_SIZE];
+        w32(&mut pic_buf, 0, NV_ENC_PIC_PARAMS_VER);
+        w32(&mut pic_buf, 4, self.width);
+        w32(&mut pic_buf, 8, self.height);
+        w32(&mut pic_buf, 12, pitch);
+        w32(&mut pic_buf, 20, self.frame_idx);
+        w64(&mut pic_buf, 24, self.frame_idx as u64);
+        wptr(&mut pic_buf, 40, mapped_resource);
+        wptr(&mut pic_buf, 48, self.output_buffer);
+        w32(&mut pic_buf, 64, fmt);
+        w32(&mut pic_buf, 68, 1);
+
+        if self.force_idr {
+            w32(&mut pic_buf, 16, NV_ENC_PIC_FLAGS_FORCEIDR | 0x4);
+            w32(&mut pic_buf, 72, NV_ENC_PIC_TYPE_IDR);
+        }
+
+        self.frame_idx += 1;
+
+        let status = unsafe {
+            (self.fns.nvEncEncodePicture)(self.encoder, pic_buf.as_mut_ptr() as *mut c_void)
+        };
+        if status != NV_ENC_SUCCESS {
+            unsafe { (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource) };
+            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+            if status != NV_ENC_ERR_NEED_MORE_INPUT {
+                eprintln!("[nvenc-direct] nvEncEncodePicture (fmt={fmt:#x}) failed: {status}");
+            }
+            return None;
+        }
+        self.force_idr = false;
+
+        let mut lock_buf = vec![0u8; NVENC_LOCK_BITSTREAM_SIZE];
+        w32(&mut lock_buf, 0, NV_ENC_LOCK_BITSTREAM_VER);
+        wptr(&mut lock_buf, 8, self.output_buffer);
+
+        let status = unsafe {
+            (self.fns.nvEncLockBitstream)(self.encoder, lock_buf.as_mut_ptr() as *mut c_void)
+        };
+        if status != NV_ENC_SUCCESS {
+            eprintln!("[nvenc-direct] nvEncLockBitstream (fmt={fmt:#x}) failed: {status}");
+            unsafe { (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource) };
+            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+            return None;
+        }
+
+        let size = r32(&lock_buf, 36) as usize;
+        let buf_ptr = rptr(&lock_buf, 56) as *const u8;
+        let nal_data = if !buf_ptr.is_null() && size > 0 {
+            unsafe { std::slice::from_raw_parts(buf_ptr, size) }.to_vec()
+        } else {
+            Vec::new()
+        };
+        let is_idr = self.is_keyframe_pic_type(r32(&lock_buf, 64));
+
+        unsafe { (self.fns.nvEncUnlockBitstream)(self.encoder, self.output_buffer) };
+        unsafe { (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource) };
+
+        let mut dummy_ctx: gpu_libs::CUcontext = ptr::null_mut();
+        unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy_ctx) };
+
+        if nal_data.is_empty() {
+            None
+        } else {
+            let mut nal_data = nal_data;
+            self.ensure_h264_sps_pps(&mut nal_data, is_idr);
+            Some((nal_data, is_idr))
+        }
+    }
+}
+
+/// Check if an Annex B H.264 bitstream contains SPS (NAL type 7) and PPS (NAL type 8).
+fn h264_has_sps_pps(data: &[u8]) -> bool {
+    let mut has_sps = false;
+    let mut has_pps = false;
+    for_each_annex_b_nal(data, |nal_type, _offset| {
+        if nal_type == 7 {
+            has_sps = true;
+        }
+        if nal_type == 8 {
+            has_pps = true;
+        }
+    });
+    has_sps && has_pps
+}
+
+/// Extract the Annex B prefix containing SPS+PPS NAL units (everything
+/// before the first VCL NAL, i.e. IDR slice type 5).
+fn h264_extract_sps_pps_prefix(data: &[u8]) -> Option<Vec<u8>> {
+    let mut first_vcl_offset = None;
+    for_each_annex_b_nal(data, |nal_type, offset| {
+        if first_vcl_offset.is_none() && (nal_type == 5 || nal_type == 1) {
+            first_vcl_offset = Some(offset);
+        }
+    });
+    first_vcl_offset
+        .filter(|&off| off > 0)
+        .map(|off| data[..off].to_vec())
+}
+
+/// Iterate over NAL units in an Annex B byte stream, calling `f` with the
+/// NAL unit type and byte offset of each start code.
+fn for_each_annex_b_nal(data: &[u8], mut f: impl FnMut(u8, usize)) {
+    let len = data.len();
+    let mut i = 0;
+    while i < len.saturating_sub(3) {
+        if data[i] == 0 && data[i + 1] == 0 {
+            let (sc_len, nal_start) = if data[i + 2] == 1 {
+                (3, i + 3)
+            } else if data[i + 2] == 0 && i + 3 < len && data[i + 3] == 1 {
+                (4, i + 4)
+            } else {
+                i += 1;
+                continue;
+            };
+            let _ = sc_len;
+            if nal_start < len {
+                let nal_type = data[nal_start] & 0x1f;
+                f(nal_type, i);
+            }
+            i = nal_start + 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+impl Drop for NvencDirectEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            let upload = self.nv12_upload.take();
+            // Push the CUDA context — Drop may run on any thread.
+            let cuda = gpu_libs::cuda().ok();
+            let pushed = cuda.is_some_and(|cuda| (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) == 0);
+            if let Some(upload) = &upload {
+                (self.fns.nvEncUnregisterResource)(self.encoder, upload.registered);
+            }
+            // Zero-copy imports: unregister before the encoder goes, and
+            // release the CUDA side (which also closes the dup'd fd it took
+            // ownership of at import).
+            for (_, imp) in self.nv12_imports.drain() {
+                (self.fns.nvEncUnregisterResource)(self.encoder, imp.registered);
+                if let Some(cuda) = cuda
+                    && let Some(destroy) = cuda.cuDestroyExternalMemory
+                {
+                    destroy(imp.ext_mem);
+                }
+            }
+            (self.fns.nvEncDestroyBitstreamBuffer)(self.encoder, self.output_buffer);
+            (self.fns.nvEncDestroyEncoder)(self.encoder);
+            if let Some(cuda) = cuda {
+                if let Some(upload) = upload {
+                    (cuda.cuMemFreeHost)(upload.pinned_host as *mut c_void);
+                    (cuda.cuMemFree_v2)(upload.cuda_devptr);
+                }
+                // The context is the shared device primary context — other
+                // encoders are using it, so it is never destroyed here (the
+                // retain in `primary_ctx` is process-lifetime).
+                if pushed {
+                    let mut previous: gpu_libs::CUcontext = ptr::null_mut();
+                    (cuda.cuCtxPopCurrent_v2)(&mut previous);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps() -> NvencCaps {
+        // What an Ada-generation AV1 engine reports.
+        NvencCaps {
+            min_width: 160,
+            min_height: 128,
+            max_width: 8192,
+            max_height: 8192,
+            yuv444: false,
+            encoder_engines: 2,
+        }
+    }
+
+    #[test]
+    fn stream_gop_uses_nvencs_infinite_low_latency_form() {
+        let mut config = vec![0u8; NVENC_CONFIG_SIZE];
+        write_stream_gop(&mut config);
+        assert_eq!(r32(&config, 20), NVENC_INFINITE_GOPLENGTH);
+        assert_eq!(r32(&config, 24), 1, "infinite GOP requires IPP");
+    }
+
+    #[test]
+    fn cpu_nv12_staging_is_exactly_one_and_a_half_planes() {
+        assert_eq!(nv12_upload_size(1024, 708), Some(1_087_488));
+        assert_eq!(nv12_upload_size(2048, 1080), Some(3_317_760));
+        assert_eq!(nv12_upload_size(usize::MAX, 2), None);
+    }
+
+    #[test]
+    fn av1_color_description_matches_the_limited_range_bt601_pipeline() {
+        let mut config = vec![0u8; NVENC_CONFIG_SIZE];
+        write_av1_color_description(&mut config);
+        assert_eq!(r32(&config, NVENC_AV1_COLOR_RANGE_OFFSET), 0);
+        assert_eq!(
+            r32(&config, NVENC_AV1_COLOR_PRIMARIES_OFFSET),
+            NVENC_VUI_COLOR_PRIMARIES_BT709,
+        );
+        assert_eq!(
+            r32(&config, NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET),
+            NVENC_VUI_TRANSFER_CHARACTERISTIC_BT709,
+        );
+        assert_eq!(
+            r32(&config, NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET),
+            NVENC_VUI_MATRIX_COEFFS_SMPTE170M,
+        );
+    }
+
+    #[test]
+    fn wide_av1_forces_two_strip_split_encode() {
+        let mut init = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
+        write_split_encode_mode(&mut init, "av1", 3840);
+        assert_eq!(
+            r32(&init, 68),
+            NVENC_SPLIT_TWO_FORCED_MODE << NVENC_SPLIT_ENCODE_MODE_SHIFT,
+        );
+
+        let mut narrow = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
+        write_split_encode_mode(&mut narrow, "av1", 2560);
+        assert_eq!(r32(&narrow, 68), 0, "ordinary frames stay automatic");
+
+        let mut h264 = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
+        write_split_encode_mode(&mut h264, "h264", 3840);
+        assert_eq!(r32(&h264, 68), 0, "split mode does not apply to H.264");
+    }
+
+    /// The dock renders panes at 256x54.  That is a statement about the
+    /// frame, and the caller has to be able to read it as one — writing it
+    /// off as "this host has no NVENC" is what took hardware AV1 away from
+    /// every viewer on the machine.
+    #[test]
+    fn a_frame_under_the_engine_minimum_is_refused_not_the_engine() {
+        assert!(caps().refuse(256, 54).is_some(), "under min_height");
+        assert!(caps().refuse(64, 480).is_some(), "under min_width");
+        assert!(caps().refuse(9000, 480).is_some(), "over max_width");
+        assert!(caps().refuse(1920, 9000).is_some(), "over max_height");
+        assert!(caps().refuse(1920, 1080).is_none());
+        // Exactly on the bounds is inside them.
+        assert!(caps().refuse(160, 128).is_none());
+        assert!(caps().refuse(8192, 8192).is_none());
+    }
+
+    /// The probe frame every backend is measured against has to clear the
+    /// minimums, or the thing meant to tell a host's fault from a frame's
+    /// would report every host as broken.
+    #[test]
+    fn the_probe_frame_clears_the_engine_minimum() {
+        let (w, h) = crate::surface_encoder::PROBE_SIZE;
+        assert!(caps().refuse(w, h).is_none());
+    }
+
+    /// The refusal names the range, because it is read in logs beside the
+    /// size that was asked for.
+    #[test]
+    fn a_refusal_says_what_the_range_is() {
+        let msg = caps().refuse(256, 54).unwrap();
+        assert!(msg.contains("256x54"), "{msg}");
+        assert!(msg.contains("160x128"), "{msg}");
+    }
+}

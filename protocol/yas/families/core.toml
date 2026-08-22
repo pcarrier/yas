@@ -1,0 +1,247 @@
+schema = 1
+family = "yas.core"
+
+[[constant]]
+name = "RUNTIME_AVAILABLE"
+value = 0
+
+[[constant]]
+name = "RUNTIME_DEGRADED"
+value = 1
+
+[[constant]]
+name = "RUNTIME_UNAVAILABLE"
+value = 2
+
+[[constant]]
+name = "DIRECTION_ACCEPTS"
+value = 1
+
+[[constant]]
+name = "DIRECTION_SENDS"
+value = 2
+
+[[constant]]
+name = "CLIENT_HELLO_IDLE_TIMEOUT_EXTENSION"
+value = 1
+
+[[constant]]
+name = "CLIENT_HELLO_PLATFORM_EXTENSION"
+value = 2
+
+[[constant]]
+name = "CLIENT_HELLO_INITIAL_WATCHES_EXTENSION"
+value = 3
+
+[[constant]]
+name = "CLIENT_HELLO_READ_ONLY_SESSION_EXTENSION"
+value = 4
+
+[[constant]]
+name = "SERVER_HELLO_INITIAL_WATCH_RESULTS_EXTENSION"
+value = 1
+
+[[constant]]
+name = "SERVER_HELLO_NEGOTIATED_CODECS_EXTENSION"
+value = 2
+
+[[constant]]
+name = "SERVER_HELLO_PLATFORM_EXTENSION"
+value = 3
+
+[[constant]]
+name = "SESSION_INFO_SERVER_DIAGNOSTICS_EXTENSION"
+value = 1
+
+[[request]]
+name = "HELLO"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "forbidden"
+datagram = "forbidden"
+layout = "ClientHello; ResultPrefix + ServerHello"
+
+[[request]]
+name = "PING"
+kind = 0x0001
+direction = "bidirectional"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "sender_monotonic_ns:u64; ResultPrefix + receiver_receive_ns:u64,receiver_send_ns:u64"
+
+[[request]]
+name = "CANCEL"
+kind = 0x0002
+direction = "bidirectional"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "target_request_id:u32; ResultPrefix"
+
+[[request]]
+name = "SESSION_INFO"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "empty; ResultPrefix + SessionInfo"
+
+[[request]]
+name = "CLIENT_UPDATE"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "Extensions; ResultPrefix"
+
+[[request]]
+name = "SHUTDOWN"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16] nonzero,grace_ns:u64,reason:string_u32; ResultPrefix"
+
+[[event]]
+name = "GOAWAY"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "status:u16,reserved:u16=0,close_deadline_server_ns:u64,detail:Extensions"
+
+[[event]]
+name = "SESSION_UPDATE"
+kind = 0x0001
+direction = "server_to_client"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "catalog_revision:u64 nonzero,ReceiveLimits replacement,Extensions"
+
+[[event]]
+name = "FAMILY_UPDATE"
+kind = 0x0002
+direction = "server_to_client"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "catalog_revision:u64 nonzero,FamilyDescriptor complete replacement"
+
+[[status]]
+name = "OK"
+code = 0
+
+[[status]]
+name = "INVALID"
+code = 1
+
+[[status]]
+name = "UNSUPPORTED"
+code = 2
+
+[[status]]
+name = "NOT_FOUND"
+code = 3
+
+[[status]]
+name = "CONFLICT"
+code = 4
+
+[[status]]
+name = "BUSY"
+code = 5
+
+[[status]]
+name = "UNAVAILABLE"
+code = 6
+
+[[status]]
+name = "RESOURCE_EXHAUSTED"
+code = 7
+
+[[status]]
+name = "RATE_LIMITED"
+code = 8
+
+[[status]]
+name = "TIMEOUT"
+code = 9
+
+[[status]]
+name = "CANCELLED"
+code = 10
+
+[[status]]
+name = "STALE"
+code = 11
+
+[[status]]
+name = "IO"
+code = 12
+
+[[status]]
+name = "INTERNAL"
+code = 13
+
+[[type]]
+name = "frame_header"
+layout = "family:u16,kind:u16,meta:u8,request_id:u32 if class request/result"
+
+[[type]]
+name = "result_prefix"
+layout = "status:u16,flags:u16=0,detail:bytes_u32,body:remaining"
+
+[[type]]
+name = "client_hello"
+layout = "minor_range,receive_limits,client_instance:[u8;16],client_name:string_u16,client_release:string_u16,family_offers,codecs,Extensions"
+
+[[type]]
+name = "server_hello"
+layout = "minor:u16,reserved:u16=0,boot_id:[u8;16],session_id:[u8;16],receive_limits,times,names,family_descriptors,Extensions"
+
+[[type]]
+name = "family_descriptor"
+layout = "descriptor:bytes_u32 containing family_id:u16,version:u16,runtime_state:u8,reserved:u8=0,operations,limits:bytes_u32; a known operation direction may be a nonempty supported subset of its canonical schema direction and must never add a forbidden direction"
+
+[[type]]
+name = "receive_limits"
+layout = "max_frame:u32,max_decoded:u32,max_datagram:u32,max_buffered:u64; max_frame>=correlated_header_bytes,max_decoded>=max_frame,max_datagram=0 or >=event_header_bytes,max_buffered>0"
+
+[[type]]
+name = "family_operation"
+layout = "direction:u8,class:u8 Request|Event only,kind:u16; Result capability is implied by Request"
+
+[[type]]
+name = "session_info"
+layout = "session_id:[u8;16],catalog_revision:u64,ReceiveLimits,server_monotonic_ns:u64,family_count:u16,repeated FamilyDescriptor,Extensions"
+
+[[type]]
+name = "server_diagnostics_extension"
+layout = "active_sessions:u32,relay_active:u32,relay_pending:u32,reserved:u32=0,aggregate_receive_limit:u64,aggregate_receive_buffered:u64; buffered<=limit"
+
+[[type]]
+name = "session_update"
+layout = "catalog_revision:u64 nonzero,ReceiveLimits,Extensions; max_frame and max_decoded cannot decrease within a session"
+
+[[type]]
+name = "family_update"
+layout = "catalog_revision:u64 nonzero,FamilyDescriptor; family_id and version match the selected descriptor"
+
+[[type]]
+name = "initial_watches_extension"
+layout = "count:u16,repeated family_id:u16,family_version:u16,watch_payload:bytes_u32"
+
+[[type]]
+name = "initial_watch_results_extension"
+layout = "count:u16,repeated embedded_watch_result:bytes_u32"
+
+[[type]]
+name = "negotiated_codecs_extension"
+layout = "count:u8,repeated codec:u16; nonzero,unique,ascending,subset of ClientHello codecs"

@@ -1,0 +1,77 @@
+{
+  "name": "@yas-run/solid",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./hooks": {
+      "types": "./src/hooks/index.ts",
+      "default": "./src/hooks/index.ts"
+    }
+  },
+  "publishConfig": {
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./hooks": {
+        "types": "./dist/hooks/index.d.ts",
+        "default": "./dist/hooks/index.js"
+      }
+    }
+  },
+  "description": "Low-latency terminal streaming — Solid components and primitives",
+  "homepage": "https://yas.run",
+  "author": "Indent <oss@indent.com> (https://indent.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pcarrier/yas.git",
+    "directory": "js/solid"
+  },
+  "bugs": {
+    "url": "https://github.com/pcarrier/yas/issues"
+  },
+  "keywords": [
+    "terminal",
+    "tty",
+    "solid",
+    "solidjs",
+    "streaming",
+    "webgl"
+  ],
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && vite build && tsc --emitDeclarationOnly --noEmit false",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@yas-run/core": "workspace:*",
+    "solid-js": ">=1.8.0"
+  },
+  "devDependencies": {
+    "@yas-run/browser": "file:../../crates/browser/pkg",
+    "@yas-run/core": "workspace:*",
+    "@solidjs/testing-library": "^0.8.10",
+    "jsdom": "^29.1.1",
+    "solid-js": "^1.9.13",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vite-plugin-solid": "^2.11.12",
+    "vitest": "^4.1.6"
+  },
+  "license": "MIT"
+}

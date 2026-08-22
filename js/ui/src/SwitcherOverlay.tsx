@@ -1,0 +1,2500 @@
+import {
+  createSignal,
+  createEffect,
+  createMemo,
+  on,
+  onMount,
+  onCleanup,
+  Show,
+  For,
+  type JSX,
+} from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
+import {
+  YasTerminal,
+  YasSurfaceView,
+  createYasWorkspace,
+} from "@yas-run/solid";
+import { symbolKindTag } from "./ide/symbolKinds";
+import {
+  SEARCH_SOURCE_SCROLLBACK,
+  SEARCH_SOURCE_TITLE,
+  SEARCH_SOURCE_VISIBLE,
+} from "@yas-run/core";
+import type {
+  YasSearchResult,
+  YasSession,
+  YasSurface,
+  SessionId,
+  SurfaceId,
+  TerminalPalette,
+} from "@yas-run/core";
+import { surfaceAssignment } from "@yas-run/core/layout";
+import { OverlayBackdrop, OverlayPanel } from "./Overlay";
+import {
+  mergeStyle,
+  overlayChromeStyles,
+  scrollbarStyle,
+  sessionName,
+  sessionPrefix,
+  themeFor,
+  ui,
+  uiScale,
+} from "./theme";
+import { LayoutPreview } from "./layout/LayoutPreview";
+import {
+  isSurfaceAssignment,
+  layoutFromDSL,
+  type LayoutAssignments,
+  type WorkspaceLayout,
+} from "./layout/store";
+import { tileDisplay } from "./ide/tileDisplay";
+import { t, tp } from "./i18n";
+import { getInstallPrompt, clearInstallPrompt } from "./installPrompt";
+import { placeApplicationSection } from "./switcherSections";
+import { retainSwitcherFocus } from "./switcherFocus";
+import { AppIcon } from "./panelKit";
+import {
+  applicationIcon,
+  requestApplicationIcons,
+  sessionCatalogs,
+  startApplication,
+} from "./sessionCatalogs";
+import {
+  workspaceSessionIdFromHash,
+  workspaceSessionShareUrl,
+} from "./workspaceSessionUrl";
+
+const SOURCE_LABEL: Record<number, string> = {
+  [SEARCH_SOURCE_TITLE]: t("switcher.sourceTitle"),
+  [SEARCH_SOURCE_VISIBLE]: t("switcher.sourceTerminal"),
+  [SEARCH_SOURCE_SCROLLBACK]: t("switcher.sourceBacklog"),
+};
+
+/** Returns true if the URI scheme is share: (contains a secret passphrase). */
+function isShareUri(uri: string): boolean {
+  return uri.trimStart().toLowerCase().startsWith("share:");
+}
+
+/** Returns a masked display string for share: URIs; passes other URIs through unchanged. */
+function maskUri(uri: string): string {
+  return isShareUri(uri)
+    ? "share:\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
+    : uri;
+}
+
+type LayoutItem = {
+  type: "layout";
+  key: string;
+  title: string;
+  subtitle: string;
+  layout: WorkspaceLayout;
+};
+
+type SessionItem = {
+  type: "session";
+  key: string;
+  prefix: string;
+  title: string;
+  subtitle: string;
+  sessionId: SessionId;
+  exited: boolean;
+  context?: string;
+  source?: number;
+  focused: boolean;
+  inLayout: boolean;
+};
+
+type ActionItem = {
+  type: "action";
+  key: string;
+  title: string;
+  subtitle: string;
+  // Deliberately not here: anything the status bar or the left dock already
+  // does in one click — palette, font, workspace roots, and the remotes
+  // dialog, which now carries the connected-client lists too. The switcher is
+  // for what has no other home.
+  action:
+    | "new-terminal"
+    | "share-url"
+    | "manage-sessions"
+    | "install-app"
+    | "clear-layout"
+    | "clear-local-storage"
+    | "open-web"
+    | "open-search";
+  connectionId?: string;
+};
+
+type SurfaceItem = {
+  type: "surface";
+  key: string;
+  title: string;
+  subtitle: string;
+  surfaceId: SurfaceId;
+  connectionId: string;
+  focused: boolean;
+  /** Asked to come forward (xdg_activation_v1) and has not been looked at. */
+  attention: boolean;
+};
+
+type RemoteItem = {
+  type: "remote";
+  key: string;
+  title: string;
+  subtitle: string;
+  remoteName: string;
+  remoteUri: string;
+  status: import("@yas-run/core").ConnectionStatus | null;
+};
+
+type TileItem = {
+  type: "tile";
+  key: string;
+  /** Dim address half, as a session row has (`dev:manage` before `Session`). */
+  prefix: string;
+  title: string;
+  subtitle: string;
+  /** The tile assignment to restore (editor:/diff:/commit:/manage:). */
+  assignment: string;
+  tileKind: "editor" | "diff" | "commit" | "web" | "manage";
+};
+
+type FileItem = {
+  type: "file";
+  key: string;
+  title: string;
+  subtitle: string;
+  /** Root-relative path to open in the editor. */
+  relPath: string;
+};
+
+/** One `#query` hit: an LSP workspace symbol, as the backend reported it. */
+export type SwitcherSymbolHit = {
+  name: string;
+  /** LSP SymbolKind value. */
+  symKind: number;
+  /** Workspace-relative path (the LSP root's, not the fs root's). */
+  path: string;
+  /** 0-based line. */
+  line: number;
+  /** UTF-8 byte column. */
+  col: number;
+};
+
+type SymbolItem = {
+  type: "symbol";
+  key: string;
+  title: string;
+  subtitle: string;
+  hit: SwitcherSymbolHit;
+};
+
+/**
+ * One installed application on one connected server.
+ *
+ * Deliberately carries no artwork. {@link stabilizeSections} compares items
+ * field by field, so an icon arriving *in* the item would replace the row
+ * object and remount the row. The square reads the icon from the catalog store
+ * instead, which is reactive on its own: the row stays put and the picture
+ * appears inside it.
+ */
+type AppItem = {
+  type: "app";
+  key: string;
+  title: string;
+  subtitle: string;
+  /** Desktop-entry id — the name the supervisor's `start` takes. */
+  appId: string;
+  connectionId: string;
+};
+
+type SwitcherItem =
+  | LayoutItem
+  | SessionItem
+  | ActionItem
+  | SurfaceItem
+  | RemoteItem
+  | TileItem
+  | FileItem
+  | SymbolItem
+  | AppItem;
+type SwitcherSection = {
+  title: string;
+  items: SwitcherItem[];
+};
+
+function itemKey(item: SwitcherItem): string {
+  return item.key;
+}
+
+function isCustomLayoutQuery(query: string): boolean {
+  return /^\s*([^:]*:\s*)?(line|col|tabs)\s*\(/i.test(query);
+}
+
+function parseLayoutQuery(query: string): { name: string | null; dsl: string } {
+  const match = query.match(/^\s*([^:(]+?)\s*:\s*((line|col|tabs)\s*\(.*)/i);
+  if (match) return { name: match[1].trim(), dsl: match[2].trim() };
+  return { name: null, dsl: query.trim() };
+}
+
+function TileGlyph(props: {
+  kind: "editor" | "diff" | "commit" | "preview" | "web" | "manage";
+  fg: string;
+  dimFg: string;
+}) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="24"
+      height="24"
+      fill="none"
+      aria-hidden="true"
+    >
+      <Show when={props.kind === "web"}>
+        {/* globe */}
+        <circle cx="12" cy="12" r="7.5" stroke={props.dimFg} />
+        <path d="M4.5 12h15" stroke={props.fg} />
+        <path
+          d="M12 4.5c3 3 3 12 0 15M12 4.5c-3 3-3 12 0 15"
+          stroke={props.fg}
+        />
+      </Show>
+      <Show when={props.kind === "editor"}>
+        {/* document with text lines */}
+        <path d="M7 4.5h7l3.5 3.5v11.5H7z" stroke={props.dimFg} />
+        <path d="M13.5 4.5v4h4" stroke={props.dimFg} />
+        <path d="M9.5 12h6M9.5 15h6" stroke={props.fg} />
+      </Show>
+      <Show when={props.kind === "diff"}>
+        {/* two side-by-side columns */}
+        <rect x="4.5" y="4.5" width="15" height="15" stroke={props.dimFg} />
+        <path d="M12 4.5v15" stroke={props.dimFg} />
+        <path d="M6.5 9h3M6.5 12h3" stroke={props.fg} />
+        <path d="M14.5 12h3M14.5 15h3" stroke={props.fg} />
+      </Show>
+      <Show when={props.kind === "commit"}>
+        {/* commit node on a branch line */}
+        <path d="M12 4.5v4M12 15.5v4" stroke={props.dimFg} />
+        <circle cx="12" cy="12" r="3.5" stroke={props.fg} />
+      </Show>
+      <Show when={props.kind === "manage"}>
+        {/* sliders: a server's own controls */}
+        <path d="M4.5 8h15M4.5 16h15" stroke={props.dimFg} />
+        <circle cx="9.5" cy="8" r="2" stroke={props.fg} />
+        <circle cx="15" cy="16" r="2" stroke={props.fg} />
+      </Show>
+      <Show when={props.kind === "preview"}>
+        {/* framed picture: a rendered file rather than its source */}
+        <rect x="4.5" y="5.5" width="15" height="13" stroke={props.dimFg} />
+        <circle cx="9" cy="10" r="1.5" stroke={props.fg} />
+        <path d="M5.5 16.5l4-4 3.5 3.5 2.5-2.5 3 3" stroke={props.fg} />
+      </Show>
+    </svg>
+  );
+}
+
+function ActionGlyph(props: {
+  action: ActionItem["action"];
+  fg: string;
+  dimFg: string;
+}) {
+  const icon = (): JSX.Element => {
+    switch (props.action) {
+      case "new-terminal":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <rect x="3.5" y="5.5" width="17" height="13" stroke={props.dimFg} />
+            <path d="M7 10l2.5 2L7 14" stroke={props.fg} />
+            <path d="M11.5 14h3.5" stroke={props.fg} />
+            <path d="M18 7.5v5" stroke={props.fg} />
+            <path d="M15.5 10h5" stroke={props.fg} />
+          </svg>
+        );
+      case "share-url":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <circle cx="17" cy="6" r="2.5" stroke={props.fg} />
+            <circle cx="7" cy="12" r="2.5" stroke={props.fg} />
+            <circle cx="17" cy="18" r="2.5" stroke={props.fg} />
+            <path d="M9.5 11l5-4M9.5 13l5 4" stroke={props.dimFg} />
+          </svg>
+        );
+      case "install-app":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path d="M12 4v12" stroke={props.fg} />
+            <path d="M8 12l4 4 4-4" stroke={props.fg} />
+            <path d="M5 18h14" stroke={props.dimFg} />
+          </svg>
+        );
+      case "clear-layout":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <rect x="4.5" y="4.5" width="15" height="15" stroke={props.dimFg} />
+            <path d="M9 9l6 6M15 9l-6 6" stroke={props.fg} />
+          </svg>
+        );
+      case "clear-local-storage":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path d="M7 7h10l-1 12H8L7 7z" stroke={props.dimFg} />
+            <path d="M5 7h14" stroke={props.fg} />
+            <path d="M10 5h4" stroke={props.fg} />
+          </svg>
+        );
+      case "open-web":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            stroke-width="1.5"
+          >
+            <circle cx="12" cy="12" r="8" stroke={props.fg} />
+            <path
+              d="M4 12h16M12 4c3 3 3 13 0 16M12 4c-3 3-3 13 0 16"
+              stroke={props.fg}
+            />
+          </svg>
+        );
+      case "open-search":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            stroke-width="1.5"
+          >
+            <circle cx="10.5" cy="10.5" r="6" stroke={props.fg} />
+            <path d="M15 15l5 5" stroke={props.fg} />
+          </svg>
+        );
+      default:
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="3" fill={props.fg} opacity="0.5" />
+          </svg>
+        );
+    }
+  };
+
+  return <>{icon()}</>;
+}
+
+const STATUS_COLORS: Record<string, string> = {
+  connected: "#4caf50",
+  connecting: "#ff9800",
+  authenticating: "#ff9800",
+  disconnected: "#888",
+  closed: "#888",
+  error: "#f44336",
+};
+
+function StatusDot(props: {
+  status: import("@yas-run/core").ConnectionStatus | null;
+  fg: string;
+  dimFg: string;
+  accent: string;
+}) {
+  const color = () =>
+    props.status ? (STATUS_COLORS[props.status] ?? props.dimFg) : props.dimFg;
+  const pulse = () =>
+    props.status === "connecting" || props.status === "authenticating";
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="24"
+      height="24"
+      fill="none"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="4" fill={color()} opacity={pulse() ? 0.6 : 1}>
+        {pulse() && (
+          <animate
+            attributeName="opacity"
+            values="0.4;1;0.4"
+            dur="1.5s"
+            repeatCount="indefinite"
+          />
+        )}
+      </circle>
+    </svg>
+  );
+}
+
+export function SwitcherOverlay(props: {
+  sessions: readonly YasSession[];
+  focusedSessionId: SessionId | null;
+  lru: SessionId[];
+  palette: TerminalPalette;
+  fontFamily?: string;
+  fontSize?: number;
+  onSelect: (sessionId: SessionId) => void;
+  onClose: () => void;
+  onCreate: (command?: string, connectionId?: string) => void;
+  activeLayout?: WorkspaceLayout | null;
+  layoutAssignments?: LayoutAssignments | null;
+  onApplyLayout?: (layout: WorkspaceLayout) => void;
+  onRemoveLayout?: (dsl: string) => void;
+  /** Open the web-pane picker. */
+  onOpenWeb?: () => void;
+  /** Open the project search panel and focus its query input. */
+  onOpenSearch?: () => void;
+  onClearLayout?: () => void;
+  onSelectPane?: (
+    paneId: string,
+    sessionId: SessionId | null,
+    command?: string,
+    connectionId?: string,
+  ) => void;
+  focusedPaneId?: string | null;
+  onMoveToPane?: (sessionId: SessionId, targetPaneId: string) => void;
+  /** Mode prefix already typed, from a Ctrl+B mode key. */
+  initialQuery?: string;
+  recentLayouts?: WorkspaceLayout[];
+  initialNewTerminalMode?: boolean;
+  remotes?: readonly import("./workspaceSessionRemotes").Remote[];
+  remoteStatuses?: ReadonlyMap<
+    string,
+    import("@yas-run/core").ConnectionStatus
+  >;
+  surfaces?: readonly YasSurface[];
+  connectionId?: string;
+  connectionLabels?: Map<string, string>;
+  multiConnection?: boolean;
+  focusedSurfaceId?: SurfaceId | null;
+  focusedSurfaceConnId?: string | null;
+  /** Has this pane assignment asked to come forward without being looked at?
+   *  An activation is answered with a mark rather than the view, and this list
+   *  is where the marks can actually be found and acted on. */
+  hasAttention?: (assignment: string) => boolean;
+  onFocusSurface?: (surfaceId: SurfaceId, connectionId?: string) => void;
+  onMoveSurfaceToPane?: (
+    surfaceId: SurfaceId,
+    connectionId: string,
+    targetPaneId: string,
+  ) => void;
+  /** Backgrounded IDE tiles (editor/diff/commit), most-recent first. */
+  backgroundTiles?: readonly string[];
+  /** Restore a backgrounded tile (re-open it in the main view / focused pane). */
+  onRestoreTile?: (assignment: string) => void;
+  /**
+   * Start an application selected from the app list. The caller owns focusing
+   * the surface once it appears; the switcher itself does not know the active
+   * panel or the surface's id ahead of time.
+   */
+  onStartApplication?: (connectionId: string, appId: string) => boolean;
+  /** Synchronous "@query" search over the locally cached file index
+   *  (ide/fileIndex.ts) — per-keystroke, no round trip. Null while the
+   *  native index is unavailable or still fetching — the list stays empty
+   *  until an index arrives. */
+  fileSearchLocal?: (query: string) => string[] | null;
+  /** Kick the index fetch without scoring anything — called on mount so
+   *  the list is usually in hand by the first "@" keystroke. */
+  fileSearchWarm?: () => void;
+  /** Open a file (root-relative path) from an "@" match in the editor. */
+  onOpenFile?: (relPath: string) => void;
+  /** Async "#query" search over the workspace's LSP symbols. Unlike the
+   *  file index this is a real round trip per query, so the caller sees a
+   *  debounced, cancellable call — resolve to [] for "nothing to say"
+   *  (no attachment, still warming, backend can't answer). */
+  symbolSearch?: (query: string) => Promise<SwitcherSymbolHit[]>;
+  /** Attach the language server without asking anything of it, so the
+   *  first "#" keystroke isn't also waiting on a spawn. Returns a release
+   *  called when the switcher closes, so warming for one lookup does not pin
+   *  a language server for the rest of the session. */
+  symbolSearchWarm?: () => (() => void) | undefined;
+  /** Open a "#" match: reveal its line in an editor tile. */
+  onOpenSymbol?: (hit: SwitcherSymbolHit) => void;
+  defaultRemote?: string | null;
+  /** Open the backend workspace-session manager. */
+  onManageSessions?: () => void;
+  /** Attached backend workspace, used for canonical share URLs. */
+  workspaceSessionId?: string;
+}) {
+  const workspace = createYasWorkspace();
+  const notClosed = createMemo(() =>
+    props.sessions.filter((session) => session.state !== "closed"),
+  );
+  const lruIndex = createMemo(
+    () => new Map(props.lru.map((id, index) => [id, index])),
+  );
+  const visibleSessions = createMemo(() => {
+    const isNamed = (session: YasSession) =>
+      session.tag.length > 0 && !/^[0-9a-f-]{8,}$/.test(session.tag);
+    return [...notClosed()].sort((left, right) => {
+      const leftNamed = isNamed(left) ? 0 : 1;
+      const rightNamed = isNamed(right) ? 0 : 1;
+      if (leftNamed !== rightNamed) return leftNamed - rightNamed;
+      const leftIndex = lruIndex().get(left.id) ?? Infinity;
+      const rightIndex = lruIndex().get(right.id) ?? Infinity;
+      return leftIndex - rightIndex;
+    });
+  });
+
+  // Session IDs currently assigned to a pane (excludes surface assignments).
+  const assignedSessionIds = createMemo(() => {
+    const a = props.layoutAssignments?.assignments;
+    if (!a) return new Set<string>();
+    const ids = new Set<string>();
+    for (const v of Object.values(a)) {
+      if (v != null && !isSurfaceAssignment(v)) ids.add(v);
+    }
+    return ids;
+  });
+
+  const dark = () => props.palette.dark;
+  const theme = () => themeFor(props.palette);
+  const scale = () => uiScale(props.fontSize ?? 13);
+  const chrome = () => overlayChromeStyles(theme(), dark(), scale());
+  // A mode prefix Ctrl+B # / @ / > typed for the viewer. Read once, at mount:
+  // the field is theirs from the first keystroke after that.
+  const [query, setQuery] = createSignal(props.initialQuery ?? "");
+  const [searchResults, setSearchResults] = createSignal<
+    YasSearchResult[] | null
+  >(null);
+  const [selectedIdx, setSelectedIdx] = createSignal(0);
+  // Track whether the pointer actually moved so that scroll-triggered
+  // mouseenter events (from keyboard navigation) don't hijack selection.
+  let pointerMovedSinceKey = true;
+  const [newTerminalMode, setNewTerminalMode] = createSignal(
+    props.initialNewTerminalMode ?? false,
+  );
+  const [killPickerSessionId, setKillPickerSessionId] =
+    createSignal<SessionId | null>(null);
+  let searchRef!: HTMLInputElement;
+  let itemRefs: (HTMLDivElement | null)[] = [];
+  let wrapperRef!: HTMLDivElement;
+
+  const isCommand = () => query().startsWith(">");
+  const commandText = () => (isCommand() ? query().slice(1).trim() : "");
+  // "@query" → fuzzy file search of the active session's root.
+  const isFileSearch = () => query().startsWith("@");
+  const fileQuery = () => (isFileSearch() ? query().slice(1).trim() : "");
+  const [fileResults, setFileResults] = createSignal<string[]>([]);
+  // Warm the local index cache so the list is usually in hand by the
+  // first "@" keystroke.
+  onMount(() => props.fileSearchWarm?.());
+  createEffect(() => {
+    if (!isFileSearch()) {
+      setFileResults([]);
+      return;
+    }
+    // Synchronous, per keystroke. Re-runs on its own when the index fetch
+    // lands (the lookup reads a version signal).
+    setFileResults(props.fileSearchLocal?.(fileQuery()) ?? []);
+  });
+  // "#query" → LSP workspace symbols. Unlike "@", there is no local index
+  // to score against: every query is a round trip to the language server.
+  // Hence the debounce (typing a name shouldn't be one request per letter)
+  // and the cancelled flag — Solid re-runs this effect on each keystroke
+  // and disposes the previous run, so a slow answer can't overwrite a
+  // newer one.
+  const isSymbolSearch = () => query().startsWith("#");
+  const symbolQuery = () => (isSymbolSearch() ? query().slice(1).trim() : "");
+  const [symbolResults, setSymbolResults] = createSignal<SwitcherSymbolHit[]>(
+    [],
+  );
+  const [symbolPending, setSymbolPending] = createSignal(false);
+  onMount(() => {
+    const release = props.symbolSearchWarm?.();
+    if (release) onCleanup(release);
+  });
+  createEffect(() => {
+    if (!isSymbolSearch() || !props.symbolSearch) {
+      setSymbolResults([]);
+      setSymbolPending(false);
+      return;
+    }
+    const q = symbolQuery();
+    const search = props.symbolSearch;
+    let cancelled = false;
+    setSymbolPending(true);
+    const timer = setTimeout(() => {
+      search(q)
+        .then((hits) => {
+          if (!cancelled) {
+            setSymbolResults(hits);
+            setSymbolPending(false);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setSymbolResults([]);
+            setSymbolPending(false);
+          }
+        });
+    }, 120);
+    onCleanup(() => {
+      cancelled = true;
+      clearTimeout(timer);
+    });
+  });
+  const inlineCmd = () =>
+    !isCommand() && query().includes(">")
+      ? query()
+          .slice(query().indexOf(">") + 1)
+          .trim()
+      : "";
+  const searchPart = () =>
+    !isCommand() && query().includes(">")
+      ? query().slice(0, query().indexOf(">")).trim()
+      : query().trim();
+  const searching = () => !isCommand() && searchPart().length > 0;
+
+  // The token has to name the server as well as the application, since two of
+  // them can have the same id.
+  const requestIconTokens = (tokens: string[]) => {
+    const byConnection = new Map<string, string[]>();
+    for (const token of tokens) {
+      const space = token.indexOf(" ");
+      if (space < 0) continue;
+      const connectionId = token.slice(0, space);
+      const ids = byConnection.get(connectionId) ?? [];
+      ids.push(token.slice(space + 1));
+      byConnection.set(connectionId, ids);
+    }
+    for (const [connectionId, ids] of byConnection) {
+      requestApplicationIcons(connectionId, ids);
+    }
+  };
+  /** Every connection the workspace holds, in its own order. The catalog store
+   *  answers only for the ones whose server runs a supervisor, so this needs no
+   *  filtering of its own. */
+  const connectionIds = (): string[] =>
+    props.remoteStatuses
+      ? [...props.remoteStatuses.keys()]
+      : props.connectionId
+        ? [props.connectionId]
+        : [];
+
+  /**
+   * When the query is `label> cmd` and `label` matches (as a prefix) a
+   * connection label, returns `{ connId, label }` so we can scope the session
+   * list and new-terminal action to that destination.
+   *
+   * Works in both single- and multi-connection mode so that e.g. `rab>htop`
+   * matches the "rabbit" connection regardless of how many connections exist.
+   * If multiple labels share the same prefix the first match wins.
+   */
+  const destPrefix = createMemo(
+    (): { connId: string; label: string } | null => {
+      if (!props.connectionLabels) return null;
+      if (!query().includes(">")) return null;
+      const part = searchPart().toLowerCase();
+      if (!part) return null;
+      for (const [connId, label] of props.connectionLabels) {
+        if (label.toLowerCase().startsWith(part)) return { connId, label };
+      }
+      return null;
+    },
+  );
+
+  createEffect(() => {
+    if (!searching()) {
+      setSearchResults(null);
+      return;
+    }
+
+    const part = searchPart();
+    let cancelled = false;
+    workspace
+      .search(part)
+      .then((results) => {
+        if (!cancelled) setSearchResults(results);
+      })
+      .catch(() => {
+        if (!cancelled) setSearchResults([]);
+      });
+
+    onCleanup(() => {
+      cancelled = true;
+    });
+  });
+
+  onMount(() => {
+    if (!wrapperRef || !searchRef) return;
+    onCleanup(retainSwitcherFocus(wrapperRef, searchRef));
+  });
+
+  const sessionsById = createMemo(
+    () => new Map(visibleSessions().map((session) => [session.id, session])),
+  );
+
+  const layoutChoices = createMemo(() => {
+    const recent = props.recentLayouts ?? [];
+    const custom =
+      searching() && isCustomLayoutQuery(searchPart())
+        ? (() => {
+            try {
+              const { name, dsl } = parseLayoutQuery(searchPart());
+              const layout = layoutFromDSL(dsl);
+              if (name) layout.name = name;
+              return [layout];
+            } catch {
+              return [];
+            }
+          })()
+        : [];
+
+    if (!searching()) {
+      return { recent, custom };
+    }
+
+    const needle = searchPart().toLowerCase();
+    const matches = (layouts: WorkspaceLayout[]) =>
+      layouts.filter(
+        (layout) =>
+          layout.name.toLowerCase().includes(needle) ||
+          layout.dsl.toLowerCase().includes(needle),
+      );
+
+    return {
+      recent: matches(recent),
+      custom,
+    };
+  });
+
+  const sessionMatches = createMemo(() => {
+    const dp = destPrefix();
+
+    if (!searching()) {
+      const sessions = dp
+        ? visibleSessions().filter((s) => s.connectionId === dp.connId)
+        : visibleSessions();
+      const assigned = assignedSessionIds();
+      return sessions.map<SessionItem>((session) => ({
+        type: "session",
+        key: `session:${session.id}`,
+        prefix: sessionPrefix(
+          session,
+          props.connectionLabels?.get(session.connectionId),
+        ),
+        title: sessionName(session),
+        subtitle:
+          session.command ??
+          (session.state === "exited"
+            ? t("switcher.exitedTerminal")
+            : t("switcher.openTerminal")),
+        sessionId: session.id,
+        exited: session.state === "exited",
+        focused: session.id === props.focusedSessionId,
+        inLayout: assigned.has(session.id),
+      }));
+    }
+
+    // When a destination prefix is matched, show all sessions on that
+    // connection without further text filtering (the `>` part is the command).
+    if (dp) {
+      const assigned = assignedSessionIds();
+      return visibleSessions()
+        .filter((s) => s.connectionId === dp.connId)
+        .map<SessionItem>((session) => ({
+          type: "session",
+          key: `session:${session.id}`,
+          prefix: sessionPrefix(
+            session,
+            props.connectionLabels?.get(session.connectionId),
+          ),
+          title: sessionName(session),
+          subtitle:
+            session.command ??
+            (session.state === "exited"
+              ? t("switcher.exitedTerminal")
+              : t("switcher.openTerminal")),
+          sessionId: session.id,
+          exited: session.state === "exited",
+          focused: session.id === props.focusedSessionId,
+          inLayout: assigned.has(session.id),
+        }));
+    }
+
+    const needle = searchPart().toLowerCase();
+    const assigned = assignedSessionIds();
+    const seen = new Set<SessionId>();
+    const matches: SessionItem[] = [];
+
+    // When the search query matches a connection label (prefix or substring),
+    // include all sessions on that connection so that e.g. typing "rabbit"
+    // surfaces the terminals running on the rabbit remote.
+    const labelConnIds = new Set<string>();
+    if (props.connectionLabels) {
+      for (const [connId, label] of props.connectionLabels) {
+        if (label.toLowerCase().includes(needle)) labelConnIds.add(connId);
+      }
+    }
+
+    for (const session of visibleSessions()) {
+      if (
+        session.tag.toLowerCase().includes(needle) ||
+        (session.title ?? "").toLowerCase().includes(needle) ||
+        (session.command ?? "").toLowerCase().includes(needle) ||
+        labelConnIds.has(session.connectionId)
+      ) {
+        seen.add(session.id);
+        matches.push({
+          type: "session",
+          key: `session:${session.id}`,
+          prefix: sessionPrefix(
+            session,
+            props.connectionLabels?.get(session.connectionId),
+          ),
+          title: sessionName(session),
+          subtitle:
+            session.command ??
+            (session.state === "exited"
+              ? t("switcher.exitedTerminal")
+              : t("switcher.openTerminal")),
+          sessionId: session.id,
+          exited: session.state === "exited",
+          focused: session.id === props.focusedSessionId,
+          inLayout: assigned.has(session.id),
+        });
+      }
+    }
+
+    for (const result of searchResults() ?? []) {
+      if (!sessionsById().has(result.sessionId) || seen.has(result.sessionId))
+        continue;
+      const session = sessionsById().get(result.sessionId)!;
+      seen.add(result.sessionId);
+      matches.push({
+        type: "session",
+        key: `session:${session.id}`,
+        prefix: sessionPrefix(
+          session,
+          props.connectionLabels?.get(session.connectionId),
+        ),
+        title: sessionName(session),
+        subtitle:
+          session.command ??
+          (session.state === "exited"
+            ? t("switcher.exitedTerminal")
+            : t("switcher.openTerminal")),
+        sessionId: session.id,
+        exited: session.state === "exited",
+        context: result.context,
+        source: result.primarySource,
+        focused: session.id === props.focusedSessionId,
+        inLayout: assigned.has(session.id),
+      });
+    }
+
+    return matches;
+  });
+
+  /** Asked to come forward and not yet looked at. Keyed by pane assignment,
+   *  the same string the dock and the panes are keyed by, so one predicate
+   *  serves every place a surface can be marked. */
+  const asksForAttention = (s: YasSurface) =>
+    props.hasAttention?.(surfaceAssignment(s.connectionId, s.surfaceId)) ??
+    false;
+
+  const surfaceMatches = createMemo(() => {
+    const surfs = props.surfaces ?? [];
+    if (surfs.length === 0) return [] as SurfaceItem[];
+
+    const dp = destPrefix();
+    // When a destination prefix is matched, show surfaces on that connection.
+    if (dp) {
+      return surfs
+        .filter((s) => s.connectionId === dp.connId)
+        .map<SurfaceItem>((s) => ({
+          type: "surface",
+          key: `surface:${s.connectionId}:${s.surfaceId}`,
+          title: s.title || s.appId || `Surface ${s.surfaceId}`,
+          subtitle: `${s.width}\u00D7${s.height}`,
+          surfaceId: s.surfaceId,
+          connectionId: s.connectionId,
+          focused:
+            s.surfaceId === props.focusedSurfaceId &&
+            (props.focusedSurfaceConnId == null ||
+              s.connectionId === props.focusedSurfaceConnId),
+          attention: asksForAttention(s),
+        }));
+    }
+
+    const needle = searching() ? searchPart().toLowerCase() : "";
+
+    // When the search query matches a connection label, include surfaces on
+    // that connection (mirrors the session matching behaviour).
+    const labelConnIds = new Set<string>();
+    if (searching() && props.connectionLabels) {
+      for (const [connId, label] of props.connectionLabels) {
+        if (label.toLowerCase().includes(needle)) labelConnIds.add(connId);
+      }
+    }
+
+    return surfs
+      .filter((s) => {
+        if (!searching()) return true;
+        // Both the title and the application id, not the first non-empty one.
+        // A window's title is whatever it is currently showing, and for a
+        // managed application the Applications section is not the fallback —
+        // that section drops anything the supervisor already runs. So a title
+        // that happens not to contain the application's own name used to make
+        // it unreachable by name from here: Spotify plays a track and titles
+        // its window after it, and typing "spotify" matched nothing anywhere.
+        const name = s.title || `Surface ${s.surfaceId}`;
+        return (
+          name.toLowerCase().includes(needle) ||
+          s.appId.toLowerCase().includes(needle) ||
+          labelConnIds.has(s.connectionId)
+        );
+      })
+      .map<SurfaceItem>((s) => ({
+        type: "surface",
+        key: `surface:${s.connectionId}:${s.surfaceId}`,
+        title: s.title || s.appId || `Surface ${s.surfaceId}`,
+        subtitle: `${s.width}\u00D7${s.height}`,
+        surfaceId: s.surfaceId,
+        connectionId: s.connectionId,
+        focused:
+          s.surfaceId === props.focusedSurfaceId &&
+          (props.focusedSurfaceConnId == null ||
+            s.connectionId === props.focusedSurfaceConnId),
+        attention: asksForAttention(s),
+      }));
+  });
+
+  const backgroundMatches = createMemo<TileItem[]>(() => {
+    const needle = searchPart().toLowerCase();
+    const items: TileItem[] = [];
+    for (const assignment of props.backgroundTiles ?? []) {
+      const d = tileDisplay(assignment);
+      if (
+        needle &&
+        !d.prefix.toLowerCase().includes(needle) &&
+        !d.title.toLowerCase().includes(needle) &&
+        !d.subtitle.toLowerCase().includes(needle)
+      ) {
+        continue;
+      }
+      items.push({
+        type: "tile",
+        key: `tile:${assignment}`,
+        prefix: d.prefix,
+        title: d.title,
+        subtitle: d.subtitle,
+        assignment,
+        tileKind: d.kind,
+      });
+    }
+    return items;
+  });
+
+  const buildSections = (): SwitcherSection[] => {
+    if (isFileSearch()) {
+      const items: FileItem[] = fileResults().map((relPath) => {
+        const slash = relPath.lastIndexOf("/");
+        return {
+          type: "file",
+          key: `file:${relPath}`,
+          title: slash === -1 ? relPath : relPath.slice(slash + 1),
+          subtitle: slash === -1 ? "" : relPath.slice(0, slash),
+          relPath,
+        };
+      });
+      return [{ title: t("switcher.sectionFiles"), items }];
+    }
+    if (isSymbolSearch()) {
+      const items: SymbolItem[] = symbolResults().map((hit) => ({
+        type: "symbol",
+        // Name alone is not unique — the same symbol name recurs across
+        // files and even within one — and a duplicate key would point
+        // selection and scroll-into-view at the wrong row.
+        key: `symbol:${hit.path}:${hit.line}:${hit.col}:${hit.name}`,
+        title: hit.name,
+        subtitle: `${symbolKindTag(hit.symKind)} · ${hit.path}:${hit.line + 1}`,
+        hit,
+      }));
+      return [
+        {
+          title: symbolPending()
+            ? t("switcher.sectionSymbolsPending")
+            : t("switcher.sectionSymbols"),
+          items,
+        },
+      ];
+    }
+    if (newTerminalMode()) {
+      const q = searchPart().toLowerCase();
+      const items: RemoteItem[] = [];
+      if (props.remotes) {
+        for (const r of props.remotes) {
+          if (r.disabled) continue;
+          if (
+            !q ||
+            r.name.toLowerCase().includes(q) ||
+            (!isShareUri(r.uri) && r.uri.toLowerCase().includes(q))
+          ) {
+            items.push({
+              type: "remote",
+              key: `remote:${r.name}`,
+              title: r.name,
+              subtitle: maskUri(r.uri),
+              remoteName: r.name,
+              remoteUri: r.uri,
+              status: props.remoteStatuses?.get(r.name) ?? null,
+            });
+          }
+        }
+      }
+      return [{ title: t("switcher.sectionNewTerminal"), items }];
+    }
+
+    if (isCommand()) {
+      const cmd = commandText();
+      return [
+        {
+          title: t("switcher.sectionAction"),
+          items: [
+            {
+              type: "action",
+              key: "action:new-terminal",
+              title: cmd
+                ? tp("switcher.runCommand", { command: cmd })
+                : t("switcher.newTerminal"),
+              subtitle: cmd
+                ? t("switcher.createRunning")
+                : t("switcher.createInCwd"),
+              action: "new-terminal",
+            },
+          ],
+        },
+      ];
+    }
+
+    const next: SwitcherSection[] = [];
+
+    const customLayouts = layoutChoices().custom.map<LayoutItem>((layout) => ({
+      type: "layout",
+      key: `layout:custom:${layout.dsl}`,
+      title: t("switcher.useTypedLayout"),
+      subtitle: layout.dsl,
+      layout,
+    }));
+    const recent = layoutChoices().recent.map<LayoutItem>((layout) => ({
+      type: "layout",
+      key: `layout:recent:${layout.dsl}`,
+      title: layout.name,
+      subtitle: layout.dsl,
+      layout,
+    }));
+    if (backgroundMatches().length > 0) {
+      next.push({
+        title: t("switcher.sectionBackground"),
+        items: backgroundMatches(),
+      });
+    }
+    if (sessionMatches().length > 0) {
+      if (props.multiConnection && props.connectionLabels) {
+        // Group sessions and surfaces together by connection.
+        const sessionGroups = new Map<string, SessionItem[]>();
+        for (const item of sessionMatches()) {
+          const session = props.sessions.find((s) => s.id === item.sessionId);
+          const connId = session?.connectionId ?? "unknown";
+          if (!sessionGroups.has(connId)) sessionGroups.set(connId, []);
+          sessionGroups.get(connId)!.push(item);
+        }
+        const surfaceGroups = new Map<string, SurfaceItem[]>();
+        for (const item of surfaceMatches()) {
+          const connId = item.connectionId || "unknown";
+          if (!surfaceGroups.has(connId)) surfaceGroups.set(connId, []);
+          surfaceGroups.get(connId)!.push(item);
+        }
+        // Merge: iterate all connection IDs that have sessions or surfaces.
+        const allConnIds = new Set([
+          ...sessionGroups.keys(),
+          ...surfaceGroups.keys(),
+        ]);
+        for (const connId of allConnIds) {
+          const label = props.connectionLabels.get(connId) ?? connId;
+          const items: SwitcherItem[] = [
+            ...(sessionGroups.get(connId) ?? []),
+            ...(surfaceGroups.get(connId) ?? []),
+          ];
+          next.push({ title: label, items });
+        }
+      } else {
+        next.push({
+          title: t("switcher.sectionTerminals"),
+          items: sessionMatches(),
+        });
+        if (surfaceMatches().length > 0) {
+          next.push({
+            title: t("switcher.sectionSurfaces"),
+            items: surfaceMatches(),
+          });
+        }
+      }
+    } else if (surfaceMatches().length > 0) {
+      if (props.multiConnection && props.connectionLabels) {
+        // No sessions — still group surfaces by connection.
+        const surfaceGroups = new Map<string, SurfaceItem[]>();
+        for (const item of surfaceMatches()) {
+          const connId = item.connectionId || "unknown";
+          if (!surfaceGroups.has(connId)) surfaceGroups.set(connId, []);
+          surfaceGroups.get(connId)!.push(item);
+        }
+        for (const [connId, items] of surfaceGroups) {
+          const label = props.connectionLabels.get(connId) ?? connId;
+          next.push({ title: label, items });
+        }
+      } else {
+        next.push({
+          title: t("switcher.sectionSurfaces"),
+          items: surfaceMatches(),
+        });
+      }
+    }
+
+    if (customLayouts.length > 0) {
+      next.push({
+        title: t("switcher.sectionTypedLayout"),
+        items: customLayouts,
+      });
+    }
+    if (searching() && recent.length > 0) {
+      next.push({ title: t("switcher.sectionRecentLayouts"), items: recent });
+    }
+
+    const actions: ActionItem[] = [];
+    const dp = destPrefix();
+    if (dp) {
+      // Destination prefix matched (e.g. "rab> ls" matching "rabbit"): show
+      // only that destination's action, with inlineCmd() as the command.
+      // Works in both single- and multi-connection mode.
+      const cmd = inlineCmd();
+      actions.push({
+        type: "action",
+        key: `action:new-terminal:${dp.connId}`,
+        title: cmd
+          ? tp("switcher.runCommandOnTarget", {
+              command: cmd,
+              target: dp.label,
+            })
+          : t("switcher.newTerminal"),
+        subtitle: cmd
+          ? t("switcher.createRunning")
+          : tp("switcher.createOnTarget", { target: dp.label }),
+        action: "new-terminal",
+        connectionId: dp.connId,
+      });
+    } else {
+      actions.push({
+        type: "action",
+        key: "action:new-terminal",
+        title: t("switcher.newTerminal"),
+        subtitle: t("switcher.createInCwd"),
+        action: "new-terminal",
+      });
+    }
+    if (props.onOpenWeb) {
+      actions.push({
+        type: "action",
+        key: "action:open-web",
+        title: t("switcher.newWebPane"),
+        subtitle: t("switcher.newWebPaneDesc"),
+        action: "open-web",
+      });
+    }
+    if (props.onOpenSearch) {
+      actions.push({
+        type: "action",
+        key: "action:open-search",
+        title: t("switcher.search"),
+        subtitle: t("switcher.searchDesc"),
+        action: "open-search",
+      });
+    }
+    // Workspace state is server-side; the canonical share carries only its id.
+    if (props.workspaceSessionId || workspaceSessionIdFromHash(location.hash)) {
+      actions.push({
+        type: "action",
+        key: "action:share-url",
+        title: t("switcher.shareUrl"),
+        subtitle: t("switcher.shareUrlDesc"),
+        action: "share-url",
+      });
+    }
+    if (props.onManageSessions) {
+      actions.push({
+        type: "action",
+        key: "action:manage-sessions",
+        title: t("switcher.sessions"),
+        subtitle: t("switcher.sessionsDesc"),
+        action: "manage-sessions",
+      });
+    }
+    {
+      const isStandalone =
+        window.matchMedia("(display-mode: standalone)").matches ||
+        (navigator as any).standalone === true;
+      if (!isStandalone) {
+        actions.push({
+          type: "action",
+          key: "action:install-app",
+          title: t("switcher.installApp"),
+          subtitle: getInstallPrompt()
+            ? t("switcher.installAppDesc")
+            : t("switcher.installAppBrowserDesc"),
+          action: "install-app",
+        });
+      }
+    }
+    if (props.activeLayout && props.onClearLayout) {
+      actions.push({
+        type: "action",
+        key: "action:clear-layout",
+        title: t("switcher.exitLayout"),
+        subtitle: t("switcher.exitLayoutDesc"),
+        action: "clear-layout",
+      });
+    }
+    actions.push({
+      type: "action",
+      key: "action:clear-local-storage",
+      title: t("switcher.clearLocalStorage"),
+      subtitle: t("switcher.clearLocalStorageDesc"),
+      action: "clear-local-storage",
+    });
+    {
+      const dp = destPrefix();
+      if (dp) {
+        // Destination prefix matched — only show the resolved new-terminal action.
+        // When there is an inline command (e.g. "rabbit>htop"), place the run
+        // action first so it is the default selection.
+        const dpActions = actions.filter((a) => a.connectionId === dp.connId);
+        const section = {
+          title: t("switcher.sectionActions"),
+          items: dpActions,
+        };
+        if (inlineCmd()) {
+          next.unshift(section);
+        } else {
+          next.push(section);
+        }
+      } else if (searching()) {
+        const matched = actions.filter((action) =>
+          action.title.toLowerCase().includes(searchPart().toLowerCase()),
+        );
+        if (matched.length > 0) {
+          next.unshift({
+            title: t("switcher.sectionActions"),
+            items: matched,
+          });
+        }
+      } else {
+        next.push({
+          title: t("switcher.sectionActions"),
+          items: actions,
+        });
+      }
+    }
+
+    // Remotes section — show configured remotes with connection status.
+    // Disabled remotes are kept on disk but not actionable from the switcher.
+    if (props.remotes && props.remotes.length > 0) {
+      const q = searchPart().toLowerCase();
+      const remoteItems: RemoteItem[] = props.remotes
+        .filter((r) => !r.disabled)
+        .filter(
+          (r) =>
+            !searching() ||
+            r.name.toLowerCase().includes(q) ||
+            (!isShareUri(r.uri) && r.uri.toLowerCase().includes(q)),
+        )
+        .map((r) => ({
+          type: "remote" as const,
+          key: `remote:${r.name}`,
+          title: r.name,
+          subtitle: maskUri(r.uri),
+          remoteName: r.name,
+          remoteUri: r.uri,
+          status: props.remoteStatuses?.get(r.name) ?? null,
+        }));
+      if (remoteItems.length > 0) {
+        next.push({
+          title: t("switcher.sectionRemotes"),
+          items: remoteItems,
+        });
+      }
+    }
+
+    // Applications section — everything installed on every connected server,
+    // startable on the spot. Last, and shown whether or not anything has been
+    // typed: it is the longest section by far, and a viewer who opens the
+    // switcher to reach a pane should not have to scroll past a games library
+    // to see one.
+    //
+    // Managed applications are skipped. The supervisor already runs those, and
+    // an entry that would restart something already up is not what "start" is
+    // being offered for here.
+    {
+      const q = searchPart().toLowerCase();
+      const appItems: AppItem[] = [];
+      for (const remote of sessionCatalogs(connectionIds())) {
+        const label = props.connectionLabels?.get(remote.connectionId);
+        const running = new Set(
+          remote.apps
+            .filter((app) => app.phase === "running")
+            .map((app) => app.id),
+        );
+        for (const entry of remote.catalog) {
+          if (running.has(entry.id)) continue;
+          if (
+            searching() &&
+            !entry.name.toLowerCase().includes(q) &&
+            !entry.id.toLowerCase().includes(q)
+          ) {
+            continue;
+          }
+          appItems.push({
+            type: "app" as const,
+            // The id alone is not unique: two servers both have Firefox.
+            key: `app:${remote.connectionId}:${entry.id}`,
+            title: entry.name,
+            // The server's name earns its place only when there is more than
+            // one; otherwise every row would carry the same word.
+            subtitle:
+              props.multiConnection && label
+                ? tp("switcher.appOn", { name: label })
+                : entry.id,
+            appId: entry.id,
+            connectionId: remote.connectionId,
+          });
+        }
+      }
+      if (appItems.length > 0) {
+        const section = { title: t("switcher.sectionApps"), items: appItems };
+        // A typed application name is an explicit launch request. Put its
+        // desktop entries before matching existing windows so `C-b k`,
+        // "brave", Enter starts Brave rather than merely focusing a stale or
+        // already-visible surface. With an empty query the huge catalog stays
+        // at the bottom as before.
+        placeApplicationSection(next, section, searching());
+      }
+    }
+
+    return next.filter((section) => section.items.length > 0);
+  };
+
+  // Workspace emits rebuild the item data constantly. A keyed Solid store
+  // updates fields in place while preserving section and row proxies, so
+  // <For> keeps the terminal/surface canvases mounted even when a title,
+  // focus badge, or other visible field changes.
+  type StoredSwitcherSection = SwitcherSection & { key: string };
+  const [sectionStore, setSectionStore] = createStore<StoredSwitcherSection[]>(
+    [],
+  );
+  createEffect(() => {
+    const next = buildSections().map((section) => ({
+      ...section,
+      key: `section:${section.title}`,
+    }));
+    setSectionStore(reconcile(next, { key: "key" }));
+  });
+  const sections = () => sectionStore;
+
+  const flatItems = createMemo(() =>
+    sections().flatMap((section) => section.items),
+  );
+
+  // First flat-item index of each section, for PageUp/PageDown navigation.
+  const sectionStarts = createMemo(() => {
+    const starts: number[] = [];
+    let offset = 0;
+    for (const section of sections()) {
+      if (section.items.length > 0) starts.push(offset);
+      offset += section.items.length;
+    }
+    return starts;
+  });
+
+  // Clamp selected index when flatItems changes.
+  createEffect(() => {
+    const len = flatItems().length;
+    setSelectedIdx((current) => {
+      if (len === 0) return 0;
+      return Math.min(current, len - 1);
+    });
+  });
+
+  // Resolve the launcher's application shelf as soon as it exists. Icons are
+  // small catalog metadata, not video frames; making each row wait for viewport
+  // admission left the menu visibly filling for seconds.
+  createEffect(() => {
+    const tokens = flatItems()
+      .filter((item): item is AppItem => item.type === "app")
+      .map((item) => `${item.connectionId} ${item.appId}`);
+    if (tokens.length > 0) requestIconTokens(tokens);
+  });
+
+  // Reset selection when query changes.
+  createEffect(() => {
+    void query();
+    setSelectedIdx(0);
+    setKillPickerSessionId(null);
+  });
+
+  // When the "New terminal on…" picker opens, pre-select the default remote.
+  // `on` limits this to the open transition: flatItems rebuilds on every
+  // workspace snapshot (remote statuses), and re-running here would snap the
+  // selection back to the default while the user is arrow-keying away.
+  createEffect(
+    on(newTerminalMode, (open) => {
+      if (!open) return;
+      const dflt = props.defaultRemote;
+      if (!dflt) return;
+      const idx = flatItems().findIndex(
+        (i) => i.type === "remote" && (i as RemoteItem).remoteName === dflt,
+      );
+      if (idx >= 0) setSelectedIdx(idx);
+    }),
+  );
+
+  // Narrow viewport: hide preview sidebar, shrink thumbnails.
+  const [narrow, setNarrow] = createSignal(window.innerWidth < 640);
+  onMount(() => {
+    const mq = matchMedia("(max-width: 639px)");
+    const handler = () => setNarrow(mq.matches);
+    mq.addEventListener?.("change", handler);
+    onCleanup(() => mq.removeEventListener?.("change", handler));
+  });
+
+  // Keep keyboard selection in view.
+  createEffect(() => {
+    const el = itemRefs[selectedIdx()];
+    el?.scrollIntoView({ block: "nearest" });
+  });
+
+  const selectedItem = () => flatItems()[selectedIdx()] ?? null;
+
+  const uiFont = () => props.fontFamily ?? "inherit";
+  const compact = 0.75;
+  const fsSm = () => Math.round(scale().sm * compact);
+  const fsMd = () => Math.round(scale().md * compact);
+  const fsXl = () => Math.round(scale().xl * compact);
+  const cardBg = () => theme().solidPanelBg;
+  const railBg = () => theme().solidPanelBg;
+  const iconSize = () =>
+    narrow()
+      ? Math.round(scale().icon * compact * 0.55)
+      : Math.round(scale().icon * compact);
+
+  // A component (not a function call in the row JSX) so the body runs once
+  // per row: the selection border stays reactive via square.selected while the
+  // live terminal/surface thumbnails keep their mount instead of being
+  // destroyed and recreated on every selection move.
+  function ItemSquare(square: { item: SwitcherItem; selected: boolean }) {
+    const item = square.item;
+    return (
+      <div
+        style={{
+          width: `${iconSize()}px`,
+          height: `${iconSize()}px`,
+          "flex-shrink": 0,
+          "border-radius": "0",
+          border: `1px solid ${square.selected ? theme().accent : theme().subtleBorder}`,
+          "background-color": theme().solidPanelBg,
+          display: "flex",
+          "align-items": "center",
+          "justify-content": "center",
+          overflow: "hidden",
+          position: "relative",
+        }}
+      >
+        {item.type === "layout" ? (
+          <LayoutPreview
+            node={item.layout.root}
+            width={iconSize()}
+            height={iconSize()}
+            color={theme().fg}
+            bg={theme().bg}
+          />
+        ) : item.type === "session" ? (
+          <YasTerminal
+            sessionId={item.sessionId}
+            readOnly
+            resizable={false}
+            showCursor={false}
+            style={{
+              width: `${iconSize()}px`,
+              height: `${iconSize()}px`,
+              "pointer-events": "none",
+            }}
+          />
+        ) : item.type === "surface" ? (
+          <YasSurfaceView
+            connectionId={(item as SurfaceItem).connectionId}
+            surfaceId={(item as SurfaceItem).surfaceId}
+            live={false}
+            // An icon-sized preview: no input, and no say in the surface's size.
+            resizable={false}
+            style={{
+              width: `${iconSize()}px`,
+              height: `${iconSize()}px`,
+              "pointer-events": "none",
+              overflow: "hidden",
+            }}
+          />
+        ) : item.type === "remote" ? (
+          <StatusDot
+            status={(item as RemoteItem).status}
+            fg={theme().fg}
+            dimFg={theme().dimFg}
+            accent={theme().accent}
+          />
+        ) : item.type === "tile" ? (
+          <TileGlyph
+            kind={(item as TileItem).tileKind}
+            fg={theme().fg}
+            dimFg={theme().dimFg}
+          />
+        ) : item.type === "file" || item.type === "symbol" ? (
+          <TileGlyph kind="editor" fg={theme().fg} dimFg={theme().dimFg} />
+        ) : item.type === "app" ? (
+          // Read from the store rather than from the item, so the artwork can
+          // land without the row being rebuilt around it.
+          <AppIcon
+            theme={theme()}
+            scale={scale()}
+            name={item.title}
+            src={applicationIcon(item.connectionId, item.appId)}
+          />
+        ) : (
+          <ActionGlyph
+            action={item.action}
+            fg={theme().fg}
+            dimFg={theme().dimFg}
+          />
+        )}
+      </div>
+    );
+  }
+
+  function activateItem(item: SwitcherItem | null) {
+    if (!item) return;
+    if (item.type === "layout") {
+      const layoutStr =
+        item.layout.name !== item.layout.dsl
+          ? `${item.layout.name}:${item.layout.dsl}`
+          : item.layout.dsl;
+      if (query().trim() === layoutStr) {
+        props.onApplyLayout?.(item.layout);
+      } else {
+        setQuery(layoutStr);
+        searchRef?.focus();
+        searchRef?.select();
+      }
+      return;
+    }
+    if (item.type === "remote") {
+      // Open a new terminal on this remote's connection.
+      // If a pane is focused (layout), place the terminal in that pane.
+      const cmd = commandText() || inlineCmd() || undefined;
+      if (props.focusedPaneId && props.onSelectPane) {
+        props.onSelectPane(props.focusedPaneId, null, cmd, item.remoteName);
+      } else {
+        props.onCreate(cmd, item.remoteName);
+      }
+      return;
+    }
+    if (item.type === "session") {
+      if (props.focusedPaneId && props.onMoveToPane) {
+        props.onMoveToPane(item.sessionId, props.focusedPaneId);
+      } else {
+        props.onSelect(item.sessionId);
+      }
+      return;
+    }
+    if (item.type === "surface") {
+      if (props.focusedPaneId && props.onMoveSurfaceToPane) {
+        props.onMoveSurfaceToPane(
+          item.surfaceId,
+          item.connectionId,
+          props.focusedPaneId,
+        );
+      } else {
+        props.onFocusSurface?.(item.surfaceId, item.connectionId);
+      }
+      return;
+    }
+    if (item.type === "tile") {
+      props.onRestoreTile?.(item.assignment);
+      return;
+    }
+    if (item.type === "file") {
+      props.onOpenFile?.(item.relPath);
+      props.onClose();
+      return;
+    }
+    if (item.type === "symbol") {
+      props.onOpenSymbol?.(item.hit);
+      props.onClose();
+      return;
+    }
+    if (item.type === "app") {
+      // Start, not enable: this is trying an application, not adopting it for
+      // every future session. The window it opens arrives as a surface on its
+      // own, so let the workspace place it in the active panel once it appears.
+      const accepted = props.onStartApplication
+        ? props.onStartApplication(item.connectionId, item.appId)
+        : startApplication(item.connectionId, item.appId);
+      // Never turn a dead catalog channel into a successful-looking action.
+      // Its lifecycle reconnects in the background; leaving the picker open
+      // makes Enter retryable.
+      if (accepted !== false) props.onClose();
+      return;
+    }
+    if (item.action === "install-app") {
+      const prompt = getInstallPrompt();
+      if (prompt) {
+        clearInstallPrompt();
+        props.onClose();
+        void prompt.prompt();
+      }
+      return;
+    }
+    if (item.action === "share-url") {
+      const sessionId =
+        props.workspaceSessionId ?? workspaceSessionIdFromHash(location.hash);
+      if (sessionId) {
+        const url = workspaceSessionShareUrl(location, sessionId);
+        navigator.clipboard.writeText(url).catch(() => {});
+      }
+      props.onClose();
+      return;
+    }
+    if (item.action === "manage-sessions") {
+      props.onClose();
+      props.onManageSessions?.();
+      return;
+    }
+    if (item.action === "clear-layout") {
+      props.onClearLayout?.();
+      return;
+    }
+    if (item.action === "open-web") {
+      props.onOpenWeb?.();
+      return;
+    }
+    if (item.action === "open-search") {
+      props.onOpenSearch?.();
+      return;
+    }
+    if (item.action === "clear-local-storage") {
+      localStorage.clear();
+      location.reload();
+      return;
+    }
+    // new-terminal: if remotes are configured, no connection is already
+    // resolved (e.g. via "rabbit>htop" prefix), we're not already in the
+    // sub-menu, and there is no command to run, show the "New terminal on…"
+    // picker instead of creating immediately.  A bare ">cmd" runs locally —
+    // diverting it to the picker would clear the query and lose the command.
+    const cmd = commandText() || inlineCmd() || undefined;
+    if (
+      item.action === "new-terminal" &&
+      !item.connectionId &&
+      !cmd &&
+      !newTerminalMode() &&
+      props.remotes &&
+      props.remotes.length > 0
+    ) {
+      // Clear the query before flipping the mode: the pre-select effect fires
+      // on the mode transition and must see the unfiltered remote list.
+      setQuery("");
+      setNewTerminalMode(true);
+      searchRef?.focus();
+      return;
+    }
+    if (props.focusedPaneId && props.onSelectPane) {
+      props.onSelectPane(props.focusedPaneId, null, cmd, item.connectionId);
+    } else {
+      props.onCreate(cmd, item.connectionId);
+    }
+    setNewTerminalMode(false);
+  }
+
+  function handleKeyDown(event: KeyboardEvent) {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      pointerMovedSinceKey = false;
+      if (flatItems().length > 0) {
+        setSelectedIdx((index) => (index + 1) % flatItems().length);
+      }
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      pointerMovedSinceKey = false;
+      if (flatItems().length > 0) {
+        setSelectedIdx(
+          (index) => (index - 1 + flatItems().length) % flatItems().length,
+        );
+      }
+      return;
+    }
+    if (event.key === "PageDown") {
+      event.preventDefault();
+      pointerMovedSinceKey = false;
+      const starts = sectionStarts();
+      if (starts.length > 0) {
+        const cur = selectedIdx();
+        const next = starts.find((s) => s > cur);
+        setSelectedIdx(next ?? starts[starts.length - 1]);
+      }
+      return;
+    }
+    if (event.key === "PageUp") {
+      event.preventDefault();
+      pointerMovedSinceKey = false;
+      const starts = sectionStarts();
+      if (starts.length > 0) {
+        const cur = selectedIdx();
+        let prev = starts[0];
+        for (const s of starts) {
+          if (s >= cur) break;
+          prev = s;
+        }
+        setSelectedIdx(prev);
+      }
+      return;
+    }
+    if (event.key === "Escape" && newTerminalMode()) {
+      event.preventDefault();
+      event.stopPropagation();
+      setNewTerminalMode(false);
+      setQuery("");
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      activateItem(selectedItem());
+      return;
+    }
+    if (event.key === "Tab" && selectedItem()) {
+      // Tab completes to "<target>>", the run-a-command-there form. That
+      // only means something for a destination — a terminal, pane, surface
+      // or remote. For a file or a symbol there is nothing to run, and
+      // rewriting the query to a bare basename would silently drop the
+      // "@"/"#" and land you in pane search with no way back to the hit
+      // you had selected.
+      const sel = selectedItem()!;
+      if (sel.type === "file" || sel.type === "symbol" || sel.type === "tile") {
+        return;
+      }
+      event.preventDefault();
+      setQuery(sel.title + ">");
+      return;
+    }
+    if (
+      (event.key === "w" || event.key === "W") &&
+      (event.ctrlKey || event.metaKey)
+    ) {
+      const sel = selectedItem();
+      if (sel?.type === "session") {
+        event.preventDefault();
+        void workspace.closeSession((sel as SessionItem).sessionId);
+        return;
+      }
+      if (sel?.type === "surface") {
+        event.preventDefault();
+        workspace.closeSurface(
+          (sel as SurfaceItem).connectionId,
+          (sel as SurfaceItem).surfaceId,
+        );
+        return;
+      }
+    }
+    if (
+      (event.key === "Q" || event.code === "KeyQ") &&
+      event.shiftKey &&
+      event.ctrlKey &&
+      event.altKey
+    ) {
+      const sel = selectedItem();
+      if (sel?.type === "session") {
+        event.preventDefault();
+        void workspace.closeSession((sel as SessionItem).sessionId);
+      } else if (sel?.type === "surface") {
+        event.preventDefault();
+        workspace.closeSurface(
+          (sel as SurfaceItem).connectionId,
+          (sel as SurfaceItem).surfaceId,
+        );
+      }
+    }
+  }
+
+  return (
+    <OverlayBackdrop
+      palette={props.palette}
+      label={t("switcher.label")}
+      onClose={props.onClose}
+      style={{
+        background: dark() ? "rgba(0,0,0,0.66)" : "rgba(240,240,240,0.7)",
+      }}
+    >
+      <div
+        ref={wrapperRef}
+        style={{
+          position: "relative",
+          // Full backdrop height so the panel's percentage max-height
+          // resolves (and the panel stays vertically centered).
+          height: "100%",
+          display: "flex",
+          "flex-direction": "column",
+          "justify-content": "center",
+        }}
+      >
+        <OverlayPanel
+          palette={props.palette}
+          fontSize={props.fontSize}
+          style={{
+            "background-color": theme().solidPanelBg,
+            "font-family": uiFont(),
+            "border-radius": "0",
+            border: `1px solid ${theme().subtleBorder}`,
+            "box-shadow": dark()
+              ? "0 18px 60px rgba(0,0,0,0.45)"
+              : "0 18px 60px rgba(0,0,0,0.12)",
+            padding: `${scale().tightGap}px`,
+            overflow: "hidden",
+            display: "flex",
+            "flex-direction": "column",
+          }}
+        >
+          {/* Search bar */}
+          <div
+            style={{
+              display: "flex",
+              "align-items": "center",
+              gap: `${scale().tightGap}px`,
+              "margin-bottom": `${scale().tightGap}px`,
+              "flex-shrink": "0",
+            }}
+          >
+            <input
+              ref={searchRef}
+              name="yas-switcher-search"
+              type="text"
+              autofocus={true}
+              value={query()}
+              onInput={(e) => setQuery(e.currentTarget.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={
+                newTerminalMode()
+                  ? t("switcher.newTerminalPlaceholder")
+                  : t("switcher.placeholder")
+              }
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck={false}
+              style={mergeStyle(ui.input, {
+                flex: 1,
+                "min-width": "0",
+                padding: `${scale().controlY + 3}px ${scale().controlX + 1}px`,
+                "font-size": `${fsMd()}px`,
+                "border-radius": "0",
+                border: `1px solid ${theme().subtleBorder}`,
+                "background-color": railBg(),
+                color: theme().fg,
+                "box-shadow": "none",
+              })}
+            />
+            <button
+              style={{
+                ...chrome().closeButton,
+                "border-radius": "0",
+                padding: `${scale().controlY}px ${scale().controlX}px`,
+                "background-color": railBg(),
+                "font-size": `${fsSm()}px`,
+              }}
+              onClick={props.onClose}
+            >
+              {t("overlay.close")}
+            </button>
+          </div>
+
+          {/* Sections list */}
+          <div
+            style={{
+              display: "flex",
+              "flex-direction": "column",
+              flex: "1",
+              "min-height": "0",
+              gap: `${scale().tightGap}px`,
+            }}
+          >
+            <div
+              onMouseMove={() => {
+                pointerMovedSinceKey = true;
+              }}
+              style={{
+                "min-width": "0",
+                "min-height": "0",
+                flex: "1",
+                overflow: "auto",
+                display: "grid",
+                "align-content": "start",
+                gap: `${scale().tightGap}px`,
+                "padding-right": "2px",
+                ...scrollbarStyle(theme()),
+              }}
+            >
+              <For each={sections()}>
+                {(section) => (
+                  <section
+                    style={{
+                      display: "grid",
+                      gap: `${scale().tightGap}px`,
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        "justify-content": "space-between",
+                        "align-items": "center",
+                        gap: `${scale().gap}px`,
+                      }}
+                    >
+                      <div
+                        style={{
+                          "font-size": `${fsSm()}px`,
+                          "font-weight": 700,
+                          color: theme().dimFg,
+                          "text-transform": "uppercase",
+                          "letter-spacing": "0.08em",
+                        }}
+                      >
+                        {section.title}
+                      </div>
+                      <div
+                        style={{
+                          "font-size": `${fsSm()}px`,
+                          color: theme().dimFg,
+                        }}
+                      >
+                        {section.items.length}
+                      </div>
+                    </div>
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: `${scale().tightGap}px`,
+                      }}
+                    >
+                      <For each={section.items}>
+                        {(item) => {
+                          const index = () =>
+                            flatItems().findIndex(
+                              (candidate) =>
+                                itemKey(candidate) === itemKey(item),
+                            );
+                          const selected = () => index() === selectedIdx();
+                          return (
+                            <div
+                              ref={(el) => {
+                                itemRefs[index()] = el;
+                              }}
+                              onClick={() => activateItem(item)}
+                              onMouseEnter={() => {
+                                if (pointerMovedSinceKey)
+                                  setSelectedIdx(index());
+                              }}
+                              style={{
+                                display: "flex",
+                                "align-items": "stretch",
+                                gap: `${scale().tightGap}px`,
+                                padding: `${scale().tightGap}px`,
+                                "border-radius": "0",
+                                border: `1px solid ${selected() ? theme().accent : theme().subtleBorder}`,
+                                "background-color": selected()
+                                  ? theme().selectedBg
+                                  : cardBg(),
+                                color: "inherit",
+                                "text-align": "left",
+                                cursor: "pointer",
+                                "font-family": "inherit",
+                                "box-shadow": "none",
+                                transform: "none",
+                                transition:
+                                  "border-color 120ms ease, background-color 120ms ease",
+                              }}
+                            >
+                              <ItemSquare item={item} selected={selected()} />
+
+                              <div
+                                style={{
+                                  "min-width": "0",
+                                  flex: 1,
+                                  display: "grid",
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    "align-items": "center",
+                                    gap: `${scale().tightGap}px`,
+                                    "min-width": "0",
+                                    "flex-wrap": "wrap",
+                                  }}
+                                >
+                                  <span
+                                    style={{
+                                      overflow: "hidden",
+                                      "text-overflow": "ellipsis",
+                                      "white-space": "nowrap",
+                                      "font-size": `${fsMd()}px`,
+                                      "font-weight": 600,
+                                    }}
+                                  >
+                                    {/* A parked manage tile carries the same
+                                        dim address a session row does, so both
+                                        are asked for it the same way. */}
+                                    <Show
+                                      when={
+                                        (item.type === "session" &&
+                                          (item as SessionItem).prefix) ||
+                                        (item.type === "tile" &&
+                                          (item as TileItem).prefix)
+                                      }
+                                    >
+                                      {(prefix) => (
+                                        <>
+                                          <span
+                                            style={{
+                                              opacity: 0.5,
+                                              "font-weight": 400,
+                                            }}
+                                          >
+                                            {prefix()}
+                                          </span>
+                                          <Show when={item.title}>
+                                            {" \u203A "}
+                                          </Show>
+                                        </>
+                                      )}
+                                    </Show>
+                                    {item.title}
+                                  </span>
+                                  <Show
+                                    when={
+                                      (item.type === "session" &&
+                                        (item as SessionItem).focused) ||
+                                      (item.type === "surface" &&
+                                        (item as SurfaceItem).focused)
+                                    }
+                                  >
+                                    <mark style={ui.badge}>
+                                      {t("switcher.badgeFocused")}
+                                    </mark>
+                                  </Show>
+                                  {/* Coloured text, not a filled badge like its
+                                      neighbours: this one says "act on me",
+                                      and a block of alert in a list of them
+                                      reads as decoration. */}
+                                  <Show
+                                    when={
+                                      item.type === "surface" &&
+                                      (item as SurfaceItem).attention
+                                    }
+                                  >
+                                    {/* ui.badge's metrics written out rather
+                                        than spread-and-overridden: spreading it
+                                        and setting `background-color` after
+                                        left the badge blue anyway — the colour
+                                        override took, the background one did
+                                        not. `background: none` also has to be
+                                        explicit, or <mark> falls back to the
+                                        UA's yellow. */}
+                                    <mark
+                                      style={{
+                                        "font-size": ui.badge["font-size"],
+                                        padding: ui.badge.padding,
+                                        "flex-shrink": 0,
+                                        "line-height": 1.5,
+                                        background: "none",
+                                        color: theme().errorText,
+                                        "font-weight": "bold",
+                                      }}
+                                    >
+                                      {t("switcher.badgeAttention")}
+                                    </mark>
+                                  </Show>
+                                  <Show
+                                    when={
+                                      item.type === "session" &&
+                                      (item as SessionItem).inLayout
+                                    }
+                                  >
+                                    <mark style={ui.badge}>
+                                      {t("switcher.badgeInLayout")}
+                                    </mark>
+                                  </Show>
+                                  <Show
+                                    when={
+                                      item.type === "session" &&
+                                      (item as SessionItem).exited
+                                    }
+                                  >
+                                    <mark
+                                      style={{
+                                        ...ui.badge,
+                                        "background-color":
+                                          "rgba(255,100,100,0.3)",
+                                      }}
+                                    >
+                                      {t("switcher.badgeExited")}
+                                    </mark>
+                                  </Show>
+                                  <Show
+                                    when={
+                                      item.type === "layout" &&
+                                      props.activeLayout?.dsl ===
+                                        (item as LayoutItem).layout.dsl
+                                    }
+                                  >
+                                    <mark style={ui.badge}>
+                                      {t("switcher.badgeCurrent")}
+                                    </mark>
+                                  </Show>
+                                  <Show
+                                    when={
+                                      item.type === "remote" &&
+                                      (item as RemoteItem).status
+                                    }
+                                  >
+                                    <mark
+                                      style={{
+                                        ...ui.badge,
+                                        "background-color":
+                                          (item as RemoteItem).status ===
+                                          "connected"
+                                            ? "rgba(76,175,80,0.25)"
+                                            : (item as RemoteItem).status ===
+                                                "error"
+                                              ? "rgba(244,67,54,0.25)"
+                                              : "rgba(255,152,0,0.25)",
+                                      }}
+                                    >
+                                      {t(
+                                        `remotes.status.${(item as RemoteItem).status}`,
+                                      )}
+                                    </mark>
+                                  </Show>
+                                </div>
+                                <div
+                                  style={{
+                                    "font-size": `${fsSm()}px`,
+                                    color: theme().dimFg,
+                                    overflow: "hidden",
+                                    "text-overflow": "ellipsis",
+                                    "white-space": "nowrap",
+                                  }}
+                                >
+                                  {item.subtitle}
+                                  <Show
+                                    when={
+                                      item.type === "session" &&
+                                      (item as SessionItem).source != null
+                                    }
+                                  >
+                                    {" "}
+                                    &middot;{" "}
+                                    {SOURCE_LABEL[
+                                      (item as SessionItem).source!
+                                    ] ?? t("switcher.sourceMatch")}
+                                  </Show>
+                                </div>
+                                <Show
+                                  when={
+                                    item.type === "session" &&
+                                    (item as SessionItem).context
+                                  }
+                                >
+                                  <div
+                                    style={{
+                                      "font-size": `${fsSm()}px`,
+                                      color: theme().dimFg,
+                                      overflow: "hidden",
+                                      "text-overflow": "ellipsis",
+                                      "white-space": "nowrap",
+                                    }}
+                                  >
+                                    {(item as SessionItem).context}
+                                  </div>
+                                </Show>
+                              </div>
+
+                              {/* Kill picker / kill button / close button */}
+                              <Show
+                                when={
+                                  item.type === "session" &&
+                                  !(item as SessionItem).exited
+                                }
+                              >
+                                <Show
+                                  when={
+                                    killPickerSessionId() ===
+                                    (item as SessionItem).sessionId
+                                  }
+                                  fallback={
+                                    <button
+                                      type="button"
+                                      title={t("switcher.kill")}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setKillPickerSessionId(
+                                          (item as SessionItem).sessionId,
+                                        );
+                                      }}
+                                      style={{
+                                        background: railBg(),
+                                        border: `1px solid ${theme().subtleBorder}`,
+                                        color: "inherit",
+                                        cursor: "pointer",
+                                        opacity: 0.75,
+                                        "font-size": `${fsSm()}px`,
+                                        padding: `${scale().controlY}px ${scale().controlX}px`,
+                                        "font-family": "inherit",
+                                        "align-self": "stretch",
+                                        "border-radius": "0",
+                                        "min-width": `${fsMd() * 2}px`,
+                                        display: "flex",
+                                        "align-items": "center",
+                                        "justify-content": "center",
+                                      }}
+                                    >
+                                      {t("switcher.kill")}
+                                    </button>
+                                  }
+                                >
+                                  <div
+                                    style={{
+                                      display: "flex",
+                                      gap: "2px",
+                                      "align-self": "center",
+                                    }}
+                                  >
+                                    <For
+                                      each={
+                                        [
+                                          ["TERM", 15],
+                                          ["KILL", 9],
+                                          ["INT", 2],
+                                          ["HUP", 1],
+                                          ["USR1", 10],
+                                          ["USR2", 12],
+                                        ] as const
+                                      }
+                                    >
+                                      {([name, sig]) => (
+                                        <button
+                                          type="button"
+                                          title={name}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            workspace.killSession(
+                                              (item as SessionItem).sessionId,
+                                              sig,
+                                            );
+                                            setKillPickerSessionId(null);
+                                          }}
+                                          style={{
+                                            background: railBg(),
+                                            border: `1px solid ${theme().subtleBorder}`,
+                                            color: "inherit",
+                                            cursor: "pointer",
+                                            opacity: 0.75,
+                                            "font-size": `${fsSm()}px`,
+                                            padding: `${scale().controlY}px ${scale().controlX}px`,
+                                            "font-family": "inherit",
+                                            "border-radius": "0",
+                                          }}
+                                        >
+                                          {name}
+                                        </button>
+                                      )}
+                                    </For>
+                                  </div>
+                                </Show>
+                              </Show>
+                              <Show when={item.type === "session"}>
+                                <button
+                                  type="button"
+                                  title={t("switcher.close")}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void workspace.closeSession(
+                                      (item as SessionItem).sessionId,
+                                    );
+                                  }}
+                                  style={{
+                                    background: railBg(),
+                                    border: `1px solid ${theme().subtleBorder}`,
+                                    color: "inherit",
+                                    cursor: "pointer",
+                                    opacity: 0.75,
+                                    "font-size": `${fsSm()}px`,
+                                    padding: `${scale().controlY}px ${scale().controlX}px`,
+                                    "font-family": "inherit",
+                                    "align-self": "stretch",
+                                    "border-radius": "0",
+                                    "min-width": `${fsMd() * 2}px`,
+                                    display: "flex",
+                                    "align-items": "center",
+                                    "justify-content": "center",
+                                  }}
+                                >
+                                  {t("switcher.close")}
+                                </button>
+                              </Show>
+                              <Show when={item.type === "surface"}>
+                                <button
+                                  type="button"
+                                  title={t("switcher.close")}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    workspace.closeSurface(
+                                      (item as SurfaceItem).connectionId,
+                                      (item as SurfaceItem).surfaceId,
+                                    );
+                                  }}
+                                  style={{
+                                    background: railBg(),
+                                    border: `1px solid ${theme().subtleBorder}`,
+                                    color: "inherit",
+                                    cursor: "pointer",
+                                    opacity: 0.75,
+                                    "font-size": `${fsSm()}px`,
+                                    padding: `${scale().controlY}px ${scale().controlX}px`,
+                                    "font-family": "inherit",
+                                    "align-self": "stretch",
+                                    "border-radius": "0",
+                                    "min-width": `${fsMd() * 2}px`,
+                                    display: "flex",
+                                    "align-items": "center",
+                                    "justify-content": "center",
+                                  }}
+                                >
+                                  {t("switcher.close")}
+                                </button>
+                              </Show>
+
+                              {/* Remove button for recent layouts */}
+                              <Show
+                                when={
+                                  item.type === "layout" &&
+                                  item.key.startsWith("layout:recent:")
+                                }
+                              >
+                                <button
+                                  type="button"
+                                  aria-label={t("switcher.removeLayout")}
+                                  title={t("switcher.removeLayout")}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    props.onRemoveLayout?.(
+                                      (item as LayoutItem).layout.dsl,
+                                    );
+                                  }}
+                                  style={{
+                                    background: "none",
+                                    border: "none",
+                                    color: "inherit",
+                                    cursor: "pointer",
+                                    opacity: 0.45,
+                                    "font-size": `${fsSm()}px`,
+                                    padding: `${scale().controlY}px ${scale().controlX}px`,
+                                    "font-family": "inherit",
+                                    "align-self": "center",
+                                  }}
+                                >
+                                  {"\u00d7"}
+                                </button>
+                              </Show>
+                            </div>
+                          );
+                        }}
+                      </For>
+                    </div>
+                  </section>
+                )}
+              </For>
+
+              {/* Empty state */}
+              <Show when={sections().length === 0}>
+                <div
+                  style={{
+                    display: "grid",
+                    gap: `${scale().tightGap}px`,
+                    "place-items": "center",
+                    "border-radius": "0",
+                    border: `1px dashed ${theme().subtleBorder}`,
+                    "background-color": railBg(),
+                    "text-align": "center",
+                    color: theme().dimFg,
+                    padding: `${scale().panelPadding}px`,
+                  }}
+                >
+                  <div
+                    style={{
+                      "font-size": `${fsXl()}px`,
+                      color: theme().fg,
+                    }}
+                  >
+                    {t("switcher.noMatches")}
+                  </div>
+                </div>
+              </Show>
+            </div>
+          </div>
+        </OverlayPanel>
+      </div>
+    </OverlayBackdrop>
+  );
+}

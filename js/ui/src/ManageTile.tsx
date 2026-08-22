@@ -1,0 +1,194 @@
+/**
+ * ManageTile — one server's panels as pane content, not as a dialog.
+ *
+ * The panels used to be a modal stack: the remotes overlay, and on top of it an
+ * overlay per remote. That made them the least durable thing on the screen.
+ * Anything that closed an overlay closed these too — and one of the things that
+ * closes an overlay is a window asking to be raised, which is exactly what
+ * happens a second after Enable starts an application. So the panel that
+ * launched the app dismissed itself, and the viewer's next click had to walk
+ * back in through two dialogs.
+ *
+ * A pane has none of that: it is a tile like an editor or a terminal, it can be
+ * split next to the thing it manages, it survives focus going elsewhere, and it
+ * is restored by the same workspace + tab registry as every other tile.
+ *
+ * One tile per connection, from {@link manageAssignment} — the panels hold live
+ * subscriptions (a client watch pushing a catalog every second, a unit table),
+ * and two tiles onto one server would run two of each.
+ */
+
+import { createEffect, createSignal, onCleanup, Show } from "solid-js";
+import { createYasWorkspaceState } from "@yas-run/solid";
+import type {
+  YasSurface,
+  YasWorkspace,
+  ConnectionId,
+  TerminalPalette,
+} from "@yas-run/core";
+import { ConnectionPanels } from "./ConnectionPanels";
+import { connectionHasClientList } from "./ConnectionClients";
+import { shownTab, TAB_LABELS } from "./connectionTab";
+import { t } from "./i18n";
+import {
+  clearActiveEditor,
+  setActiveEditorFocused,
+  type ManageController,
+} from "./ide/activeEditor";
+import {
+  PanelEmpty,
+  SectionHeading,
+  StatusPill,
+  type PanelTone,
+} from "./panelKit";
+import { scrollbarStyle, type Theme, type UIScale } from "./theme";
+
+/** Connection status → the pill's tone and word. */
+function statusTone(status: string | null): { tone: PanelTone; label: string } {
+  switch (status) {
+    case "connected":
+      return { tone: "ok", label: t("status.connected") };
+    case "connecting":
+      return { tone: "warn", label: t("status.connecting") };
+    case "authenticating":
+      return { tone: "warn", label: t("status.authenticating") };
+    case "error":
+      return { tone: "bad", label: t("common.error") };
+    default:
+      return { tone: "idle", label: status ?? t("status.disconnected") };
+  }
+}
+
+export function ManageTile(props: {
+  workspace: YasWorkspace;
+  connectionId: ConnectionId;
+  theme: Theme;
+  palette: TerminalPalette;
+  scale: UIScale;
+  fontSize: number;
+  /** Open a terminal or other pane assignment selected inside a panel. */
+  onOpenAssignment?: (assignment: string) => void;
+  /** The connection is an `.ro` share: the client-control family never
+   *  answers through the forwarder, so the clients tab must not be offered. */
+  readOnly?: boolean;
+  /** Read-only thumbnail. The dock draws no body at all for a manage card —
+   *  its title carries the server and the tab (`tileDisplay`) — so this is the
+   *  floor rather than the case: whatever mounts a preview gets the heading and
+   *  none of the panels, which would otherwise run a per-second client catalog
+   *  and a unit table behind a picture nobody is reading. */
+  preview?: boolean;
+  /** Whether this tile owns workspace focus. A layout keeps every pane mounted, so
+   *  the status bar's identity follows this rather than mounting. */
+  focused?: boolean;
+}) {
+  const snapshot = createYasWorkspaceState(props.workspace);
+  const connection = () =>
+    snapshot().connections.find((c) => c.id === props.connectionId) ?? null;
+  const sessions = () => snapshot().sessions;
+
+  // Surfaces, for the client rows' "watching …" labels. Only this connection's:
+  // the panels filter by connection anyway, so aggregating every server's would
+  // be work thrown away.
+  const [surfaces, setSurfaces] = createSignal<readonly YasSurface[]>([]);
+  createEffect(() => {
+    // Re-run on reconnect: the store is per YasConnection, and a connection
+    // that was absent when this first ran has one now.
+    void snapshot().connections.length;
+    const conn = props.workspace.getConnection(props.connectionId);
+    if (!conn) {
+      setSurfaces([]);
+      return;
+    }
+    const sync = () =>
+      setSurfaces([...conn.surfaceStore.getSurfaces().values()]);
+    sync();
+    onCleanup(conn.surfaceStore.onChange(sync));
+  });
+
+  // The bar's identity for this pane. Same contract every other tile follows:
+  // A layout keeps background panes mounted, so ownership tracks focus rather than
+  // mounting, and a thumbnail never claims it at all.
+  const controller: ManageController = {
+    kind: "manage",
+    connectionId: props.connectionId,
+    tab: () => {
+      const name = shownTab(props.connectionId);
+      return name ? t(TAB_LABELS[name]) : null;
+    },
+  };
+  createEffect(() => {
+    setActiveEditorFocused(
+      controller,
+      !props.preview && props.focused !== false,
+    );
+  });
+  onCleanup(() => clearActiveEditor(controller));
+
+  const canListClients = () => {
+    const conn = connection();
+    return (
+      !!conn &&
+      connectionHasClientList(
+        conn,
+        props.readOnly ? new Set([props.connectionId]) : new Set(),
+      )
+    );
+  };
+
+  return (
+    <div
+      style={{
+        width: "100%",
+        height: "100%",
+        display: "flex",
+        "flex-direction": "column",
+        "min-width": "0",
+        // The tile itself never scrolls: it hands its height to the panel,
+        // which hands it to whichever list is the long one. A scroller here as
+        // well as there is two scrollbars for one list — the wheel picks
+        // whichever is under the pointer, and the header the tile is supposed
+        // to keep in view scrolls away.
+        overflow: "hidden",
+        background: props.theme.bg,
+        color: props.theme.fg,
+        "font-size": `${props.scale.md}px`,
+        ...scrollbarStyle(props.theme),
+      }}
+    >
+      <SectionHeading
+        theme={props.theme}
+        scale={props.scale}
+        label={props.connectionId}
+      >
+        <StatusPill
+          theme={props.theme}
+          scale={props.scale}
+          {...statusTone(connection()?.status ?? null)}
+        />
+      </SectionHeading>
+
+      <Show when={!props.preview}>
+        <Show
+          when={connection()?.status === "connected"}
+          fallback={
+            <PanelEmpty theme={props.theme} scale={props.scale}>
+              {t("remotes.controlDisconnected")}
+            </PanelEmpty>
+          }
+        >
+          <ConnectionPanels
+            workspace={props.workspace}
+            connectionId={props.connectionId}
+            palette={props.palette}
+            fontSize={props.fontSize}
+            sessions={sessions()}
+            surfaces={surfaces()}
+            onOpenAssignment={props.onOpenAssignment}
+            canListClients={canListClients()}
+            canManageExtensions={connection()?.supportsExtensions === true}
+          />
+        </Show>
+      </Show>
+    </div>
+  );
+}

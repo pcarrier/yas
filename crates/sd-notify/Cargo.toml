@@ -1,0 +1,15 @@
+[package]
+name = "yas-sd-notify"
+version = "0.1.0"
+edition.workspace = true
+description = "Tiny no-dep sd_notify(3) implementation used by yas daemons"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "yas_sd_notify"
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

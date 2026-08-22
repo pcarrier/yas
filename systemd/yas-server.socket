@@ -1,0 +1,11 @@
+[Unit]
+Description=Yas terminal multiplexer socket
+
+[Socket]
+ListenStream=%t/yas/yas-default.sock
+SocketMode=0700
+RuntimeDirectory=yas
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

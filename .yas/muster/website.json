@@ -1,0 +1,8 @@
+{
+  "description": "Yas website dev server on :${PORTS+2} (${INSTANCE})",
+  "requires": ["js"],
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-website", "${PORTS+2}"],
+  "readyWhen": { "log": "ready in" },
+  "timeoutStart": "2m",
+  "restartOnSuccess": true
+}

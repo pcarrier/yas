@@ -1,0 +1,258 @@
+schema = 1
+family = "yas.selection"
+
+limits = [
+  { name = "MAX_INLINE_BYTES", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_ITEMS", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_MIME_BYTES", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 255 },
+  { name = "MAX_ITEM_NAME_BYTES", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_ACTIVE_DRAGS_PER_SESSION", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_STAGES_PER_SESSION", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_STAGED_BYTES_PER_STAGE", tag = 7, type = "u64", required = true, hard_min = 1, hard_max = 1073741824 },
+  { name = "MAX_MUTATION_REPLAYS", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+]
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+[[request]]
+name = "SET"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "slot:u8,reserved:[u8;3]=0,operation_id:[u8;16],item_count:u16,repeated mime:string_u16,data:bytes_u32,Extensions; ResultPrefix + revision:u64"
+[[request]]
+name = "SET_BEGIN"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "slot:u8,reserved:[u8;3]=0,operation_id:[u8;16],item_count:u16,repeated mime:string_u16,byte_len:u64,content_hash:[u8;32],initial_receive_credit:u64,Extensions; ResultPrefix + staging_handle:u64,descriptor_count:u16,reserved:u16=0,repeated descriptor:bytes_u32 containing sensitive receiver-to-sender BYTE TransferDescriptor with required upload-stage extension naming the same handle and expiry,Extensions; before SET_COMMIT succeeds, RESET of any returned descriptor discards the whole stage and all sibling descriptors"
+[[request]]
+name = "SET_COMMIT"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "staging_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix + revision:u64"
+[[request]]
+name = "GET"
+kind = 0x0005
+direction = "bidirectional"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "target_kind:u8,reserved:[u8;3]=0,slot target slot:u8,reserved:[u8;3]=0,revision:u64 or drag target drag_handle:u64,revision:u64,item_index:u16,reserved:u16=0,initial_receive_credit:u64,mime:string_u16,Extensions; ResultPrefix + InlineOrTransfer"
+[[request]]
+name = "CLEAR"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "slot:u8,reserved:[u8;3]=0,observed_revision:u64,operation_id:[u8;16],Extensions; ResultPrefix + revision:u64"
+[[request]]
+name = "DRAG_BEGIN"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],source_actions:u16,item_count:u16,repeated name:string_u16,mime_count:u16,repeated mime:string_u16,Extensions; name may be empty to mean UNKNOWN until DRAG_DROP; ResultPrefix + drag_handle:u64,revision:u64"
+[[request]]
+name = "DRAG_DROP"
+kind = 0x0008
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "drag_handle:u64,revision:u64,operation_id:[u8;16],selected_action:u16,reserved:u16=0,Extensions; required DRAG_DROP_ITEMS_EXTENSION value item_count:u16,repeated name:string_u16,selected_mime:string_u16 atomically supplies final names and the exact offered MIME to fetch for every item; ResultPrefix completes only after all corresponding GET bodies validate"
+[[request]]
+name = "DRAG_CANCEL"
+kind = 0x0009
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "drag_handle:u64,revision:u64,operation_id:[u8;16],reason:string_u32; ResultPrefix"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<SelectionRecord>"
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+[[event]]
+name = "DRAG_ENTER"
+kind = 0x0010
+direction = "bidirectional"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "drag_handle:u64,revision:u64,target_surface:u64,x_32_32:i64,y_32_32:i64,actions:u16,reserved:u16=0"
+[[event]]
+name = "DRAG_MOTION"
+kind = 0x0011
+direction = "bidirectional"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "drag_handle:u64,revision:u64,target_surface:u64,x_32_32:i64,y_32_32:i64,actions:u16,reserved:u16=0"
+[[event]]
+name = "DRAG_LEAVE"
+kind = 0x0012
+direction = "bidirectional"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "drag_handle:u64,revision:u64,target_surface:u64"
+
+[[constant]]
+name = "SLOT_CLIPBOARD"
+value = 0
+[[constant]]
+name = "SLOT_PRIMARY"
+value = 1
+[[constant]]
+name = "GET_TARGET_SLOT"
+value = 0
+[[constant]]
+name = "GET_TARGET_DRAG"
+value = 1
+[[constant]]
+name = "ENTITY_SLOT"
+value = 0
+[[constant]]
+name = "ENTITY_DRAG"
+value = 1
+[[constant]]
+name = "OWNER_NONE"
+value = 0
+[[constant]]
+name = "OWNER_SESSION"
+value = 1
+[[constant]]
+name = "OWNER_SURFACE"
+value = 2
+[[constant]]
+name = "OWNER_EXTERNAL"
+value = 3
+[[constant]]
+name = "ACTION_COPY"
+value = 1
+[[constant]]
+name = "ACTION_MOVE"
+value = 2
+[[constant]]
+name = "ACTION_LINK"
+value = 4
+[[constant]]
+name = "ACTION_MASK"
+value = 7
+[[constant]]
+name = "ITEM_CONTENT_KIND"
+value = 0
+[[constant]]
+name = "MAX_INLINE_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_ITEMS"
+value = 256
+[[constant]]
+name = "MAX_MIME_BYTES"
+value = 255
+[[constant]]
+name = "MAX_ITEM_NAME_BYTES"
+value = 1024
+[[constant]]
+name = "MAX_ACTIVE_DRAGS_PER_SESSION"
+value = 256
+[[constant]]
+name = "MAX_STAGES_PER_SESSION"
+value = 256
+[[constant]]
+name = "MAX_STAGED_BYTES_PER_STAGE"
+value = 1073741824
+[[constant]]
+name = "LIMIT_MAX_INLINE_BYTES"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_ITEMS"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_MIME_BYTES"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_ITEM_NAME_BYTES"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_ACTIVE_DRAGS_PER_SESSION"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_STAGES_PER_SESSION"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_STAGED_BYTES_PER_STAGE"
+value = 7
+[[constant]]
+name = "MAX_MUTATION_REPLAYS"
+value = 65536
+[[constant]]
+name = "LIMIT_MAX_MUTATION_REPLAYS"
+value = 8
+[[constant]]
+name = "DRAG_DROP_ITEMS_EXTENSION"
+value = 1
+
+[[type]]
+name = "inline_item"
+layout = "mime:string_u16,data:bytes_u32; MIME nonempty and at most 255 bytes, entries strictly ordered by MIME, total encoded item bytes at most 32768"
+[[type]]
+name = "upload_item"
+layout = "mime:string_u16,byte_len:u64,content_hash:[u8;32],initial_receive_credit:u64; entries strictly ordered by MIME"
+[[type]]
+name = "drag_item"
+layout = "name:string_u16,mime_count:u16,repeated mime:string_u16; name is at most 1024 UTF-8 bytes and may be empty to mean UNKNOWN until DRAG_DROP; MIME values nonempty, unique, and strictly ordered"
+[[type]]
+name = "drag_drop_items_extension"
+layout = "required extension tag 1 value item_count:u16,repeated name:string_u16,selected_mime:string_u16; count 1..256 must equal the current drag item count, each name is at most 1024 UTF-8 bytes and each selected MIME is nonempty, at most 255 UTF-8 bytes, and present in that item's offer; the server fetches exactly one body per item in index order and applies all final names and bodies atomically before the drop"
+
+[[type]]
+name = "selection_record"
+layout = "slot:u8,owner_kind:u8,reserved:u16=0,owner_handle:u64,revision:u64,mime_count:u16,repeated mime:string_u16,Extensions"
+[[type]]
+name = "drag_record"
+layout = "drag_handle:u64,revision:u64,owner_session:[u8;16],source_actions:u16,selected_action:u16,target_surface:u64,item_count:u16,repeated name:string_u16,mime_count:u16,repeated mime:string_u16,Extensions"
+[[type]]
+name = "state_entity_body"
+layout = "entity_kind:u16,reserved:u16=0; ADD/REPLACE complete selection_record or drag_record; PATCH entity key then Extensions; REMOVE slot:u8,reserved:[u8;3]=0,revision:u64 or drag_handle:u64,revision:u64"
+[[type]]
+name = "family_limits"
+layout = "ordered optional extensions: tags 1..7 encode max inline bytes:u32,items:u32,MIME bytes:u32,item name bytes:u32,active drags/session:u32,stages/session:u32,staged bytes/stage:u64; all tags are present in a selected family descriptor"

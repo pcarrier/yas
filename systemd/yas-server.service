@@ -1,0 +1,16 @@
+[Unit]
+Description=Yas terminal multiplexer
+Requires=yas-server.socket
+
+[Service]
+Type=notify
+WorkingDirectory=~
+ExecStart=yas server
+# Keep running after all clients disconnect — PTYs stay alive.
+# Stop manually with: systemctl --user stop yas-server.service
+Restart=no
+# Socket activation passes the fd; YAS_SOCK is not used.
+# Environment inherits from the user session (SHELL, TERM, etc).
+
+[Install]
+WantedBy=default.target

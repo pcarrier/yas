@@ -1,0 +1,49 @@
+schema = 1
+preface_hex = "5941530001000d0a"
+protocol_major = 1
+websocket_subprotocol = "yas.v1"
+stream_length_bits = 32
+event_header_bytes = 5
+correlated_header_bytes = 9
+
+[recommended]
+wire_frame = 1048576
+decoded_frame = 4194304
+buffered = 16777216
+
+[header]
+family_bits = 16
+kind_bits = 16
+meta_bits = 8
+request_id_bits = 32
+
+[class]
+event = 0
+request = 1
+result = 2
+mask = 0x03
+
+[meta]
+compressed = 0x04
+sensitive = 0x08
+reserved_mask = 0xf0
+
+[datagram_predicate]
+forbidden = 0
+net_native_flow = 1
+surface_frame = 2
+media_frame = 3
+
+[limits]
+pre_hello_frame = 65536
+wire_frame = 16777216
+decoded_frame = 67108864
+datagram = 65536
+bulk_chunk = 65536
+buffered = 1073741824
+extension_entries = 4096
+typed_records = 4096
+
+[[codec]]
+name = "LZ4"
+id = 1

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+install=false
+args=()
+for arg in "$@"; do
+  if [[ "$arg" == --install ]]; then
+    install=true
+  else
+    args+=("$arg")
+  fi
+done
+
+if (( ${#args[@]} > 1 )); then
+  echo "usage: bin/extensions [--install] [DIST]" >&2
+  exit 2
+fi
+
+nix run .#extensions -- "${args[@]}"
+
+if [[ "$install" == true ]]; then
+  dist="${args[0]:-dist}"
+  if [[ "$dist" != /* ]]; then
+    dist="$PWD/extensions/$dist"
+  fi
+  while IFS=$'\t' read -r name file; do
+    module="$dist/$file"
+    if yas ext status "$name" >/dev/null 2>&1; then
+      yas ext update --restart always "$name" "$module"
+      yas ext enable "$name"
+      yas ext start "$name"
+    else
+      yas ext run --persist --restart always "$name" "$module"
+    fi
+  done < <(jq -r '.extensions[] | [.name, .file] | @tsv' "$dist/manifest.json")
+fi

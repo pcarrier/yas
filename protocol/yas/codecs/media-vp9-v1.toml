@@ -1,0 +1,9 @@
+schema = 1
+name = "media-vp9-v1"
+const_name = "MEDIA_CODEC_VP9"
+family = "yas.media"
+id = 258
+version = 1
+direction = "bidirectional"
+layout = "One complete VP9 frame in unframed elementary-stream form. Decoder configuration is derived from key frames; superframes are permitted only when their index and every contained frame fit the negotiated complete_len."
+golden_hex = "82498342"

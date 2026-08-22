@@ -1,0 +1,22 @@
+{
+  "name": "yas-presentation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "deploy": "pnpm build && xmit yastalk.pcarrier.com"
+  },
+  "dependencies": {
+    "marked": "^18.0.7",
+    "mermaid": "^11.17.2"
+  },
+  "devDependencies": {
+    "@types/webmidi": "^2.0.13",
+    "@xmit-co/xmit": "npm:@xmit.co/xmit@0.5.2-0",
+    "type-fest": "^5.8.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16"
+  }
+}

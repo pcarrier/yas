@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>YAS</title>
+    <meta
+      name="description"
+      content="Open any screen. Find your whole machine waiting. Move without borders."
+    />
+    <meta property="og:title" content="YAS" />
+    <meta
+      property="og:description"
+      content="Open any screen. Find your whole machine waiting. Move without borders."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://yas.run" />
+    <meta
+      name="theme-color"
+      content="#ffffff"
+      media="(prefers-color-scheme: light)"
+    />
+    <meta
+      name="theme-color"
+      content="#000000"
+      media="(prefers-color-scheme: dark)"
+    />
+    <link rel="icon" href="/logo.svg" />
+    <link rel="apple-touch-icon" href="/logo.svg" />
+    <link rel="stylesheet" href="/src/site.css" />
+  </head>
+  <body>
+    <main>
+      <img class="logo" src="/logo.svg" alt="" />
+      <h1>YAS</h1>
+      <p>
+        Open any screen<br />
+        Find your whole machine waiting<br />
+        Move without borders
+      </p>
+      <section aria-labelledby="install">
+        <h2 id="install">Install</h2>
+        <div>
+          <small>Linux / macOS</small>
+          <button
+            class="command"
+            type="button"
+            data-copy="curl https://yas.run | sh"
+          >
+            <code>curl https://yas.run | sh</code>
+          </button>
+        </div>
+        <div>
+          <small>Linux · GPL build with x264</small>
+          <button
+            class="command"
+            type="button"
+            data-copy="curl https://yas.run | YAS_GPL=1 sh"
+          >
+            <code>curl https://yas.run | YAS_GPL=1 sh</code>
+          </button>
+        </div>
+        <div>
+          <small>Windows PowerShell</small>
+          <button
+            class="command"
+            type="button"
+            data-copy="irm https://yas.run | iex"
+          >
+            <code>irm https://yas.run | iex</code>
+          </button>
+        </div>
+      </section>
+      <section aria-labelledby="start">
+        <h2 id="start">Get started</h2>
+        <div>
+          <small>Local</small>
+          <button class="command" type="button" data-copy="yas open">
+            <code>yas open</code>
+          </button>
+        </div>
+        <div>
+          <small>Online</small>
+          <button class="command" type="button" data-copy="yas share">
+            <code>yas share</code>
+          </button>
+        </div>
+      </section>
+      <footer>
+        — <a href="https://pcarrier.com">pcarrier</a> for
+        <a href="https://indent.com">indent</a>
+        (<a href="https://github.com/pcarrier/yas">code</a>)
+      </footer>
+    </main>
+    <script type="module" src="/src/site.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+schema = 1
+name = "media-h264-v1"
+const_name = "MEDIA_CODEC_H264"
+family = "yas.media"
+id = 256
+version = 1
+direction = "bidirectional"
+layout = "One complete H.264 Annex-B access unit. SPS/PPS and other decoder configuration are carried in-band when FRAME_CODEC_CONFIG is set; key access units set FRAME_KEYFRAME."
+golden_hex = "000000016588"
