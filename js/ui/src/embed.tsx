@@ -1,0 +1,88 @@
+/**
+ * Embedding entry point: the full yas workspace as a mountable component,
+ * for hosts that are not the app shell — yas.run's share page is the first.
+ *
+ * `App` is the shell: it owns same-origin edge authentication, workspace
+ * sessions, and home-server Relay state. None of that holds on a marketing
+ * site opening one direct share link.
+ * `Workspace` below it never had those assumptions — it takes a list of
+ * (id, transport) pairs and renders the whole product — so embedding is a
+ * matter of exposing that seam, not of building a second, lesser client.
+ * The 900-line reimplementation this replaces on yas.run/s is the argument
+ * for doing it this way: it had drifted from the app it imitated.
+ */
+
+import { render } from "solid-js/web";
+import type { YasWasmModule } from "@yas-run/core";
+import { Workspace } from "./Workspace";
+import { setDefaultFont } from "./storage";
+import { setFontCatalog } from "./fontCatalog";
+import { setShellCapabilities } from "./shellCapabilities";
+import type { ConnectionSpec } from "./App";
+import type { ShellCapabilities } from "./shellCapabilities";
+import type { FontChoice } from "./fontCatalog";
+
+export type { ConnectionSpec, FontChoice };
+export { shareTransport } from "./nativeShareTransport";
+
+export interface EmbedOptions {
+  wasm: YasWasmModule;
+  /** Connections to drive, static or reactive; each owns its transport. */
+  connections: ConnectionSpec[] | (() => ConnectionSpec[]);
+  /** Shell affordances the host page can honour. Defaults to none of the
+   *  app shell's extras: no remotes management (the host fixes the
+   *  connection list) and no preview service worker (there is no sw.js at
+   *  the host's origin). */
+  capabilities?: Partial<ShellCapabilities>;
+  /** Monospace stack to default to, for a host that ships its own webfont
+   *  and wants the workspace on the same face as the page around it. The
+   *  visitor's own choice still wins; this replaces the platform fallback
+   *  the app-served client is right to use. */
+  fontFamily?: string;
+  /** Faces bundled into the host page, offered as the font picker's whole
+   *  menu. Without these the picker searches families the page cannot fetch
+   *  and accepts names it cannot honour. */
+  fonts?: readonly FontChoice[];
+  /** A transport authenticated once and then refused — a revoked share
+   *  passphrase, an expired link. The host owns the surrounding page, so it
+   *  owns the apology. */
+  onAuthError?: () => void;
+}
+
+/**
+ * Mount the workspace into `root` and return a disposer.
+ *
+ * The container must have a definite height — the workspace fills it. The
+ * app shell's global CSS (border-box sizing, `line-height: 1`, no
+ * overscroll) is applied to the container here rather than assumed of the
+ * page: yas is a terminal first and every pane sits on that tight rhythm,
+ * but an embedding page has typography of its own that a global reset
+ * would trample.
+ */
+export function mountYasWorkspace(
+  root: HTMLElement,
+  opts: EmbedOptions,
+): () => void {
+  setShellCapabilities({
+    remotes: false,
+    previews: false,
+    ...opts.capabilities,
+  });
+  if (opts.fontFamily) setDefaultFont(opts.fontFamily);
+  if (opts.fonts) setFontCatalog(opts.fonts);
+  root.style.lineHeight = "1";
+  root.style.boxSizing = "border-box";
+  root.style.overflow = "hidden";
+  root.style.overscrollBehavior = "none";
+  const dispose = render(
+    () => (
+      <Workspace
+        connections={opts.connections}
+        wasm={opts.wasm}
+        onAuthError={opts.onAuthError ?? (() => {})}
+      />
+    ),
+    root,
+  );
+  return dispose;
+}

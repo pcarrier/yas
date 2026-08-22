@@ -1,0 +1,138 @@
+schema = 1
+
+[[family]]
+name = "yas.core"
+const_name = "CORE"
+id = 0x0000
+version = 1
+
+[[family]]
+name = "yas.transfer"
+const_name = "TRANSFER"
+id = 0x0001
+version = 1
+
+[[family]]
+name = "yas.relay"
+const_name = "RELAY"
+id = 0x0002
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.terminal"
+const_name = "TERMINAL"
+id = 0x0010
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.client"
+const_name = "CLIENT"
+id = 0x0011
+version = 1
+
+[[family]]
+name = "yas.surface"
+const_name = "SURFACE"
+id = 0x0020
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.selection"
+const_name = "SELECTION"
+id = 0x0021
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.desktop"
+const_name = "DESKTOP"
+id = 0x0022
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.media"
+const_name = "MEDIA"
+id = 0x0023
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.font"
+const_name = "FONT"
+id = 0x0024
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.fs"
+const_name = "FS"
+id = 0x0030
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.git"
+const_name = "GIT"
+id = 0x0031
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.lsp"
+const_name = "LSP"
+id = 0x0032
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.kv"
+const_name = "KV"
+id = 0x0033
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.process"
+const_name = "PROCESS"
+id = 0x0040
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.net"
+const_name = "NET"
+id = 0x0041
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.channel"
+const_name = "CHANNEL"
+id = 0x0042
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.extension"
+const_name = "EXTENSION"
+id = 0x0043
+version = 1
+dependencies = ["yas.transfer", "yas.channel"]
+
+[[family]]
+name = "yas.events"
+const_name = "EVENTS"
+id = 0x0044
+version = 1
+dependencies = ["yas.transfer"]
+
+[[family]]
+name = "yas.env"
+const_name = "ENV"
+id = 0x0045
+version = 1
+dependencies = ["yas.transfer"]

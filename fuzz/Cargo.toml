@@ -1,0 +1,37 @@
+[package]
+name = "yas-wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+build = "build.rs"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+yas-wire = { path = "../crates/yas" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "families"
+path = "fuzz_targets/families.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packed"
+path = "fuzz_targets/packed.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+exec flyctl deploy "$root" \
+  --config "$root/crates/website/fly.toml" \
+  --dockerfile "$root/crates/website/Dockerfile" \
+  "$@"

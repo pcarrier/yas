@@ -1,0 +1,87 @@
+#version 450
+
+// Convert BGRA → NV12 into a single linear buffer.
+// Y plane at offset 0, UV plane at uv_offset.
+// Source pixels are edge-extended into encoder padding area.
+// Dispatch with (ceil(enc_width/16), ceil(enc_height/16), 1).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba8) readonly uniform image2D bgra_in;
+layout(set = 0, binding = 1, std430) buffer NV12Out {
+    uint data[];
+} nv12;
+
+layout(push_constant) uniform Params {
+    uint src_width;   // BGRA source dimensions
+    uint src_height;
+    uint y_stride;    // bytes per row (Y and UV use the same stride)
+    uint uv_offset;   // byte offset to UV plane
+    uint enc_width;   // NV12 output dimensions (>= src, encoder-aligned)
+    uint enc_height;
+};
+
+// Keep this byte-for-byte identical to surface_encoder.rs's CPU fallback.
+// A target can move between these paths while one NVENC stream stays alive;
+// different float coefficients or rounding make that transition visible.
+ivec3 rgb8(vec4 bgra) {
+    return ivec3(round(bgra.zyx * 255.0));
+}
+
+int rgb_to_y8(ivec3 rgb) {
+    return clamp(((66 * rgb.r + 129 * rgb.g + 25 * rgb.b + 128) >> 8) + 16, 0, 255);
+}
+
+int rgb_to_u8(ivec3 rgb) {
+    return clamp(((-38 * rgb.r - 74 * rgb.g + 112 * rgb.b + 128) >> 8) + 128, 0, 255);
+}
+
+int rgb_to_v8(ivec3 rgb) {
+    return clamp(((112 * rgb.r - 94 * rgb.g - 18 * rgb.b + 128) >> 8) + 128, 0, 255);
+}
+
+void main() {
+    uvec2 pos = gl_GlobalInvocationID.xy;
+    if (pos.x >= enc_width || pos.y >= enc_height) return;
+
+    // Clamp to source dimensions for edge-extension into padding.
+    ivec2 src = ivec2(min(pos.x, src_width - 1u), min(pos.y, src_height - 1u));
+    vec4 bgra = imageLoad(bgra_in, src);
+
+    // BT.601 limited-range RGB→Y. Studio swing is deliberate: Firefox's
+    // WebCodecs output path can lose a full-range flag before YUV→RGB.
+    uint y_byte = uint(rgb_to_y8(rgb8(bgra)));
+
+    // Write Y byte via packed uint.
+    uint y_idx = pos.y * y_stride + pos.x;
+    uint word_idx = y_idx >> 2u;
+    uint byte_pos = y_idx & 3u;
+    atomicOr(nv12.data[word_idx], y_byte << (byte_pos * 8u));
+
+    // Write UV at half resolution (every 2x2 block).
+    if ((pos.x & 1u) == 0u && (pos.y & 1u) == 0u) {
+        vec4 s00 = bgra;
+        ivec2 s10_pos = ivec2(min(pos.x + 1u, src_width - 1u), src.y);
+        ivec2 s01_pos = ivec2(src.x, min(pos.y + 1u, src_height - 1u));
+        ivec2 s11_pos = ivec2(s10_pos.x, s01_pos.y);
+        vec4 s10 = imageLoad(bgra_in, s10_pos);
+        vec4 s01 = imageLoad(bgra_in, s01_pos);
+        vec4 s11 = imageLoad(bgra_in, s11_pos);
+
+        int u_sum = rgb_to_u8(rgb8(s00)) + rgb_to_u8(rgb8(s10))
+                  + rgb_to_u8(rgb8(s01)) + rgb_to_u8(rgb8(s11));
+        int v_sum = rgb_to_v8(rgb8(s00)) + rgb_to_v8(rgb8(s10))
+                  + rgb_to_v8(rgb8(s01)) + rgb_to_v8(rgb8(s11));
+        uint u_byte = uint(u_sum / 4);
+        uint v_byte = uint(v_sum / 4);
+
+        // UV interleaved: U then V, same stride as Y.
+        uint cx = pos.x >> 1u;
+        uint cy = pos.y >> 1u;
+        uint uv_idx = uv_offset + cy * y_stride + cx * 2u;
+        uint uv_word = uv_idx >> 2u;
+        uint uv_byte_pos = uv_idx & 3u;
+        uint uv_packed = (u_byte | (v_byte << 8u)) << (uv_byte_pos * 8u);
+        atomicOr(nv12.data[uv_word], uv_packed);
+    }
+}

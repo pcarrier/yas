@@ -1,0 +1,579 @@
+schema = 1
+family = "yas.fs"
+
+limits = [
+  { name = "MAX_ROOTS_PER_SESSION", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+  { name = "MAX_WATCHES_PER_ROOT", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 32 },
+  { name = "MAX_PATH_COMPONENTS", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_COMPONENT_BYTES", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_PATH_BYTES", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 65535 },
+  { name = "MAX_INLINE_BYTES", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_QUERY_RECORDS", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 8192 },
+  { name = "MAX_QUERY_BYTES", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 4194304 },
+  { name = "MAX_STAGES_PER_SESSION", tag = 9, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_STAGED_BYTES", tag = 10, type = "u64", required = true, hard_min = 1, hard_max = 67108864 },
+  { name = "MAX_BATCH_ITEMS", tag = 11, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_QUERY_CONCURRENCY", tag = 12, type = "u32", required = true, hard_min = 1, hard_max = 8 },
+  { name = "MAX_CATALOG_ENTRIES", tag = 13, type = "u32", required = true, hard_min = 1, hard_max = 1000000 },
+]
+
+[[request]]
+name = "OPEN"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "flags:u16,reserved:u16=0,source:bytes_u32 containing RootSource,Extensions; ResultPrefix + root_handle:u64,root_revision:u64,path_model:u8,case_behavior:u8,reserved:u16=0,canonical_path:bytes_u32,Extensions"
+[[request]]
+name = "CLOSE"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "root_handle:u64,Extensions; ResultPrefix; idempotent and invalidates root-scoped watches/stages"
+[[request]]
+name = "WATCH"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "root_handle:u64,flags:u16,settle_ms:u16,inline_max:u32,ignore_patterns:bytes_u32,state:bytes_u32 containing StateWatch; ResultPrefix + StateWatchResult"
+[[request]]
+name = "UNWATCH"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+[[request]]
+name = "FETCH"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "root_handle:u64,path:bytes_u32 containing WirePath,expected_hash_present:u8,reserved:[u8;3]=0,optional expected_hash:[u8;32],initial_receive_credit:u64,Extensions; ResultPrefix + content:bytes_u32 containing InlineOrTransfer,Extensions"
+[[request]]
+name = "READ"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "root_handle:u64,initial_receive_credit:u64,question_count:u16,reserved:u16=0,repeated kind:u16,flags:u16,path:bytes_u32 containing WirePath,Extensions; ResultPrefix + QueryPage"
+[[request]]
+name = "SEARCH"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "root_handle:u64,flags:u16,max_results:u16,query:bytes_u16,cursor:bytes_u16,initial_receive_credit:u64,Extensions; ResultPrefix + QueryPage"
+[[request]]
+name = "INDEX"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "root_handle:u64,flags:u16,max_results:u16,cursor:bytes_u16,initial_receive_credit:u64,Extensions; ResultPrefix + QueryPage"
+[[request]]
+name = "GREP"
+kind = 0x0008
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "root_handle:u64,flags:u16,max_results:u16,max_per_file:u16,reserved:u16=0,query:bytes_u32,cursor:bytes_u16,initial_receive_credit:u64,Extensions; ResultPrefix + QueryPage"
+[[request]]
+name = "STAGE_WRITE"
+kind = 0x0009
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "root_handle:u64,path:bytes_u32 containing WirePath,precondition:bytes_u32 containing Precondition,flags:u16,reserved:u16=0,mode:u32,byte_len:u64,content_hash:[u8;32],initial_receive_credit:u64,Extensions; ResultPrefix + staging_handle:u64,descriptor:bytes_u32 containing sensitive receiver-to-sender BYTE TransferDescriptor with required upload-stage extension naming that handle,Extensions; before COMMIT succeeds, RESET of the returned descriptor discards the stage; a CONFLICT ResultPrefix detail Extensions contains optional tag RESULT_CONFLICT_DETAIL_EXTENSION with exact ConflictDetail value"
+[[request]]
+name = "COMMIT"
+kind = 0x000a
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "staging_handle:u64,operation_id:[u8;16],flags:u16,reserved:u16=0,Extensions; ResultPrefix + root_revision:u64,entry_revision:u64,modified_unix_ns:i64,content_hash:[u8;32]; a CONFLICT ResultPrefix detail Extensions contains optional tag RESULT_CONFLICT_DETAIL_EXTENSION with exact ConflictDetail value"
+[[request]]
+name = "APPLY"
+kind = 0x000b
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "root_handle:u64,operation_id:[u8;16],flags:u16,item_count:u16,repeated item_len:u32,item_kind:u16,item_flags:u16,item_body,Extensions; ResultPrefix + root_revision:u64,result_count:u16,reserved:u16=0,repeated ApplyItemResult,Extensions"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<EntryRecord|EntryPatch|RemoveRecord|MoveRecord>; known family record kinds includes RECORD_MOVE"
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[type]]
+name = "wire_path"
+layout = "component_count:u16,repeated component:bytes_u16; root is zero components; components are raw platform-name bytes, nonempty, not dot/dot-dot, without NUL or separators; at most 1024 components, 4096 bytes each, 65535 bytes total"
+[[type]]
+name = "root_source"
+layout = "kind:u8,reserved:[u8;3]=0; PLATFORM_PATH path:bytes_u32, TERMINAL_CWD terminal_handle:u64,suffix:bytes_u32 containing WirePath, PROCESS_CWD process_handle:u64, STAGING no body; STAGING is session-owned, created lazily, and survives root CLOSE until session loss"
+[[type]]
+name = "entry_record"
+layout = "path:bytes_u32 containing WirePath,entry_revision:u64,kind:u8,flags:u8,reserved:u16=0,mode:u32,modified_unix_ns:i64; FILE byte_len:u64,content_hash:[u8;32],content_kind:u8,reserved:[u8;3]=0,optional content:bytes_u32; DIRECTORY no body; SYMLINK content_hash:[u8;32],target:bytes_u32 where hash is BLAKE3(target); Extensions"
+[[type]]
+name = "entry_patch"
+layout = "path:bytes_u32 containing WirePath,observed_revision:u64,fields:u16,reserved:u16=0,replacement:bytes_u32 containing complete EntryRecord with identical path; fields states which semantic fields changed"
+[[type]]
+name = "move_record"
+layout = "from:bytes_u32 containing WirePath,to:bytes_u32 containing WirePath,operation_id_present:u8,reserved:[u8;3]=0,optional operation_id:[u8;16]"
+[[type]]
+name = "remove_record"
+layout = "path:bytes_u32 containing WirePath,removed_revision:u64,operation_id_present:u8,reserved:[u8;3]=0,optional operation_id:[u8;16]"
+[[type]]
+name = "typed_record"
+layout = "record_len:u32,kind:u16,flags:u16,body; record_len includes kind and flags; flag bit0 REQUIRED, other bits zero"
+[[type]]
+name = "query_page"
+layout = "next_cursor:bytes_u16,total_hint:u64,flags:u16,reserved:u16=0,delivery:u8,reserved:[u8;3]=0; INLINE record_count:u16,reserved:u16=0,record_stream:bytes_u32; TRANSFER descriptor:bytes_u32 containing sensitive server-to-client MESSAGE TransferDescriptor; Extensions"
+[[type]]
+name = "query_read_record"
+layout = "question_index:u16,status:u16,path_present:u8,reserved:[u8;3]=0,optional path:bytes_u32 containing WirePath,content:bytes_u32; OK content follows the matching question kind: STAT EntryRecord, HASH exactly [u8;32], LINK_TARGET raw target bytes, CONTENT raw file bytes; non-OK content is empty"
+[[type]]
+name = "query_path_record"
+layout = "path:bytes_u32 containing WirePath,flags:u16,reserved:u16=0; used by SEARCH and INDEX"
+[[type]]
+name = "query_grep_file_record"
+layout = "file_index:u32,match_count:u32,flags:u16,reserved:u16=0,path:bytes_u32 containing WirePath; file indices are dense from zero"
+[[type]]
+name = "query_grep_match_record"
+layout = "file_index:u32,line:u32,column:u32,end_line:u32,end_column:u32,text:string_u32; lines and UTF-8 byte columns are zero based and end is exclusive"
+[[type]]
+name = "query_record_batch"
+layout = "nonempty Transfer MESSAGE item: first_record_index:u32,record_count:u16,reserved:u16=0,record_stream:bytes_u32 containing typed records; batches are contiguous from index zero and collectively contain the QueryPage record sequence"
+[[type]]
+name = "precondition"
+layout = "kind:u8,reserved:[u8;3]=0; ANY/ABSENT no body, REVISION revision:u64, HASH content_hash:[u8;32]"
+[[type]]
+name = "apply_item"
+layout = "outer item_flags bit0 CREATE_PARENTS is valid for WRITE_INLINE,MKDIR,RENAME,SYMLINK,HARDLINK and forbidden for REMOVE; WRITE_INLINE path,precondition,mode:u32,content:bytes_u32; MKDIR path,precondition,mode:u32; REMOVE path,precondition,flags:u16,reserved:u16=0; RENAME from,to,precondition; SYMLINK path,target:bytes_u32,precondition; HARDLINK source,target,precondition; all path/precondition values are bytes_u32 encoded"
+[[type]]
+name = "apply_item_result"
+layout = "index:u16,status:u16,entry_revision:u64,modified_unix_ns:i64,content_hash_present:u8,reserved:[u8;3]=0,optional content_hash:[u8;32],detail:string_u16; on CONFLICT revision/hash/time describe the current entry and are zero/absent when it is absent"
+[[type]]
+name = "conflict_detail"
+layout = "path:bytes_u32 containing WirePath,current_present:u8,hash_present:u8,reserved:u16=0,current_entry_revision:u64,modified_unix_ns:i64,optional content_hash:[u8;32]; exact value of optional Core ResultPrefix detail extension tag RESULT_CONFLICT_DETAIL_EXTENSION for STAGE_WRITE or COMMIT status CONFLICT"
+[[type]]
+name = "entry_operation_id_extension"
+layout = "EntryRecord extension tag 1 exact value operation_id:[u8;16], nonzero; lets watchers recognize mutation echoes without suppressing them"
+[[type]]
+name = "family_limits"
+layout = "ordered optional extensions: tags 1..12 encode max roots/session:u32,watches/root:u32,path components:u32,component bytes:u32,path bytes:u32,inline bytes:u32,query records:u32,query bytes:u32,stages/session:u32,staged bytes:u64,batch items:u32,query concurrency:u32"
+
+[[constant]]
+name = "SOURCE_PLATFORM_PATH"
+value = 0
+[[constant]]
+name = "SOURCE_TERMINAL_CWD"
+value = 1
+[[constant]]
+name = "SOURCE_PROCESS_CWD"
+value = 2
+[[constant]]
+name = "SOURCE_STAGING"
+value = 3
+[[constant]]
+name = "OPEN_READ_ONLY"
+value = 1
+[[constant]]
+name = "OPEN_CROSS_FILESYSTEM"
+value = 2
+[[constant]]
+name = "OPEN_FLAGS"
+value = 3
+[[constant]]
+name = "PATH_POSIX_BYTES"
+value = 0
+[[constant]]
+name = "PATH_WINDOWS_UTF8"
+value = 1
+[[constant]]
+name = "CASE_SENSITIVE"
+value = 0
+[[constant]]
+name = "CASE_INSENSITIVE"
+value = 1
+[[constant]]
+name = "CASE_PRESERVING_INSENSITIVE"
+value = 2
+
+[[constant]]
+name = "WATCH_RECURSIVE"
+value = 1
+[[constant]]
+name = "WATCH_CONTENT"
+value = 2
+[[constant]]
+name = "WATCH_INCLUDE_HIDDEN"
+value = 4
+[[constant]]
+name = "WATCH_GITIGNORE"
+value = 8
+[[constant]]
+name = "WATCH_DOT_IGNORE"
+value = 16
+[[constant]]
+name = "WATCH_EXCLUDE_GIT"
+value = 32
+[[constant]]
+name = "WATCH_FLAGS"
+value = 63
+
+[[constant]]
+name = "ENTRY_FILE"
+value = 0
+[[constant]]
+name = "ENTRY_DIRECTORY"
+value = 1
+[[constant]]
+name = "ENTRY_SYMLINK"
+value = 2
+[[constant]]
+name = "ENTRY_EXECUTABLE"
+value = 1
+[[constant]]
+name = "ENTRY_READ_ONLY"
+value = 2
+[[constant]]
+name = "ENTRY_HIDDEN"
+value = 4
+[[constant]]
+name = "ENTRY_UNREADABLE"
+value = 8
+[[constant]]
+name = "ENTRY_UNSTABLE"
+value = 16
+[[constant]]
+name = "ENTRY_SYMLINK_DIRECTORY"
+value = 32
+[[constant]]
+name = "ENTRY_DIRECTORY_FILTERED"
+value = 64
+[[constant]]
+name = "ENTRY_FLAGS"
+value = 127
+[[constant]]
+name = "CONTENT_NONE"
+value = 0
+[[constant]]
+name = "CONTENT_INLINE"
+value = 1
+[[constant]]
+name = "ENTRY_OPERATION_ID_EXTENSION"
+value = 1
+[[constant]]
+name = "RESULT_CONFLICT_DETAIL_EXTENSION"
+value = 1
+[[constant]]
+name = "PATCH_MODE"
+value = 1
+[[constant]]
+name = "PATCH_MODIFIED_TIME"
+value = 2
+[[constant]]
+name = "PATCH_CONTENT"
+value = 4
+[[constant]]
+name = "PATCH_FLAGS_FIELD"
+value = 8
+[[constant]]
+name = "PATCH_FIELDS"
+value = 15
+[[constant]]
+name = "RECORD_MOVE"
+value = 16
+
+[[constant]]
+name = "READ_STAT"
+value = 0
+[[constant]]
+name = "READ_HASH"
+value = 1
+[[constant]]
+name = "READ_LINK_TARGET"
+value = 2
+[[constant]]
+name = "READ_CONTENT"
+value = 3
+[[constant]]
+name = "READ_NO_FOLLOW"
+value = 1
+[[constant]]
+name = "READ_FLAGS"
+value = 1
+[[constant]]
+name = "SEARCH_CASE_SENSITIVE"
+value = 1
+[[constant]]
+name = "SEARCH_PREFIX"
+value = 2
+[[constant]]
+name = "SEARCH_INCLUDE_IGNORED"
+value = 4
+[[constant]]
+name = "SEARCH_FLAGS"
+value = 7
+[[constant]]
+name = "INDEX_INCLUDE_FILES"
+value = 1
+[[constant]]
+name = "INDEX_INCLUDE_DIRECTORIES"
+value = 2
+[[constant]]
+name = "INDEX_INCLUDE_IGNORED"
+value = 4
+[[constant]]
+name = "INDEX_FLAGS"
+value = 7
+[[constant]]
+name = "GREP_CASE_SENSITIVE"
+value = 1
+[[constant]]
+name = "GREP_REGEX"
+value = 2
+[[constant]]
+name = "GREP_INCLUDE_IGNORED"
+value = 4
+[[constant]]
+name = "GREP_WORD"
+value = 8
+[[constant]]
+name = "GREP_FLAGS"
+value = 15
+[[constant]]
+name = "PAGE_INLINE"
+value = 0
+[[constant]]
+name = "PAGE_TRANSFER"
+value = 1
+[[constant]]
+name = "PAGE_TRUNCATED"
+value = 1
+[[constant]]
+name = "PAGE_FLAGS"
+value = 1
+[[constant]]
+name = "QUERY_RECORD_READ"
+value = 0
+[[constant]]
+name = "QUERY_RECORD_PATH"
+value = 1
+[[constant]]
+name = "QUERY_RECORD_GREP_FILE"
+value = 2
+[[constant]]
+name = "QUERY_RECORD_GREP_MATCH"
+value = 3
+[[constant]]
+name = "QUERY_PATH_DIRECTORY"
+value = 1
+[[constant]]
+name = "QUERY_PATH_IGNORED"
+value = 2
+[[constant]]
+name = "QUERY_PATH_FLAGS"
+value = 3
+[[constant]]
+name = "QUERY_GREP_FILE_IGNORED"
+value = 1
+[[constant]]
+name = "QUERY_GREP_FILE_FLAGS"
+value = 1
+
+[[constant]]
+name = "PRECONDITION_ANY"
+value = 0
+[[constant]]
+name = "PRECONDITION_ABSENT"
+value = 1
+[[constant]]
+name = "PRECONDITION_REVISION"
+value = 2
+[[constant]]
+name = "PRECONDITION_HASH"
+value = 3
+[[constant]]
+name = "COMMIT_SYNC_DATA"
+value = 1
+[[constant]]
+name = "COMMIT_SYNC_DIRECTORY"
+value = 2
+[[constant]]
+name = "COMMIT_FLAGS"
+value = 3
+[[constant]]
+name = "STAGE_CREATE_PARENTS"
+value = 1
+[[constant]]
+name = "STAGE_FLAGS"
+value = 1
+[[constant]]
+name = "APPLY_ALL_OR_NONE"
+value = 1
+[[constant]]
+name = "APPLY_FLAGS"
+value = 1
+[[constant]]
+name = "APPLY_WRITE_INLINE"
+value = 0
+[[constant]]
+name = "APPLY_MKDIR"
+value = 1
+[[constant]]
+name = "APPLY_REMOVE"
+value = 2
+[[constant]]
+name = "APPLY_RENAME"
+value = 3
+[[constant]]
+name = "APPLY_SYMLINK"
+value = 4
+[[constant]]
+name = "APPLY_HARDLINK"
+value = 5
+[[constant]]
+name = "APPLY_ITEM_CREATE_PARENTS"
+value = 1
+[[constant]]
+name = "APPLY_ITEM_FLAGS"
+value = 1
+[[constant]]
+name = "REMOVE_RECURSIVE"
+value = 1
+[[constant]]
+name = "REMOVE_FLAGS"
+value = 1
+
+[[constant]]
+name = "FILE_CONTENT_KIND"
+value = 0
+[[constant]]
+name = "QUERY_CONTENT_KIND"
+value = 1
+[[constant]]
+name = "STAGED_WRITE_CONTENT_KIND"
+value = 2
+
+[[constant]]
+name = "MAX_ROOTS_PER_SESSION"
+value = 64
+[[constant]]
+name = "MAX_WATCHES_PER_ROOT"
+value = 32
+[[constant]]
+name = "MAX_PATH_COMPONENTS"
+value = 1024
+[[constant]]
+name = "MAX_COMPONENT_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_PATH_BYTES"
+value = 65535
+[[constant]]
+name = "MAX_INLINE_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_QUERY_RECORDS"
+value = 8192
+[[constant]]
+name = "MAX_QUERY_BYTES"
+value = 4194304
+[[constant]]
+name = "MAX_QUERY_TEXT_BYTES"
+value = 65535
+[[constant]]
+name = "MAX_CURSOR_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_STAGES_PER_SESSION"
+value = 16
+[[constant]]
+name = "MAX_STAGED_BYTES"
+value = 67108864
+[[constant]]
+name = "MAX_BATCH_ITEMS"
+value = 256
+[[constant]]
+name = "MAX_QUERY_CONCURRENCY"
+value = 8
+[[constant]]
+name = "MAX_CATALOG_ENTRIES"
+value = 1000000
+[[constant]]
+name = "MAX_IGNORE_PATTERN_BYTES"
+value = 65535
+[[constant]]
+name = "MAX_WATCH_SETTLE_MS"
+value = 1000
+[[constant]]
+name = "MAX_GREP_LINE_BYTES"
+value = 512
+
+[[constant]]
+name = "LIMIT_MAX_ROOTS_PER_SESSION"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_WATCHES_PER_ROOT"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_PATH_COMPONENTS"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_COMPONENT_BYTES"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_PATH_BYTES"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_INLINE_BYTES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_QUERY_RECORDS"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_QUERY_BYTES"
+value = 8
+[[constant]]
+name = "LIMIT_MAX_STAGES_PER_SESSION"
+value = 9
+[[constant]]
+name = "LIMIT_MAX_STAGED_BYTES"
+value = 10
+[[constant]]
+name = "LIMIT_MAX_BATCH_ITEMS"
+value = 11
+[[constant]]
+name = "LIMIT_MAX_QUERY_CONCURRENCY"
+value = 12
+[[constant]]
+name = "LIMIT_MAX_CATALOG_ENTRIES"
+value = 13

@@ -1,0 +1,378 @@
+Reading material:
+
+- ARCHITECTURE.md
+- EMBEDDING.md
+- README.md
+- SERVICES.md
+- SKILL.md
+- UNSAFE.md
+- nix/README.md
+- crates/website/README.md
+
+# Contributing to yas
+
+This document helps LLM agents (and humans) contribute to the yas codebase. It covers the development workflow, code conventions, and project structure. For the system architecture, see [ARCHITECTURE.md](ARCHITECTURE.md). For user-facing documentation, see [README.md](./README.md).
+
+## Documentation maintenance guide
+
+When making changes, update the relevant docs in the same PR.
+
+| Document                   | Scope                                                                                                                       | Update when...                                                                                                               |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `README.md`                | User-facing overview: installation, usage, features                                                                         | CLI flags, install methods, or supported platforms change                                                                    |
+| `ARCHITECTURE.md`          | System internals: data flow, crate responsibilities, transport layers, rendering pipeline                                   | Crates are added/removed/renamed, data flow between components changes, or new transport/rendering mechanisms are introduced |
+| `CONTRIBUTING.md`          | Developer workflow: building, testing, code conventions, project structure                                                  | Build steps, test commands, directory layout, or dev tooling changes                                                         |
+| `SERVICES.md`              | Hosted services, CI/CD, and running as a service (Homebrew, systemd)                                                        | CI jobs are added/removed/changed, deployment targets change, new secrets are introduced, or the release process is modified |
+| `EMBEDDING.md`             | Embedding yas in other apps: React components (`@yas-run/react`), embedding `yas server` as a library                       | Public embedding APIs, component props, or integration patterns change                                                       |
+| `SKILL.md`                 | LLM agent skill definition: install instructions and pointer to `yas learn`. Served at `yas.run/SKILL.md` by `yas-website`. | Install methods change or the `learn` subcommand output changes                                                              |
+| `crates/cli/src/learn.md`  | Full CLI reference printed by `yas learn`: usage patterns, subcommand details, transport options, escapes                   | CLI subcommands, flags, output conventions, or transport options change                                                      |
+| `UNSAFE.md`                | Unsafe Rust code audit: which crates use `unsafe`, why, and what invariants they rely on                                    | Unsafe code is added, removed, or its safety invariants change                                                               |
+| `nix/README.md`            | nix-darwin and NixOS service module configuration examples                                                                  | Nix module options or usage patterns change                                                                                  |
+| `crates/website/README.md` | `yas.run` website, signaling hub, and Fly deployment                                                                        | Website routes, signaling, deployment, or environment variables change                                                       |
+
+## Getting started
+
+### Install Nix and direnv
+
+The project uses Nix for all tooling — the Rust toolchain, wasm-pack, pnpm, Node, cargo-watch, and everything else. There is no `Makefile` that installs things piecemeal and no list of system dependencies to chase down. One `flake.nix` pins every tool to an exact revision, so every contributor builds with identical versions regardless of OS or distro. If it works in the dev shell, it works in CI.
+
+direnv makes this invisible. Instead of remembering to run `nix develop` every time you `cd` into the repo, direnv evaluates `.envrc`, enters the Nix dev shell, and adds `bin/` to your PATH automatically. Leave the directory and it restores your previous environment. The result: you open a terminal, `cd yas`, and every tool is just there.
+
+**1. Install the [Determinate Nix Installer](https://github.com/DeterminateSystems/nix-installer):**
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+```
+
+This is preferred over the official Nix installer because it enables flakes and the nix command out of the box, configures uninstall support, and works reliably on both macOS and Linux without manual `nix.conf` edits.
+
+**2. [Install direnv](https://direnv.net/docs/installation.html)** and [hook it into your shell](https://direnv.net/docs/hook.html).
+
+**3. Allow the `.envrc`:**
+
+```bash
+cd yas
+direnv allow
+```
+
+The first run downloads and builds the toolchain (cached after that). Once you see `yas dev shell`, you're ready.
+
+### Without direnv
+
+If you'd rather not install direnv, you can enter the dev shell manually:
+
+```bash
+nix develop -c $SHELL
+```
+
+You'll need to re-run this every time you open a new terminal in the repo.
+
+## Quick start
+
+Once you're in the dev shell, build and persist the muster extension, then
+install the repository's worktree source:
+
+```bash
+./bin/extensions
+yas ext run --persist --restart always muster extensions/dist/muster.wasm
+./bin/install-in-muster
+yas @muster list
+```
+
+The extension and worktree registration are one-time setup. Muster watches Git
+and the checked-in `.yas/muster` definitions, adding or removing one stack as
+worktrees appear or disappear. See
+[Dev environment](#dev-environment) for details.
+
+## Building and testing
+
+```bash
+nix build .#yas                  # complete product build
+./bin/tests                      # complete Rust, extension, and JS tests
+./bin/clippy                     # clippy (CI fails on any warning)
+./bin/fmt --check                # formatting check (CI fails on any diff)
+./bin/fmt                        # auto-fix formatting
+./bin/lint --check               # fmt check + clippy (CI gate)
+./bin/lint                       # auto-fix formatting + clippy
+```
+
+`./bin/fmt` runs `cargo fmt` (Rust) and `prettier` (JS/TS/JSON/MD). `./bin/lint` runs fmt + clippy together; pass `--check` to check instead of auto-fixing.
+The repository wrappers materialize the generated UI and `js/web` assets that
+Rust embeds at compile time; raw workspace-wide Cargo commands require those
+assets to have been built first.
+
+TypeScript (JS workspace — core, react, solid, UI, and web):
+
+```bash
+cd js && pnpm install && pnpm test
+```
+
+Or individual packages:
+
+```bash
+cd js && pnpm --filter @yas-run/core run test
+cd js && pnpm --filter @yas-run/react run test
+```
+
+E2E (Playwright, requires built binaries):
+
+```bash
+./bin/e2e
+```
+
+CI (`ci.yml`) runs `./bin/lint`, `./bin/tests`, `./bin/e2e`, and `./bin/coverage`. These delegate to `nix run .#<task>`, etc.
+
+## Packaging
+
+Every `nix run` target has a corresponding script in `bin/`:
+
+```bash
+./bin/build-tarballs         # release tarballs -> dist/tarballs/
+./bin/publish-npm-packages   # npm publish @yas-run/browser, @yas-run/core, @yas-run/react, @yas-run/solid
+./bin/publish-crates         # cargo publish
+```
+
+`build-tarballs` accepts an optional output directory argument (default `dist/tarballs`).
+The version and platform are derived from `flake.nix` and the build host.
+Linkage is verified at `nix build` time — on Linux the musl binary must have only `libc.so` as a NEEDED library, the glibc binary targets glibc 2.31 via `cargo-zigbuild` (all other deps statically linked), and macOS binaries must not reference nix-store dylibs.
+
+Individual packages can also be built directly:
+
+```bash
+nix build .#yas
+```
+
+There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt, prettier, and `clippy -D warnings` are the style enforcement. `./bin/fmt` runs both formatters in one pass.
+
+## Dev environment
+
+`./bin/install-in-muster` writes one source for the repository into the
+selected server instance's muster configuration directory. The source derives
+an instance for the main checkout and every linked worktree containing
+`.yas/muster`. Pass `--force` to replace an older installer-owned entry and
+`--on TARGET` when yas's effective target is not that server. The installer
+checks the running extension before writing. Each unit points direnv at its own
+`${STACK_DIR}`; direnv finds that checkout's `.envrc`, enters its environment,
+and resolves its `bin/dev-*` entrypoint without deriving the worktree root from
+the stack's path. Muster supervises these units in each instance:
+
+| Unit         | What it does                                                                     | Default port / socket                 |
+| ------------ | -------------------------------------------------------------------------------- | ------------------------------------- |
+| `js`         | Builds browser WASM, installs JS deps, then watches `crates/browser/src`         | n/a                                   |
+| `server`     | Builds `yas-cli` and runs the profiling `yas server`, serving the browser itself | `local:<instance>`, `127.0.0.1:10001` |
+| `ui`         | Vite dev server for `js/ui/`                                                     | `127.0.0.1:10000`                     |
+| `website`    | Vite dev server for `js/web/`                                                    | `127.0.0.1:10002`                     |
+| `extensions` | Builds `extensions/dist`, then serves it as a CORS extension registry            | `127.0.0.1:10003`                     |
+
+Inspect and control the stack through muster:
+
+```bash
+yas @muster status <instance>/server
+yas @muster restart <instance>/js
+yas @muster log -u <instance>/server -f
+```
+
+### Running multiple dev stacks
+
+The main worktree always receives the four-port block beginning at `10000`.
+Muster allocates a durable block to each linked worktree, so adding or removing
+another worktree never moves an existing stack. Socket and state paths include
+the derived instance name.
+
+Each instance is a standard named local server. Address the main checkout
+directly as `local:yas`, or save it under a shorter target name:
+
+```bash
+yas remote add dev local:yas
+yas --on dev terminal list
+```
+
+`YAS_DEV_EDGE_HOST` selects the development edge's bind address and
+`YAS_PASSPHRASE` replaces the development-only `dev` fallback.
+
+| Instance | UI    | Edge  | Website | Extensions |
+| -------- | ----- | ----- | ------- | ---------- |
+| main     | 10000 | 10001 | 10002   | 10003      |
+| second   | 10004 | 10005 | 10006   | 10007      |
+| third    | 10008 | 10009 | 10010   | 10011      |
+
+The UI dev server proxies `/ext` to its own instance's registry, so the
+Extensions tab of a remote offers the modules _this_ stack built rather than
+the published ones. It goes through the page's origin rather than straight to
+`127.0.0.1:10003` so that it also works when the dev UI is reached through a
+tunnel or reverse proxy, where there is no port to derive from and the registry
+port is not published.
+
+Use `yas @muster stacks`, `list`, `status`, and `doctor` to inspect allocated
+instances, unit state, and configuration errors. See
+[`extensions/muster/README.md`](extensions/muster/README.md) for the complete
+command and configuration reference.
+
+## Project structure
+
+Most Rust crates are one or two source files. The CLI crate (`yas-cli`) is split into several files and `yas-webrtc-forwarder` uses a multi-file module tree.
+
+| File                                       | Role                                                                                                              |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `crates/server/src/lib.rs`                 | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control, compositor integration              |
+| `crates/server/src/surface_encoder.rs`     | Surface video encoding: AV1 (rav1e), H.264 (openh264/x264, VA-API, NVENC)                                         |
+| `crates/server/src/vaapi_encode.rs`        | Direct VA-API H.264 and AV1 encoding (dlopen, no FFmpeg)                                                          |
+| `crates/server/src/nvenc_encode.rs`        | Direct NVENC H.264 and AV1 encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)                                      |
+| `crates/server/src/video_decode.rs`        | Camera decode policy, exact-profile validation, keyframe recovery, and backend fallback                           |
+| `crates/server/src/nvdec_decode.rs`        | Direct NVDEC H.264 and AV1 decoding via CUDA + NVCUVID (dlopen, no FFmpeg)                                        |
+| `crates/server/src/vaapi_decode.rs`        | Direct stateless VA-API H.264 and AV1 decoding (dlopen, no FFmpeg)                                                |
+| `crates/server/src/video_decode_vulkan.rs` | Direct Vulkan Video H.264 and AV1 decoding                                                                        |
+| `crates/server/src/software_decode.rs`     | Pure-Rust H.264 and AV1 camera fallback                                                                           |
+| `crates/server/src/gpu_libs.rs`            | Runtime dlopen loaders for CUDA, NVCUVID, libva, NVENC, and GBM shared across codecs                              |
+| `crates/server/src/audio.rs`               | Audio capture pipeline: PipeWire daemon spawn, in-process capture via `audio_pw`, Opus encoding                   |
+| `crates/server/src/desktop_bus.rs`         | Compositor-scoped D-Bus session for desktop services and portals                                                  |
+| `crates/server/src/audio_pw.rs`            | In-process libpipewire-0.3 capture client (runtime `dlopen`), replaces the former pw-cat subprocess               |
+| `crates/yas/src/`                          | Native YAS frame, family, Transfer, State, and packed-codec implementations                                       |
+| `crates/terminal-model/src/lib.rs`         | Protocol-neutral terminal grid state, cells, styles, and bounded text extraction                                  |
+| `crates/composite-transport/src/lib.rs`    | Paired reliable-stream and native-datagram transport used by edge/proxy/forwarder links                           |
+| `crates/compositor/src/imp.rs`             | Experimental headless Wayland compositor (wayland-server): surface tracking, input forwarding, protocol delegates |
+| `crates/compositor/src/render.rs`          | Surface compositing: `SurfaceMeta` and layer collection (`collect_gpu_layers`) for the GPU renderer               |
+| `crates/compositor/src/vulkan_render.rs`   | Vulkan GPU compositor: dlopen libvulkan.so via ash, DMA-BUF import, multi-layer compositing                       |
+| `crates/webrtc-forwarder/src/`             | WebRTC forwarder (6 files: signaling, ICE, TURN, peer management)                                                 |
+| `crates/cli/src/yas_*.rs`                  | Typed native family clients used by terminal, surface, FS, Git, LSP, KV, and other CLI commands                   |
+| `crates/cli/src/main.rs`                   | Dispatch, embedded server/edge                                                                                    |
+| `crates/cli/src/cli.rs`                    | Clap struct definitions                                                                                           |
+| `crates/cli/src/interactive.rs`            | Browser mode                                                                                                      |
+| `crates/cli/src/transport.rs`              | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                       |
+| `crates/cli/src/yas_net.rs`                | Native YAS Net/Transfer client shared by `forward` and `socks`                                                    |
+| `crates/cli/src/forward.rs`                | `yas forward`: spec grammar, TCP/UDP/TLS listeners, `yas.forwards`                                                |
+| `crates/cli/src/socks.rs`                  | `yas socks`: SOCKS5 CONNECT proxy over the relay                                                                  |
+| `crates/cli/src/learn.md`                  | CLI reference text printed by `yas learn`                                                                         |
+| `crates/browser/src/lib.rs`                | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                                |
+| `crates/alacritty-driver/src/lib.rs`       | Terminal parsing wrapper around the path-only vendored `yas-alacritty-terminal`                                   |
+| `crates/edge/src/lib.rs`                   | Fixed-home authenticated YAS WebSocket edge and web application host                                              |
+| `crates/fonts/src/lib.rs`                  | Font discovery and TTF/OTF parsing                                                                                |
+| `crates/webserver/src/lib.rs`              | Shared axum HTTP helpers                                                                                          |
+| `crates/webserver/src/config.rs`           | Server configuration types                                                                                        |
+
+### Non-Rust code
+
+| Directory                    | What                                                                                                                           |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `js/core/`                   | `@yas-run/core` npm package — framework-agnostic core: transports, layout, protocol, WebGL renderer, `YasTerminalSurface`      |
+| `js/react/`                  | `@yas-run/react` npm package — thin React bindings wrapping `YasTerminalSurface` from core. Tests in `js/react/src/__tests__/` |
+| `js/solid/`                  | `@yas-run/solid` npm package — thin Solid bindings wrapping `YasTerminalSurface` from core                                     |
+| `js/ui/`                     | Vite + Solid SPA — browser UI with tiling, scrolling and floating layouts, overlays, status bar                                |
+| `js/web/`                    | Vite landing page and browser share client                                                                                     |
+| `crates/website/`            | `yas.run` static server, installer endpoints, Redis-backed signaling hub, and Fly deployment                                   |
+| `e2e/`                       | Playwright end-to-end tests against the full stack                                                                             |
+| `examples/`                  | fd-channel examples in Python and Bun                                                                                          |
+| `nix/`                       | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules             |
+| `systemd/`                   | Socket-activated unit files (user-level and system-level templates) and service units                                          |
+| `crates/cli/src/generate.rs` | Man pages and shell completions generated from clap definitions via `yas generate <dir>`                                       |
+| `bin/`                       | Shell scripts wrapping `nix run` tasks plus release scripts (`release-prepare`, `release-tag`, `prepare-release`)              |
+
+## Code conventions
+
+**Flat crate layout.** Don't introduce deep `mod` trees. If a crate grows, add files at the same level (like the `cli/src/yas_*.rs` family clients) and `mod` them from the root. `yas-webrtc-forwarder` is the one exception with a multi-file module tree.
+
+**Wire protocol changes** touch multiple layers. A new operation requires:
+
+1. A stable family/kind/layout entry under `protocol/yas/`, including limits and sensitivity metadata.
+2. Regenerated checked-in artifacts via `cargo xtask protocol`, with no manual edits to generated files.
+3. Typed Rust and TypeScript payload codecs plus the server and client family handlers.
+4. Shared golden vectors, truncation/limit tests, lifecycle integration tests, and the relevant fuzz registry entry.
+5. Updates to [the YAS RFC](docs/design/yas.md) and any affected family companion.
+
+**Tests live next to the code.** Rust family and server tests sit beside their implementations or under each crate's `tests/` directory. TypeScript tests live under each package's `src/__tests__/` directory. Cross-language payload vectors are generated under `protocol/yas/` and consumed by both implementations.
+
+**Release profile** uses `opt-level = 3`, LTO, `codegen-units = 1`, and `panic = "abort"`. On Linux, two release tarballs are produced: a glibc variant (all deps statically linked, glibc 2.31+ via zig cc, dlopen works for GPU) and a musl variant (all deps statically linked except musl libc) for Alpine. Both are single-binary tarballs. Nix verifies linkage at build time.
+
+## Versioning and releases
+
+All release-versioned workspace crates (everything except the fixed-version
+`xtask` tool), every versioned member of the `js/` pnpm workspace, the
+`extensions/` workspace, and `nix/common.nix` share a single version number.
+`bin/prepare-release` discovers all four sets rather than listing them, so a
+new crate or pnpm workspace member is versioned without editing the script.
+The JS packages live in a pnpm workspace rooted at `js/` with a shared
+`js/pnpm-lock.yaml`; `js/web` declares no version and is left alone.
+
+The `extensions/` cargo workspace is excluded from the root one because its
+members only build for wasm32, but it is not independently versioned: its
+version is what `extensions/dist/manifest.json` publishes, and the objects a
+`#digest` pin outlives are release assets under `releases/download/v<version>/`.
+
+The path-only terminal engine under `vendor/yas-alacritty-terminal/` has its
+own fixed fork version. `./bin/publish-crates` validates that exact local path
+and version, publishes it as the first dependency layer when needed, and waits
+for the registry index before publishing `yas-terminal-driver`.
+
+Releases go through a three-step process:
+
+1. **Prepare**: `./bin/release-prepare 0.12.0` runs `bin/prepare-release` locally (version bumping, validation, tests), pushes a `release/<version>` branch, and opens a PR against `main`.
+2. **Tag**: After the PR is merged, run `./bin/release-tag 0.12.0` to create a signed tag and push it to origin.
+3. The `release.yml` workflow triggers on the `v*` tag push. It first verifies the tag signature via the GitHub API — unsigned or unverified tags fail the workflow immediately.
+
+`git tag -s` honors Git's configured signing format. This project uses SSH
+signing (`gpg.format=ssh`), so release tags do not require GPG; the removed APT
+repository was the only GPG-specific release path.
+
+CI on the verified tag builds tarballs and Windows archives,
+publishes the GitHub release plus crates.io and npm packages, and updates the
+Homebrew tap.
+
+## Guardrails
+
+- `./bin/lint --check` is the CI gate (fmt + clippy). Run `./bin/lint` to auto-fix formatting and `./bin/clippy` to check clippy warnings before pushing.
+- The WASM crate (`crates/browser/`) targets `wasm32-unknown-unknown` — don't add dependencies that pull in `std::net`, `std::fs`, etc.
+- `crates/browser/pkg/` is gitignored. It must be built locally (`./bin/build-browser`) before the UI or React tests will work.
+- The server uses raw `libc` calls (`openpty`, `waitpid`, `kill`, `ioctl`) — changes to PTY lifecycle code need careful attention to signal safety and fd leaks.
+- The background zombie reaper (`waitpid(-1, ..., WNOHANG)` every 5s in the server) can race with `cleanup_pty`'s `waitpid` for the specific child. This is intentional — `cleanup_pty` uses `WNOHANG` so it doesn't block if the reaper already collected the child.
+
+## Wayland compositor (experimental)
+
+The experimental headless Wayland compositor (`crates/compositor/`) is `#[cfg(target_os = "linux")]` only — it compiles to a stub on macOS and Windows. It uses `wayland-server` directly and runs as a single shared thread across all terminals.
+
+### How it works
+
+1. When the first PTY is created, `ensure_compositor()` spawns a compositor thread with a calloop event loop.
+2. The compositor creates a Wayland listening socket (`/tmp/wayland-N`) and sets `WAYLAND_DISPLAY` + `XDG_RUNTIME_DIR` in the PTY child environment.
+3. GUI apps launched inside any terminal connect to this socket and create `xdg_toplevel` windows.
+4. On each `wl_surface.commit`, the compositor uploads the buffer as a persistent GPU texture (SHM is uploaded, DMA-BUF is imported via Vulkan), composites the surface tree, and sends a `CompositorEvent::SurfaceCommit` with the composited `PixelData` to the server.
+5. The server encodes the pixel data as H.264 or AV1 (zero-copy from a VA surface when available, or from BGRA staging) and stores the encoded frame in `last_frames`. The tick loop sends frames to connected browser clients using the same pacing/congestion-control system as terminal updates.
+6. Browser clients decode frames via WebCodecs and render to a `<canvas>`.
+
+### Key data flow
+
+```
+Wayland app → compositor thread → CompositorEvent::SurfaceCommit
+  → server tick: SurfaceEncoder::encode() → last_frames
+  → server tick: pacing check → msg_surface_frame → edge WS → browser
+  → browser: SurfaceStore → VideoDecoder → canvas
+```
+
+### Surface encoding
+
+`crates/server/src/surface_encoder.rs` wraps seven backends behind a common `SurfaceEncoder` interface:
+
+- **NVENC AV1 / H.264** — NVIDIA GPU hardware encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)
+- **AV1 VA-API** — Intel/AMD GPU hardware encoding via libva directly (dlopen, no FFmpeg)
+- **H.264 VA-API** — Intel/AMD GPU hardware encoding via libva directly (dlopen, no FFmpeg)
+- **AV1 (rav1e)** — software, handles odd dimensions. Capped at 3840x2160: rav1e has no limit of its own, but past 4K it stops keeping up.
+- **H.264 software (openh264 and/or x264)** — software fallback, max 3840x2160. Both are cargo features of `yas-server` (and `yas-cli`); default is `openh264` (MIT-friendly), release `-gpl` artifacts use `x264` (GPL-2.0-or-later, better compression). Build with neither and the software fallback is AV1-only.
+
+Hardware AV1 (NVENC, VA-API) goes to 8192x4352; everything else stops at 3840x2160. The ceiling is applied per viewer rather than per surface — `surface_encode_cap()` in `crates/server/src/lib.rs` resolves it from the backend that won the chain, and `mediated_size_for_surface()` translates each ceiling into compositor pixels at that viewer's requested scale before taking the widest across a surface's subscribers. This lets a sub-1× viewer drive a larger 1× source while `per_client_encode_target()` still downsamples into the viewer's smaller encoded frame. A viewer's ceiling is also intersected with the decode size negotiated by the native Surface client; clients that report nothing are held at 3840x2160 encoded pixels.
+
+`--surface-encoders` / `YAS_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,av1-vulkan,h264-vulkan,h264-software,av1-software` — NVENC and VA-API are tried before the compositor-resident Vulkan Video tier, which remains ahead of software. Vulkan Video uses the same per-client target size, surface pacing gate, adaptive quantizer, and one-frame delivery discipline as the other encoders; only speed control is unavailable. A refused 4:4:4 profile retries the same Vulkan codec at 4:2:0 before a 4:2:0 refusal advances to the encoders below it (see `docs/server.md` for how that is decided, and for the two ways 4:4:4 can come back no). `YAS_SURFACE_BANDWIDTH` (low/medium/high/ultra, or a raw AV1 quantizer 10-255) is the ceiling on the bit budget — adaptation is always on and only moves cheaper than what you set, and `YAS_SURFACE_SPEED` (slow/medium/fast/realtime, or a raw 10-255) controls how much encoder time a frame may cost. `YAS_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `YAS_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`). Inbound media has the mirror-image knobs: `--camera-codecs` / `--microphone-codecs` (or `YAS_MEDIA_CAMERA_CODECS` / `YAS_MEDIA_MICROPHONE_CODECS`) narrow what viewers may send, and viewers pick within that from the media panel.
+
+### Testing surfaces without a browser
+
+```bash
+yas --on local:yas terminal start bash
+yas --on local:yas terminal send 1 'foot &\n'
+yas --on local:yas surface list             # list surfaces (TSV)
+yas --on local:yas surface capture 1        # screenshot → surface-1.png
+yas --on local:yas surface click 1 100 50   # click at (x, y)
+yas --on local:yas surface key 1 Return     # press a key
+yas --on local:yas surface type 1 'hello'   # type text
+```
+
+### Native Surface delivery
+
+Surface catalogue records arrive through the Surface family's State snapshot and deltas. Each independent view then receives typed frame or frame-chunk Events, with keyframes, codec changes, and ACK pacing governed by its negotiated limits. Clipboard content uses the Selection family and mixed audio uses Media; neither is multiplexed through a global opcode space.

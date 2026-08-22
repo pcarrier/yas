@@ -1,0 +1,724 @@
+import type { CellMetrics } from "./measure";
+
+const MAX_BATCH_VERTS = 65532;
+const GLYPH_FLOATS_PER_VERT = 8;
+
+const RECT_VS = `#version 300 es
+in vec2 a_pos;
+in vec4 a_color;
+uniform vec2 u_resolution;
+out vec4 v_color;
+
+void main() {
+    vec2 zeroToOne = a_pos / u_resolution;
+    vec2 zeroToTwo = zeroToOne * 2.0;
+    vec2 clip = zeroToTwo - 1.0;
+    gl_Position = vec4(clip * vec2(1.0, -1.0), 0.0, 1.0);
+    v_color = a_color;
+}
+`;
+
+const RECT_FS = `#version 300 es
+precision mediump float;
+in vec4 v_color;
+out vec4 fragColor;
+
+void main() {
+    fragColor = vec4(v_color.rgb * v_color.a, v_color.a);
+}
+`;
+
+const GLYPH_VS = `#version 300 es
+in vec2 a_pos;
+in vec2 a_uv;
+in vec4 a_color;
+uniform vec2 u_resolution;
+out vec2 v_uv;
+out vec4 v_color;
+
+void main() {
+    vec2 zeroToOne = a_pos / u_resolution;
+    vec2 zeroToTwo = zeroToOne * 2.0;
+    vec2 clip = zeroToTwo - 1.0;
+    gl_Position = vec4(clip * vec2(1.0, -1.0), 0.0, 1.0);
+    v_uv = a_uv;
+    v_color = a_color;
+}
+`;
+
+const GLYPH_FS = `#version 300 es
+// Texture coordinates address individual glyphs in a 2K-8K atlas.  Some
+// mobile WebKit/iPad GPUs implement mediump with too little fragment
+// precision for that, which can round samples into transparent padding and
+// make terminal text disappear.
+precision highp float;
+in vec2 v_uv;
+in vec4 v_color;
+uniform sampler2D u_texture;
+// Coverage gamma, and the luminance of the default background. See
+// applyTextGamma() below for why the adjustment is background-dependent.
+uniform float u_gamma;
+uniform float u_bgLuma;
+out vec4 fragColor;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+void main() {
+    vec4 tex = texture(u_texture, v_uv);
+    float minC = min(tex.r, min(tex.g, tex.b));
+    float maxC = max(tex.r, max(tex.g, tex.b));
+    float isGray = step(maxC - minC, 0.02);
+    // Blending coverage straight into an sRGB-encoded framebuffer overstates
+    // partial coverage, so light-on-dark stems read bolder than the font
+    // intends.  Bend the coverage curve to compensate, ramped in by how much
+    // lighter than the background the glyph is — a dark glyph on a light
+    // background has the opposite error and must be left alone.
+    float lift = smoothstep(0.0, 0.35, dot(v_color.rgb, LUMA) - u_bgLuma);
+    float a = mix(tex.a, pow(tex.a, mix(1.0, u_gamma, lift)), isGray);
+    vec3 tinted = v_color.rgb * a;
+    fragColor = vec4(mix(tex.rgb, tinted, isGray), a);
+}
+`;
+
+function compileShader(
+  gl: WebGL2RenderingContext,
+  type: number,
+  source: string,
+): WebGLShader | null {
+  const shader = gl.createShader(type);
+  if (!shader) return null;
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (gl.getShaderParameter(shader, gl.COMPILE_STATUS)) return shader;
+  gl.deleteShader(shader);
+  return null;
+}
+
+function createProgram(
+  gl: WebGL2RenderingContext,
+  vs: string,
+  fs: string,
+): WebGLProgram | null {
+  const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vs);
+  const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fs);
+  if (!vertexShader || !fragmentShader) return null;
+  const program = gl.createProgram();
+  if (!program) return null;
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  gl.linkProgram(program);
+  gl.deleteShader(vertexShader);
+  gl.deleteShader(fragmentShader);
+  if (gl.getProgramParameter(program, gl.LINK_STATUS)) return program;
+  gl.deleteProgram(program);
+  return null;
+}
+
+export type RendererBackend = "webgpu" | "webgl2" | "canvas2d";
+
+/** Relative luminance of an 0-255 RGB triple, in the same (sRGB-encoded)
+ *  space the glyph shader compares foreground colours in. */
+export function rgbLuma(rgb: [number, number, number]): number {
+  return (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+}
+
+export interface GlRenderer {
+  supported: boolean;
+  backend?: RendererBackend;
+  maxDimension: number;
+  /** Coverage gamma for glyph antialiasing. 1 leaves coverage untouched;
+   *  above 1 thins light-on-dark text. See GLYPH_FS. */
+  setTextGamma(gamma: number): void;
+  resize(width: number, height: number): void;
+  render(
+    bgVerts: Float32Array,
+    glyphVerts: Float32Array,
+    atlasCanvas: HTMLCanvasElement | undefined,
+    atlasVersion: number,
+    cursorVisible: boolean,
+    cursorCol: number,
+    cursorRow: number,
+    cursorStyle: number,
+    cursorBlinkOn: boolean,
+    cell: CellMetrics,
+    bgColor: [number, number, number],
+    focused?: boolean,
+  ): void;
+  dispose(): void;
+}
+
+const UNSUPPORTED: GlRenderer = {
+  supported: false,
+  maxDimension: 0,
+  setTextGamma() {},
+  resize() {},
+  render() {},
+  dispose() {},
+};
+
+// ---------------------------------------------------------------------------
+// Canvas 2D fallback renderer
+// ---------------------------------------------------------------------------
+
+/**
+ * Software fallback when WebGL2 is not available (e.g. headless compositor
+ * without GPU).  Reads the same vertex buffers produced by the WASM terminal
+ * and paints them with Canvas 2D.
+ */
+export function createCanvas2dRenderer(canvas: HTMLCanvasElement): GlRenderer {
+  const ctx = canvas.getContext("2d", { alpha: true });
+  if (!ctx) return { ...UNSUPPORTED };
+
+  // The size this pane asked for; the canvas itself may be larger.
+  let c2dW = 0;
+  let c2dH = 0;
+  let disposed = false;
+
+  // Reusable scratch canvas for glyph tinting.
+  const tmp = document.createElement("canvas");
+  const tctx = tmp.getContext("2d", { willReadFrequently: false })!;
+
+  const BG_FPV = 6; // x y r g b a
+  const GL_FPV = 8; // x y u v r g b a
+
+  function drawBgRects(data: Float32Array): void {
+    const stride = BG_FPV * 6; // 6 verts per rect
+    for (let i = 0; i < data.length; i += stride) {
+      // First vertex gives top-left and color.
+      const x0 = data[i];
+      const y0 = data[i + 1];
+      const r = data[i + 2];
+      const g = data[i + 3];
+      const b = data[i + 4];
+      const a = data[i + 5];
+      // Fifth vertex (index 4, offset 24) gives bottom-right.
+      const x1 = data[i + 24 + 0];
+      const y1 = data[i + 24 + 1];
+      ctx!.fillStyle = `rgba(${(r * 255) | 0},${(g * 255) | 0},${(b * 255) | 0},${a})`;
+      ctx!.fillRect(x0, y0, x1 - x0, y1 - y0);
+    }
+  }
+
+  function drawGlyphs(data: Float32Array, atlas: HTMLCanvasElement): void {
+    const aw = atlas.width;
+    const ah = atlas.height;
+    if (aw === 0 || ah === 0) return;
+
+    const stride = GL_FPV * 6; // 6 verts per glyph quad
+    for (let i = 0; i < data.length; i += stride) {
+      // Vertex 0 (top-left): x, y, u, v, r, g, b, a
+      const dx0 = data[i];
+      const dy0 = data[i + 1];
+      const u0 = data[i + 2];
+      const v0 = data[i + 3];
+      const cr = data[i + 4];
+      const cg = data[i + 5];
+      const cb = data[i + 6];
+      // Vertex 5 (bottom-right): offset = 5 * GL_FPV = 40
+      const dx1 = data[i + 40];
+      const dy1 = data[i + 41];
+      const u1 = data[i + 42];
+      const v1 = data[i + 43];
+
+      const sx = u0 * aw;
+      const sy = v0 * ah;
+      const sw = (u1 - u0) * aw;
+      const sh = (v1 - v0) * ah;
+      const dw = dx1 - dx0;
+      const dh = dy1 - dy0;
+      if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) continue;
+
+      const tw = Math.ceil(sw);
+      const th = Math.ceil(sh);
+      if (tmp.width < tw) tmp.width = tw;
+      if (tmp.height < th) tmp.height = th;
+
+      // Copy glyph from atlas.
+      tctx.globalCompositeOperation = "copy";
+      tctx.drawImage(atlas, sx, sy, sw, sh, 0, 0, tw, th);
+      // Tint: replace colour while keeping alpha (white text -> fg colour;
+      // colour emoji get tinted too – acceptable for a fallback renderer).
+      tctx.globalCompositeOperation = "source-in";
+      tctx.fillStyle = `rgb(${(cr * 255) | 0},${(cg * 255) | 0},${(cb * 255) | 0})`;
+      tctx.fillRect(0, 0, tw, th);
+
+      ctx!.drawImage(tmp, 0, 0, tw, th, dx0, dy0, dw, dh);
+    }
+  }
+
+  function renderCursor(
+    visible: boolean,
+    col: number,
+    row: number,
+    style: number,
+    blinkOn: boolean,
+    cell: CellMetrics,
+    focused: boolean,
+  ): void {
+    if (!visible) return;
+    const x = col * cell.pw;
+    const y = row * cell.ph;
+
+    if (!focused) {
+      const t = Math.max(1, Math.round(cell.pw * 0.08));
+      ctx!.fillStyle = "rgba(153,153,153,0.6)";
+      ctx!.fillRect(x, y, cell.pw, t);
+      ctx!.fillRect(x, y + cell.ph - t, cell.pw, t);
+      ctx!.fillRect(x, y, t, cell.ph);
+      ctx!.fillRect(x + cell.pw - t, y, t, cell.ph);
+      return;
+    }
+
+    const blinks = style === 0 || style === 1 || style === 3 || style === 5;
+    if (blinks && !blinkOn) return;
+    if (style === 3 || style === 4) {
+      const h = Math.max(1, Math.round(cell.ph * 0.12));
+      ctx!.fillStyle = "rgba(204,204,204,0.8)";
+      ctx!.fillRect(x, y + cell.ph - h, cell.pw, h);
+    } else if (style === 5 || style === 6) {
+      const w = Math.max(1, Math.round(cell.pw * 0.12));
+      ctx!.fillStyle = "rgba(204,204,204,0.8)";
+      ctx!.fillRect(x, y, w, cell.ph);
+    } else {
+      ctx!.fillStyle = "rgba(204,204,204,0.5)";
+      ctx!.fillRect(x, y, cell.pw, cell.ph);
+    }
+  }
+
+  return {
+    // Same contract as the WebGL2 path below: a disposed renderer must stop
+    // reporting itself usable, because that is the only signal a surface has
+    // that its cached renderer was swapped out from under it. A plain `true`
+    // here meant a surface holding this fallback never noticed the WebGPU
+    // probe replacing it — it kept drawing into this orphaned 2D canvas while
+    // compositing from WebGPU's, so the pane stayed blank for good.
+    get supported() {
+      return !disposed;
+    },
+    backend: "canvas2d" as const,
+    maxDimension: 32767,
+    // Canvas 2D composites glyphs with drawImage, which offers no hook for
+    // reshaping coverage — the fallback renders at gamma 1 whatever is asked.
+    setTextGamma() {},
+    resize(width: number, height: number) {
+      c2dW = width;
+      c2dH = height;
+      // Grow-only, as in the WebGL2 path below: every pane shares this one
+      // canvas and resizes it once per frame, and assigning canvas.width
+      // reallocates and clears the bitmap. The composite reads only the
+      // top-left c2dW x c2dH sub-rect, so slack is invisible.
+      if (canvas.width < width) canvas.width = width;
+      if (canvas.height < height) canvas.height = height;
+    },
+    render(
+      bgVerts,
+      glyphVerts,
+      atlasCanvas,
+      _atlasVersion,
+      cursorVisible,
+      cursorCol,
+      cursorRow,
+      cursorStyle,
+      cursorBlinkOn,
+      cell,
+      bgColor,
+      focused = true,
+    ) {
+      // Confined to the logical rect: clearing the whole grown bitmap
+      // would cost every other pane's area too.
+      ctx!.clearRect(0, 0, c2dW, c2dH);
+      ctx!.fillStyle = `rgb(${bgColor[0]},${bgColor[1]},${bgColor[2]})`;
+      ctx!.fillRect(0, 0, c2dW, c2dH);
+      drawBgRects(bgVerts);
+      if (atlasCanvas) drawGlyphs(glyphVerts, atlasCanvas);
+      renderCursor(
+        cursorVisible,
+        cursorCol,
+        cursorRow,
+        cursorStyle,
+        cursorBlinkOn,
+        cell,
+        focused,
+      );
+    },
+    dispose() {
+      disposed = true;
+    },
+  };
+}
+
+export function createGlRenderer(
+  canvas: HTMLCanvasElement,
+  /** Called once if the drawing context is lost. The renderer is unusable from
+   *  that point on — see the `webglcontextlost` handler below. */
+  onLost?: () => void,
+): GlRenderer {
+  const gl = canvas.getContext("webgl2", {
+    alpha: true,
+    antialias: false,
+    depth: false,
+    stencil: false,
+    premultipliedAlpha: true,
+    // We render into this (offscreen) canvas and then `drawImage` it onto each
+    // surface's 2D display canvas. iOS/iPadOS WebKit discards the drawing
+    // buffer after compositing, so without this the canvas reads back as a
+    // black frame when used as a drawImage source — the whole terminal renders
+    // black on iPad. Preserving the buffer keeps the rendered pixels readable.
+    preserveDrawingBuffer: true,
+  }) as WebGL2RenderingContext | null;
+
+  if (!gl) return { ...UNSUPPORTED };
+
+  const rectProgram = createProgram(gl, RECT_VS, RECT_FS);
+  const glyphProgram = createProgram(gl, GLYPH_VS, GLYPH_FS);
+
+  if (!rectProgram || !glyphProgram) {
+    return { ...UNSUPPORTED };
+  }
+
+  const rectBuffer = gl.createBuffer()!;
+  const glyphBuffer = gl.createBuffer()!;
+  const atlasTexture = gl.createTexture()!;
+
+  const rectPosLoc = gl.getAttribLocation(rectProgram, "a_pos");
+  const rectColorLoc = gl.getAttribLocation(rectProgram, "a_color");
+  const rectResLoc = gl.getUniformLocation(rectProgram, "u_resolution");
+
+  const glyphPosLoc = gl.getAttribLocation(glyphProgram, "a_pos");
+  const glyphUvLoc = gl.getAttribLocation(glyphProgram, "a_uv");
+  const glyphColorLoc = gl.getAttribLocation(glyphProgram, "a_color");
+  const glyphResLoc = gl.getUniformLocation(glyphProgram, "u_resolution");
+  const glyphTexLoc = gl.getUniformLocation(glyphProgram, "u_texture");
+  const glyphGammaLoc = gl.getUniformLocation(glyphProgram, "u_gamma");
+  const glyphBgLumaLoc = gl.getUniformLocation(glyphProgram, "u_bgLuma");
+
+  let textGamma = 1;
+
+  const maxDim = (gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) as number) || 4096;
+
+  // The size the *current* pane is drawing at. The canvas backing store is
+  // grow-only (see resize), so it is usually larger; everything that used
+  // to read canvas.width/height for projection or viewport reads these
+  // instead, or content would be scaled to the grown store.
+  let logicalW = 0;
+  let logicalH = 0;
+  let disposed = false;
+  let contextLost = false;
+
+  // A lost context invalidates every program, buffer, VAO and texture created
+  // through it. Deliberately no `preventDefault()` and no `webglcontextrestored`
+  // handler: preventDefault's only effect is to ask for a restore, and a
+  // restored context arrives empty — all of the above would have to be rebuilt
+  // on it. Both handlers used to just log, which meant every draw after a loss
+  // went through deleted objects and the pane never painted again.
+  //
+  // Reporting `supported: false` (below) makes cached holders re-fetch, and
+  // `onLost` lets the owner build a replacement on a fresh canvas — which is
+  // the only reliable move, since this canvas is bound to the dead context for
+  // good.
+  canvas.addEventListener("webglcontextlost", () => {
+    contextLost = true;
+    console.warn("yas: WebGL context lost — rebuilding renderer");
+    onLost?.();
+  });
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+  // Glyph quads map to their atlas slot 1:1 — same size in device pixels, both
+  // corners on integer boundaries (see the WASM push_glyph_vert) — so every
+  // sample lands dead centre on a texel and NEAREST is exact. LINEAR is only
+  // *nearly* exact: UVs are computed at texel edges from an up-to-8K atlas, so
+  // any rounding in that division bleeds a neighbouring texel in and softens
+  // the glyph. Nothing here ever samples at a non-integer scale.
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  let lastAtlasCanvas: HTMLCanvasElement | null = null;
+  let lastAtlasVersion = -1;
+
+  function uploadAtlas(atlasCanvas: HTMLCanvasElement, version: number): void {
+    if (atlasCanvas === lastAtlasCanvas && version === lastAtlasVersion) return;
+    lastAtlasCanvas = atlasCanvas;
+    lastAtlasVersion = version;
+    gl!.bindTexture(gl!.TEXTURE_2D, atlasTexture);
+    gl!.texImage2D(
+      gl!.TEXTURE_2D,
+      0,
+      gl!.RGBA,
+      gl!.RGBA,
+      gl!.UNSIGNED_BYTE,
+      atlasCanvas,
+    );
+  }
+
+  function drawColoredTriangles(data: Float32Array): void {
+    if (!data.length) return;
+    const floatsPerVert = 6;
+    const totalVerts = data.length / floatsPerVert;
+    gl!.useProgram(rectProgram);
+    gl!.bindBuffer(gl!.ARRAY_BUFFER, rectBuffer);
+    gl!.enableVertexAttribArray(rectPosLoc);
+    gl!.enableVertexAttribArray(rectColorLoc);
+    gl!.uniform2f(rectResLoc, logicalW, logicalH);
+    for (let off = 0; off < totalVerts; off += MAX_BATCH_VERTS) {
+      const count = Math.min(MAX_BATCH_VERTS, totalVerts - off);
+      const slice = data.subarray(
+        off * floatsPerVert,
+        (off + count) * floatsPerVert,
+      );
+      gl!.bufferData(gl!.ARRAY_BUFFER, slice, gl!.DYNAMIC_DRAW);
+      gl!.vertexAttribPointer(rectPosLoc, 2, gl!.FLOAT, false, 24, 0);
+      gl!.vertexAttribPointer(rectColorLoc, 4, gl!.FLOAT, false, 24, 8);
+      gl!.drawArrays(gl!.TRIANGLES, 0, count);
+    }
+  }
+
+  function drawSolidRect(
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+    r: number,
+    g: number,
+    b: number,
+    a: number,
+  ): void {
+    drawColoredTriangles(
+      new Float32Array([
+        x1,
+        y1,
+        r,
+        g,
+        b,
+        a,
+        x2,
+        y1,
+        r,
+        g,
+        b,
+        a,
+        x1,
+        y2,
+        r,
+        g,
+        b,
+        a,
+        x1,
+        y2,
+        r,
+        g,
+        b,
+        a,
+        x2,
+        y1,
+        r,
+        g,
+        b,
+        a,
+        x2,
+        y2,
+        r,
+        g,
+        b,
+        a,
+      ]),
+    );
+  }
+
+  function renderCursor(
+    cursorVisible: boolean,
+    cursorCol: number,
+    cursorRow: number,
+    cursorStyle: number,
+    cursorBlinkOn: boolean,
+    cell: CellMetrics,
+    focused: boolean,
+  ): void {
+    if (!cursorVisible) return;
+    const x1 = cursorCol * cell.pw;
+    const y1 = cursorRow * cell.ph;
+
+    if (!focused) {
+      // Unfocused: non-blinking outline.
+      const t = Math.max(1, Math.round(cell.pw * 0.08));
+      drawSolidRect(x1, y1, x1 + cell.pw, y1 + t, 0.6, 0.6, 0.6, 0.6);
+      drawSolidRect(
+        x1,
+        y1 + cell.ph - t,
+        x1 + cell.pw,
+        y1 + cell.ph,
+        0.6,
+        0.6,
+        0.6,
+        0.6,
+      );
+      drawSolidRect(x1, y1, x1 + t, y1 + cell.ph, 0.6, 0.6, 0.6, 0.6);
+      drawSolidRect(
+        x1 + cell.pw - t,
+        y1,
+        x1 + cell.pw,
+        y1 + cell.ph,
+        0.6,
+        0.6,
+        0.6,
+        0.6,
+      );
+      return;
+    }
+
+    const blinks =
+      cursorStyle === 0 ||
+      cursorStyle === 1 ||
+      cursorStyle === 3 ||
+      cursorStyle === 5;
+    if (blinks && !cursorBlinkOn) return;
+    if (cursorStyle === 3 || cursorStyle === 4) {
+      const h = Math.max(1, Math.round(cell.ph * 0.12));
+      drawSolidRect(
+        x1,
+        y1 + cell.ph - h,
+        x1 + cell.pw,
+        y1 + cell.ph,
+        0.8,
+        0.8,
+        0.8,
+        0.8,
+      );
+    } else if (cursorStyle === 5 || cursorStyle === 6) {
+      const w = Math.max(1, Math.round(cell.pw * 0.12));
+      drawSolidRect(x1, y1, x1 + w, y1 + cell.ph, 0.8, 0.8, 0.8, 0.8);
+    } else {
+      drawSolidRect(x1, y1, x1 + cell.pw, y1 + cell.ph, 0.8, 0.8, 0.8, 0.5);
+    }
+  }
+
+  function uploadAndDrawGlyphs(
+    data: Float32Array,
+    atlasCanvas: HTMLCanvasElement,
+    atlasVersion: number,
+    bgLuma: number,
+  ): void {
+    if (!data.length || !atlasCanvas) return;
+    uploadAtlas(atlasCanvas, atlasVersion);
+    const totalVerts = data.length / GLYPH_FLOATS_PER_VERT;
+    const stride = GLYPH_FLOATS_PER_VERT * 4;
+    gl!.useProgram(glyphProgram);
+    gl!.bindBuffer(gl!.ARRAY_BUFFER, glyphBuffer);
+    gl!.enableVertexAttribArray(glyphPosLoc);
+    gl!.enableVertexAttribArray(glyphUvLoc);
+    gl!.enableVertexAttribArray(glyphColorLoc);
+    gl!.uniform2f(glyphResLoc, logicalW, logicalH);
+    gl!.uniform1f(glyphGammaLoc, textGamma);
+    gl!.uniform1f(glyphBgLumaLoc, bgLuma);
+    gl!.activeTexture(gl!.TEXTURE0);
+    gl!.bindTexture(gl!.TEXTURE_2D, atlasTexture);
+    gl!.uniform1i(glyphTexLoc, 0);
+    for (let off = 0; off < totalVerts; off += MAX_BATCH_VERTS) {
+      const count = Math.min(MAX_BATCH_VERTS, totalVerts - off);
+      const slice = data.subarray(
+        off * GLYPH_FLOATS_PER_VERT,
+        (off + count) * GLYPH_FLOATS_PER_VERT,
+      );
+      gl!.bufferData(gl!.ARRAY_BUFFER, slice, gl!.DYNAMIC_DRAW);
+      gl!.vertexAttribPointer(glyphPosLoc, 2, gl!.FLOAT, false, stride, 0);
+      gl!.vertexAttribPointer(glyphUvLoc, 2, gl!.FLOAT, false, stride, 8);
+      gl!.vertexAttribPointer(glyphColorLoc, 4, gl!.FLOAT, false, stride, 16);
+      gl!.drawArrays(gl!.TRIANGLES, 0, count);
+    }
+  }
+
+  return {
+    // A disposed or context-lost renderer must stop reporting itself as
+    // usable: callers cache the shared renderer and only re-fetch when this
+    // goes false (see YasTerminalSurface.doRender). The async WebGPU probe
+    // disposes whatever was already in place and swaps itself in, so without
+    // this a surface keeps drawing through deleted GL objects — "bindTexture:
+    // attempt to use a deleted object", and a pane that never paints. A lost
+    // context has the same effect for the same reason.
+    get supported() {
+      return !disposed && !contextLost;
+    },
+    backend: "webgl2" as const,
+    maxDimension: maxDim,
+    setTextGamma(gamma: number) {
+      textGamma = Number.isFinite(gamma) && gamma > 0 ? gamma : 1;
+    },
+    resize(width: number, height: number) {
+      const w = Math.min(width, maxDim);
+      const h = Math.min(height, maxDim);
+      logicalW = w;
+      logicalH = h;
+      // Grow-only. Every pane shares this one canvas and calls resize()
+      // with its own size once per frame, and assigning canvas.width
+      // reallocates and clears the drawing buffer — measured at ~1ms a
+      // time. Sizing exactly therefore cost that once per pane per frame
+      // whenever two panes differed in size, which during a window drag
+      // is every pane, every frame.
+      //
+      // The composite copies the top-left logicalW x logicalH sub-rect
+      // (see YasTerminalSurface.doRender), so slack beyond it is never
+      // read and a larger backing store is invisible. render() below
+      // confines drawing to that rect via the viewport.
+      if (canvas.width < w) canvas.width = w;
+      if (canvas.height < h) canvas.height = h;
+    },
+    render(
+      bgVerts: Float32Array,
+      glyphVerts: Float32Array,
+      atlasCanvas: HTMLCanvasElement | undefined,
+      atlasVersion: number,
+      cursorVisible: boolean,
+      cursorCol: number,
+      cursorRow: number,
+      cursorStyle: number,
+      cursorBlinkOn: boolean,
+      cell: CellMetrics,
+      bgColor: [number, number, number],
+      focused = true,
+    ) {
+      if (gl!.isContextLost()) return;
+      // The shaders flip Y, so content is laid out from the top-left;
+      // GL's viewport origin is the bottom-left, hence the slack offset.
+      // Scissor to the same rect so the clear only pays for the region
+      // this pane actually uses, not the whole grown canvas.
+      const vpY = canvas.height - logicalH;
+      gl!.viewport(0, vpY, logicalW, logicalH);
+      gl!.enable(gl!.SCISSOR_TEST);
+      gl!.scissor(0, vpY, logicalW, logicalH);
+      gl!.clearColor(bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255, 1);
+      gl!.clear(gl!.COLOR_BUFFER_BIT);
+      drawColoredTriangles(bgVerts);
+      if (atlasCanvas) {
+        uploadAndDrawGlyphs(
+          glyphVerts,
+          atlasCanvas,
+          atlasVersion,
+          rgbLuma(bgColor),
+        );
+      }
+      renderCursor(
+        cursorVisible,
+        cursorCol,
+        cursorRow,
+        cursorStyle,
+        cursorBlinkOn,
+        cell,
+        focused,
+      );
+    },
+    dispose() {
+      disposed = true;
+      gl!.deleteBuffer(rectBuffer);
+      gl!.deleteBuffer(glyphBuffer);
+      gl!.deleteTexture(atlasTexture);
+      gl!.deleteProgram(rectProgram);
+      gl!.deleteProgram(glyphProgram);
+    },
+  };
+}

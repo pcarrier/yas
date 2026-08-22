@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <circle cx="128" cy="128" r="120" fill="none" stroke="#000" stroke-width="16" />
+  <g fill="#000">
+    <rect id="spoke" x="120" y="128" width="16" height="120" />
+    <use href="#spoke" transform="rotate(120 128 128)" />
+    <use href="#spoke" transform="rotate(240 128 128)" />
+  </g>
+</svg>

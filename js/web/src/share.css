@@ -1,0 +1,82 @@
+@import "tailwindcss";
+@source "../../ui/src";
+
+@import "@fontsource/jetbrains-mono/latin-400.css";
+@import "@fontsource/jetbrains-mono/latin-700.css";
+@import "@fontsource/fira-code/latin-400.css";
+@import "@fontsource/fira-code/latin-700.css";
+@import "@fontsource/ibm-plex-mono/latin-400.css";
+@import "@fontsource/ibm-plex-mono/latin-700.css";
+@import "@fontsource/source-code-pro/latin-400.css";
+@import "@fontsource/source-code-pro/latin-700.css";
+
+@theme {
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+html,
+body,
+#app,
+#state {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+#app {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0
+    env(safe-area-inset-left);
+}
+
+#state {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 1rem;
+  padding: 1.5rem;
+  background: #fff;
+  color: #000;
+  font:
+    13px/1.5 "JetBrains Mono",
+    ui-monospace,
+    monospace;
+  text-align: center;
+}
+
+#state img {
+  width: 3rem;
+  height: 3rem;
+}
+
+#state h1,
+#state p {
+  max-width: 32rem;
+  margin: 0;
+}
+
+#state h1 {
+  font-size: 13px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+#state a {
+  color: inherit;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  #state {
+    background: #000;
+    color: #fff;
+  }
+
+  #state img {
+    filter: invert(1);
+  }
+}

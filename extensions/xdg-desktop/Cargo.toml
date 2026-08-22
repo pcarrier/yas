@@ -1,0 +1,23 @@
+[package]
+name = "yas-ext-xdg-desktop"
+description = "Autostart and supervise XDG desktop applications in YAS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# The published object is `xdg-desktop.wasm`; the crate name only matters to cargo.
+[[bin]]
+name = "xdg-desktop"
+path = "src/main.rs"
+
+# Desktop-entry parsing and the supervisor's bookkeeping are a library so they
+# can be tested on the host — the field-code, quoting, and backoff rules are
+# where the bugs live, and none of them need a running session to exercise.
+[lib]
+name = "yas_ext_xdg_desktop"
+path = "src/lib.rs"
+
+[dependencies]
+yas-guest.workspace = true

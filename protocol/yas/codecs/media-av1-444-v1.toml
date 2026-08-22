@@ -1,0 +1,9 @@
+schema = 1
+name = "media-av1-444-v1"
+const_name = "MEDIA_CODEC_AV1_444"
+family = "yas.media"
+id = 261
+version = 1
+direction = "bidirectional"
+layout = "One complete AV1 temporal unit in low-overhead OBU format whose decoded chroma format is 4:4:4, beginning with a temporal delimiter. Sequence headers are carried in-band when FRAME_CODEC_CONFIG is set; random-access frames set FRAME_KEYFRAME. This codec ID is never negotiated as the 4:2:0 MEDIA_CODEC_AV1 codec."
+golden_hex = "120200"

@@ -1,0 +1,55 @@
+{
+  "name": "@yas-run/bin",
+  "version": "0.0.0",
+  "description": "Installs the prebuilt yas binary for your platform; default export is the binary path.",
+  "keywords": [
+    "yas",
+    "terminal",
+    "multiplexer",
+    "wayland",
+    "cli"
+  ],
+  "homepage": "https://yas.run",
+  "license": "MIT",
+  "author": "Indent <oss@indent.com> (https://indent.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pcarrier/yas.git",
+    "directory": "npm/bin"
+  },
+  "bugs": {
+    "url": "https://github.com/pcarrier/yas/issues"
+  },
+  "bin": {
+    "yas": "bin/yas.js"
+  },
+  "type": "commonjs",
+  "main": "index.js",
+  "module": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    },
+    "./resolve": {
+      "types": "./resolve.d.ts",
+      "default": "./resolve.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin/yas.js",
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "resolve.js",
+    "resolve.d.ts",
+    "README.md"
+  ],
+  "optionalDependencies": {},
+  "engines": {
+    "node": ">=18"
+  }
+}

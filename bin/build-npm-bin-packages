@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# Repackage release artifacts into npm packages: one data-only package per
+# platform (@yas-run/bin-<os>-<cpu>[-musl]) plus the @yas-run/bin launcher that
+# depends on them as optionalDependencies.
+#
+# The GPL flavor (yas-gpl_* tarballs, x264 instead of openh264, Linux only)
+# gets its own parallel set under @yas-run/bin-gpl, licensed GPL-2.0-or-later.
+# Both sets share the launcher sources in npm/bin; resolve.js reads its own
+# package name to know which platform packages to look for.
+#
+# Usage: build-npm-bin-packages <artifacts-dir> <out-dir> [version]
+#
+#   artifacts-dir   directory scanned (recursively) for yas_*.tar.gz,
+#                   yas-gpl_*.tar.gz and yas_*_windows_*.zip release artifacts
+#   out-dir         where generated packages are written
+#   version         optional override; otherwise inferred from filenames
+#
+# The first publish of a NEW package name has to happen by hand: npm only lets
+# you configure trusted publishing (OIDC) on a package that already exists, so
+# the release job cannot create one. Bootstrap it locally, then add the trusted
+# publisher on npmjs.com and let the pipeline take over:
+#
+#   gh release download vX.Y.Z -D artifacts -p 'yas*.tar.gz' -p 'yas_*_windows_*.zip'
+#   bin/build-npm-bin-packages artifacts dist/npm-bin X.Y.Z
+#   npm publish dist/npm-bin/@yas-run/<new-package> --access public
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+
+in_dir="${1:?usage: build-npm-bin-packages <artifacts-dir> <out-dir> [version]}"
+out_dir="${2:?usage: build-npm-bin-packages <artifacts-dir> <out-dir> [version]}"
+version_override="${3:-}"
+
+in_dir="$(cd "$in_dir" && pwd)"
+mkdir -p "$out_dir"
+out_dir="$(cd "$out_dir" && pwd)"
+
+HOMEPAGE="https://yas.run"
+AUTHOR="Indent <oss@indent.com> (https://indent.com)"
+REPO_URL="git+https://github.com/pcarrier/yas.git"
+BUGS_URL="https://github.com/pcarrier/yas/issues"
+LICENSE="MIT"
+GPL_LICENSE="GPL-2.0-or-later"
+
+extract_zip() {
+  # extract_zip <zip> <dest-dir>
+  local zip="$1" dest="$2"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$zip" -d "$dest"
+  elif command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -xf "$zip" -C "$dest"
+  else
+    echo "error: need 'unzip' or 'bsdtar' to extract $zip" >&2
+    exit 1
+  fi
+}
+
+version=""
+set_version() {
+  local v="$1"
+  if [ -z "$version" ]; then
+    version="$v"
+  elif [ "$version" != "$v" ]; then
+    echo "error: conflicting versions in artifacts: $version vs $v" >&2
+    exit 1
+  fi
+}
+[ -n "$version_override" ] && version="$version_override"
+
+# Track generated platform package names for the launcher manifests. The flavor
+# is read back off the name, so one list covers both.
+pkg_names=()
+
+# Set by the artifact loop before each write_platform_pkg call.
+pkg_license="$LICENSE"
+pkg_launcher="@yas-run/bin"
+
+# write_platform_pkg <pkgName> <nodeOs> <nodeCpu> <libc|''> <binFile> <srcBinary> <descSuffix>
+write_platform_pkg() {
+  local name="$1" os="$2" cpu="$3" libc="$4" binfile="$5" src="$6" desc="$7"
+  local dir="$out_dir/$name"
+  rm -rf "$dir"
+  mkdir -p "$dir/bin"
+  cp "$src" "$dir/bin/$binfile"
+  [ "$binfile" = "yas.exe" ] || chmod 0755 "$dir/bin/$binfile"
+
+  local libc_field=""
+  if [ -n "$libc" ]; then
+    libc_field="\n  \"libc\": [\"$libc\"],"
+  fi
+
+  cat > "$dir/package.json" <<JSON
+{
+  "name": "$name",
+  "version": "$version",
+  "description": "yas binary for $desc",
+  "homepage": "$HOMEPAGE",
+  "license": "$pkg_license",
+  "author": "$AUTHOR",
+  "repository": { "type": "git", "url": "$REPO_URL" },
+  "bugs": { "url": "$BUGS_URL" },
+  "os": ["$os"],
+  "cpu": ["$cpu"],$(printf "$libc_field")
+  "files": ["bin/$binfile", "README.md"],
+  "preferUnplugged": true,
+  "engines": { "node": ">=18" }
+}
+JSON
+
+  cat > "$dir/README.md" <<MD
+# $name
+
+Prebuilt \`yas\` binary for $desc.
+
+This is a platform-specific dependency of [\`$pkg_launcher\`](https://www.npmjs.com/package/$pkg_launcher);
+install \`$pkg_launcher\` instead. See <https://yas.run>.
+MD
+
+  pkg_names+=("$name")
+  echo "  generated $name ($desc)"
+}
+
+# Split "<os>_<arch>" into os + arch, where arch is a known token that may
+# itself contain an underscore (x86_64).
+split_os_arch() {
+  local s="$1"
+  case "$s" in
+    *_x86_64) split_os="${s%_x86_64}"; split_arch="x86_64" ;;
+    *_aarch64) split_os="${s%_aarch64}"; split_arch="aarch64" ;;
+    *) echo "error: cannot parse os/arch from '$s'" >&2; exit 1 ;;
+  esac
+}
+
+process_tarball() {
+  local f="$1" base os arch v rest
+  base="$(basename "$f" .tar.gz)"           # yas[-gpl]_<ver>_<os>_<arch>
+  case "$base" in
+    yas-gpl_*)
+      rest="${base#yas-gpl_}"
+      pkg_launcher="@yas-run/bin-gpl"; pkg_license="$GPL_LICENSE" ;;
+    yas_*)
+      rest="${base#yas_}"
+      pkg_launcher="@yas-run/bin"; pkg_license="$LICENSE" ;;
+    *) echo "error: unrecognized artifact name '$base'" >&2; exit 1 ;;
+  esac
+  v="${rest%%_*}"; rest="${rest#*_}"          # ver, then <os>_<arch>
+  split_os_arch "$rest"; os="$split_os"; arch="$split_arch"
+  set_version "$v"
+
+  local tmp; tmp="$(mktemp -d)"
+  tar -xzf "$f" -C "$tmp"
+  local bin="$tmp/bin/yas"
+  [ -f "$bin" ] || { echo "error: $f has no bin/yas" >&2; exit 1; }
+
+  local cpu
+  case "$arch" in
+    x86_64) cpu="x64" ;;
+    aarch64) cpu="arm64" ;;
+    *) echo "error: unknown arch '$arch' in $f" >&2; exit 1 ;;
+  esac
+
+  local desc_suffix=""
+  [ "$pkg_launcher" = "@yas-run/bin-gpl" ] && desc_suffix=", GPL flavor"
+  case "$os" in
+    linux)
+      write_platform_pkg "$pkg_launcher-linux-$cpu" linux "$cpu" glibc yas "$bin" \
+        "Linux $arch (glibc)$desc_suffix" ;;
+    linux-musl)
+      write_platform_pkg "$pkg_launcher-linux-$cpu-musl" linux "$cpu" musl yas "$bin" \
+        "Linux $arch (musl)$desc_suffix" ;;
+    darwin)
+      write_platform_pkg "$pkg_launcher-darwin-$cpu" darwin "$cpu" "" yas "$bin" \
+        "macOS $arch$desc_suffix" ;;
+    *) echo "error: unknown os '$os' in $f" >&2; exit 1 ;;
+  esac
+  rm -rf "$tmp"
+}
+
+process_zip() {
+  local f="$1" base rest v arch
+  base="$(basename "$f" .zip)"               # yas_<ver>_windows_<arch>
+  pkg_launcher="@yas-run/bin"; pkg_license="$LICENSE"
+  rest="${base#yas_}"                       # <ver>_windows_<arch>
+  v="${rest%%_*}"; rest="${rest#*_}"          # ver, then windows_<arch>
+  split_os_arch "$rest"; arch="$split_arch"  # split_os == "windows"
+  set_version "$v"
+
+  local tmp; tmp="$(mktemp -d)"
+  extract_zip "$f" "$tmp"
+  local bin="$tmp/yas.exe"
+  [ -f "$bin" ] || bin="$(find "$tmp" -name yas.exe -print -quit)"
+  [ -n "$bin" ] && [ -f "$bin" ] || { echo "error: $f has no yas.exe" >&2; exit 1; }
+
+  local cpu
+  case "$arch" in
+    x86_64) cpu="x64" ;;
+    aarch64) cpu="arm64" ;;
+    *) echo "error: unknown arch '$arch' in $f" >&2; exit 1 ;;
+  esac
+  write_platform_pkg "@yas-run/bin-win32-$cpu" win32 "$cpu" "" yas.exe "$bin" "Windows $arch"
+  rm -rf "$tmp"
+}
+
+echo "scanning $in_dir for release artifacts..."
+shopt -s nullglob globstar
+for f in "$in_dir"/**/yas_*.tar.gz "$in_dir"/**/yas-gpl_*.tar.gz; do
+  [ -f "$f" ] || continue
+  process_tarball "$f"
+done
+# Windows has no GPL build, so the plain prefix is the whole set here.
+for f in "$in_dir"/**/yas_*_windows_*.zip; do
+  [ -f "$f" ] || continue
+  process_zip "$f"
+done
+
+if [ ${#pkg_names[@]} -eq 0 ]; then
+  echo "error: no yas_*.tar.gz / *_windows_*.zip artifacts found in $in_dir" >&2
+  exit 1
+fi
+if [ -z "$version" ]; then
+  echo "error: could not determine version" >&2
+  exit 1
+fi
+
+# De-duplicate package names (glob fallbacks may match twice).
+mapfile -t pkg_names < <(printf '%s\n' "${pkg_names[@]}" | sort -u)
+
+# Split the platform packages by flavor; each launcher depends on its own set.
+mit_names=(); gpl_names=()
+for name in "${pkg_names[@]}"; do
+  case "$name" in
+    @yas-run/bin-gpl-*) gpl_names+=("$name") ;;
+    *) mit_names+=("$name") ;;
+  esac
+done
+
+# write_launcher <pkgName> <license> <description> <withCliShim:0|1> <platformPkg...>
+# Both launchers ship the same sources from npm/bin; resolve.js keys off the
+# package name it finds in its own manifest. The GPL one omits the CLI shim so
+# it can be installed alongside @yas-run/bin without two packages fighting over
+# the `yas` bin name — spawn its default export instead, or install the CLI
+# with `curl -sf https://yas.run | YAS_GPL=1 sh`.
+write_launcher() {
+  local name="$1" license="$2" description="$3" with_shim="$4"; shift 4
+  local deps=("$@")
+  local src="$repo_root/npm/bin"
+  local dir="$out_dir/$name"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  local f
+  for f in index.js index.mjs index.d.ts resolve.js resolve.d.ts; do
+    cp "$src/$f" "$dir/$f"
+  done
+
+  local bin_field="" shim_file=""
+  if [ "$with_shim" = "1" ]; then
+    mkdir -p "$dir/bin"
+    cp "$src/bin/yas.js" "$dir/bin/yas.js"
+    bin_field='\n  "bin": { "yas": "bin/yas.js" },'
+    shim_file='"bin/yas.js", '
+  fi
+
+  local opt_deps="" dep
+  for dep in "${deps[@]}"; do
+    [ -n "$opt_deps" ] && opt_deps+=","
+    opt_deps+="\n    \"$dep\": \"$version\""
+  done
+
+  cat > "$dir/package.json" <<JSON
+{
+  "name": "$name",
+  "version": "$version",
+  "description": "$description",
+  "keywords": ["yas", "terminal", "multiplexer", "wayland", "cli"],
+  "homepage": "$HOMEPAGE",
+  "license": "$license",
+  "author": "$AUTHOR",
+  "repository": { "type": "git", "url": "$REPO_URL", "directory": "npm/bin" },
+  "bugs": { "url": "$BUGS_URL" },$(printf "$bin_field")
+  "type": "commonjs",
+  "main": "index.js",
+  "module": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    },
+    "./resolve": {
+      "types": "./resolve.d.ts",
+      "default": "./resolve.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [${shim_file}"index.js", "index.mjs", "index.d.ts", "resolve.js", "resolve.d.ts", "README.md"],
+  "optionalDependencies": {$(printf "$opt_deps")
+  },
+  "engines": { "node": ">=18" }
+}
+JSON
+  echo "  generated $name launcher (optionalDependencies: ${deps[*]})"
+}
+
+write_launcher "@yas-run/bin" "$LICENSE" \
+  "Installs the prebuilt yas binary for your platform; default export is the binary path." \
+  1 ${mit_names[@]+"${mit_names[@]}"}
+cp "$repo_root/npm/bin/README.md" "$out_dir/@yas-run/bin/README.md"
+
+if [ ${#gpl_names[@]} -gt 0 ]; then
+  write_launcher "@yas-run/bin-gpl" "$GPL_LICENSE" \
+    "Installs the prebuilt GPL (x264) yas binary for your Linux platform; default export is the binary path." \
+    0 "${gpl_names[@]}"
+  cat > "$out_dir/@yas-run/bin-gpl/README.md" <<MD
+# @yas-run/bin-gpl
+
+The GPL flavor of the [yas](https://yas.run) binary, distributed via npm. It is
+the same build as [\`@yas-run/bin\`](https://www.npmjs.com/package/@yas-run/bin)
+except that software H.264 encodes with x264 (GPL-2.0-or-later) instead of
+openh264: better compression, and 4:4:4 rather than 4:2:0. Linux only — x64 and
+arm64, glibc and musl.
+
+Installing it pulls in exactly one prebuilt package for your platform
+(\`@yas-run/bin-gpl-linux-<cpu>[-musl]\`) through optional dependencies.
+
+The default export is the absolute path to the executable:
+
+\`\`\`js
+const yas = require("@yas-run/bin-gpl");
+require("child_process").spawn(yas, ["open"], { stdio: "inherit" });
+\`\`\`
+
+There is no \`yas\` CLI shim here, so this package can be installed next to
+\`@yas-run/bin\`. For the GPL binary on your PATH use
+\`curl -sf https://yas.run | YAS_GPL=1 sh\`.
+
+This binary includes libx264 and is therefore covered by GPL-2.0-or-later.
+Complete corresponding source: <https://github.com/pcarrier/yas>
+(x264: <https://code.videolan.org/videolan/x264>). \`yas --license\` prints the
+exact terms.
+MD
+fi
+
+# Emit a publish order manifest: platform packages first, launchers last.
+{
+  for name in "${pkg_names[@]}"; do echo "$name"; done
+  echo "@yas-run/bin"
+  if [ ${#gpl_names[@]} -gt 0 ]; then echo "@yas-run/bin-gpl"; fi
+} > "$out_dir/.publish-order"

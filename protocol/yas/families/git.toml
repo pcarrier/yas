@@ -1,0 +1,1062 @@
+schema = 1
+family = "yas.git"
+
+limits = [
+  { name = "MAX_REPOSITORIES_PER_SESSION", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+  { name = "MAX_WATCHES_PER_REPOSITORY", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 32 },
+  { name = "MAX_WATCHED_QUERIES_PER_REPOSITORY", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_QUERY_RECORDS", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_QUERY_BYTES", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 4194304 },
+  { name = "MAX_CURSOR_BYTES", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_SPEC_BYTES", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_INLINE_BYTES", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_CONCURRENT_QUERIES", tag = 9, type = "u32", required = true, hard_min = 1, hard_max = 8 },
+  { name = "MAX_CONCURRENT_FETCHES", tag = 10, type = "u32", required = true, hard_min = 1, hard_max = 4 },
+]
+
+[[request]]
+name = "OPEN"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "source:bytes_u32 containing RepositorySource,Extensions; ResultPrefix + repository_handle:u64,repository_revision:u64,object_algorithm:u8,reserved:u8=0,repository_flags:u16,canonical_worktree_path:bytes_u32 empty only for BARE,canonical_git_dir:bytes_u32 nonempty,Extensions"
+
+[[request]]
+name = "CLOSE"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "repository_handle:u64,Extensions; ResultPrefix; idempotent and releases repository-scoped watches"
+
+[[request]]
+name = "WATCH"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "repository_handle:u64,datasets:u16,reserved:u16=0,state:bytes_u32 containing StateWatch whose Extensions contain WatchOptions; ResultPrefix + StateWatchResult"
+
+[[request]]
+name = "UNWATCH"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+
+[[request]]
+name = "QUERY"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "repository_handle:u64,max_records:u16,reserved:u16=0,cursor:bytes_u16 containing QueryCursor,initial_receive_credit:u64,body:bytes_u32 containing QueryBody,Extensions; ResultPrefix + QueryPage; max_records zero selects the server default and a nonzero value is bounded by negotiated max_query_records; repository_handle is zero exactly for DISCOVER and nonzero otherwise"
+
+[[request]]
+name = "WATCH_QUERY"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "repository_handle:u64,max_records:u16,reserved:u16=0,body:bytes_u32 containing QueryBody,state:bytes_u32 containing StateWatch; ResultPrefix + StateWatchResult; max_records has the same zero-default and hard-bound semantics as QUERY and bounds every replacement page; immutable variants may return UNSUPPORTED; StateWatch initial_credit accounts complete inline QUERY_STATE events and is not Transfer credit"
+
+[[request]]
+name = "UNWATCH_QUERY"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+
+[[request]]
+name = "FETCH"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "repository_handle:u64,operation_id:[u8;16],flags:u16,refspec_count:u16,timeout_ms:u32,remote:bytes_u16,repeated refspec:bytes_u16,Extensions; ResultPrefix + repository_revision:u64,result_count:u16,reserved:u16=0,repeated result:bytes_u32 containing FetchRefResult,Extensions"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<EntityRecord|EntityPatch|RemovedEntity>"
+
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[event]]
+name = "QUERY_STATE"
+kind = 0x0002
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "query_subscription_id:u32,event:bytes_u32 containing StateEvent<WatchedQueryValue>; outer ID is nonzero and MUST equal event.subscription_id; SNAPSHOT_RECORDS has exactly one ADD record and DELTA exactly one REPLACE record, each body is a WatchedQueryValue; marker phases have no records; Transfer delivery is forbidden because StateWatch credit accounts the complete event"
+
+[[event]]
+name = "QUERY_STATE_ACK"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck; subscription_id is the same ID carried by both QUERY_STATE outer prefix and inner StateEvent, allocated by WATCH_QUERY"
+
+[[event]]
+name = "PROGRESS"
+kind = 0x0004
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],phase:u8,flags:u8,reserved:u16=0,current:u64,total:u64,message:string_u16"
+
+[[event]]
+name = "CLOSED"
+kind = 0x0005
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "repository_handle:u64,repository_revision:u64,reason:u8,reserved:[u8;3]=0,detail:string_u16; terminal server-side lifecycle notification; clients invalidate the repository, its watches, and its watched queries before dispatching the event"
+
+[[type]]
+name = "object_id"
+layout = "algorithm:u8,byte_len:u8,reserved:u16=0,bytes:[u8;byte_len]; SHA1 requires 20 bytes and SHA256 requires 32 bytes; zero bytes are not a sentinel"
+
+[[type]]
+name = "repository_source"
+layout = "kind:u8,reserved:[u8;3]=0; PLATFORM_PATH path:bytes_u32 raw platform bytes; FS root_handle:u64,path:bytes_u32 containing FS WirePath; SUBMODULE parent_repository:u64,path:bytes_u32 containing non-root FS WirePath; TERMINAL_CWD terminal_handle:u64,suffix:bytes_u32 containing relative FS WirePath, resolved atomically from that terminal's live cwd"
+
+[[type]]
+name = "watch_options"
+layout = "StateWatch Extensions: optional tag WATCH_REFS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_STATUS_SETTLE_MS_EXTENSION value u16 milliseconds (0 server default), optional tag WATCH_REF_PREFIXES_EXTENSION value count:u16 followed by unique strictly raw-byte-ascending prefix:bytes_u16 entries; empty/absent prefix list means every ref"
+
+[[type]]
+name = "query_endpoint"
+layout = "kind:u8,reserved:[u8;3]=0,object_present:u8,reserved:[u8;3]=0,optional object:ObjectId; COMMIT,TREE,MERGE_BASE require object; EMPTY,INDEX,WORKTREE forbid object; MERGE_BASE is valid only as the left endpoint"
+
+[[type]]
+name = "query_cursor"
+layout = "empty bytes mean START; otherwise kind:u8,reserved:[u8;3]=0 and variant body: LOG_FRONTIER count:u16,reserved:u16=0,repeated ObjectId; PATH path:bytes_u32 containing FS WirePath; PLATFORM_PATH path:bytes_u32 raw platform bytes; PATCH path:bytes_u32 containing FS WirePath,position:u64; POSITION position:u64. Cursors are emitted by the server and replayed unchanged, but their exact form permits faithful protocol adaptation"
+
+[[type]]
+name = "query_body"
+layout = "kind:u16,flags:u16=0,variant body; RESOLVE spec:bytes_u16; MERGE_BASE object_count:u16,reserved:u16=0,repeated ordered ObjectId where 2 <= object_count <= MAX_QUERY_ENDPOINTS and the result is the best common ancestor of the complete set rather than an associative pairwise reduction; LOG query_flags:u16,reserved:u16=0,spec:bytes_u16,tip_count:u16,hide_count:u16,repeated tips:ObjectId,repeated hides:ObjectId,path:bytes_u32 empty or FS WirePath, where nonempty spec forbids explicit tips/hides and empty spec with no tips means HEAD; TREE tree:ObjectId,path:bytes_u32 FS WirePath; BLOB query_flags:u16,reserved:u16=0,object:ObjectId,path:bytes_u32 empty or FS WirePath,offset:u64,max_bytes:u32; DIFF query_flags:u16,rename_threshold:u8,reserved:u8=0,left:QueryEndpoint,right:QueryEndpoint,path:bytes_u32 empty or FS WirePath; PATCH query_flags:u16,context_lines:u8,rename_threshold:u8,max_bytes:u32,left:QueryEndpoint,right:QueryEndpoint,path:bytes_u32 empty or FS WirePath and returns the patch transforming left into right; INDEX query_flags:u16,reserved:u16=0,path:bytes_u32 empty or FS WirePath; DISCOVER query_flags:u16,max_depth:u16,source:bytes_u32 containing RepositorySource; BLAME query_flags:u16,reserved:u16=0,object:ObjectId,path:bytes_u32 FS WirePath,start_line:u32 one-based,line_count:u32 where zero means through end; REFLOG query_flags:u16,reserved:u16=0,name:bytes_u16 empty meaning HEAD; WORKTREES empty"
+
+[[type]]
+name = "typed_query_record"
+layout = "record_len:u32,record_kind:u16,record_flags:u16,body; length includes kind and flags; flag bit0 REQUIRED; known bodies are ObjectRecord, CommitRecord, TreeEntryRecord, ContentRecord, DiffRecord, IndexEntryRecord, DiscoveryRecord, BlameRecord, ReflogRecord, WorktreeRecord, LogPathRecord, PatchFileRecord, PatchRowRecord, PatchGapRecord, PatchBaseRecord; unknown optional records are skipped and unknown required records fail the containing operation"
+
+[[type]]
+name = "object_record"
+layout = "role:u8,reserved:[u8;3]=0,object:ObjectId; RESOLVE emits TIP then HIDE records preserving specification order, MERGE_BASE emits RESULT"
+
+[[type]]
+name = "query_page"
+layout = "next_cursor:bytes_u16 containing QueryCursor,total_hint:u64,flags:u16,reserved:u16=0,delivery:u8,reserved:[u8;3]=0; MORE is set exactly when next_cursor is nonempty; INLINE record_count:u16,reserved:u16=0,record_stream:bytes_u32; TRANSFER descriptor:bytes_u32 containing sensitive server-to-client MESSAGE TransferDescriptor with content kind QUERY_CONTENT_KIND; Extensions; ordinary QUERY permits either delivery, watched QUERY_STATE requires INLINE. For LOG, next_cursor is LOG_FRONTIER and preserves the frontier exactly; watched LOG pages are complete replacements whose MORE flag/frontier are interpreted identically to one-shot LOG pages"
+
+[[type]]
+name = "watched_query_value"
+layout = "query_status:u16 using Core status codes,reserved:u16=0,detail:string_u32,page:bytes_u32 empty or containing QueryPage; OK requires empty detail and one INLINE page; non-OK requires nonempty detail and an empty page; a later REPLACE with OK represents recovery without terminating the subscription"
+
+[[type]]
+name = "commit_record"
+layout = "flags:u16,reserved:u16=0,object:ObjectId,tree:ObjectId,parent_count:u16,reserved:u16=0,repeated parent:ObjectId,authored_unix_seconds:i64,author_timezone_minutes:i16,committed_unix_seconds:i64,committer_timezone_minutes:i16,author_name:bytes_u16,author_email:bytes_u16,committer_name:bytes_u16,committer_email:bytes_u16,message:bytes_u32; identity and message bytes may be non-UTF8 and LOSSY_ENCODING reports that a bridge substituted text"
+
+[[type]]
+name = "log_path_record"
+layout = "entry_kind:u8,object_present:u8,reserved:u16=0,mode:u32,optional object:ObjectId,path:bytes_u32 containing non-root FS WirePath; emitted immediately after its CommitRecord when LOG_PATH_OIDS is requested; absence means the followed path is deleted at that commit and requires entry_kind=BLOB,mode=0"
+
+[[type]]
+name = "tree_entry_record"
+layout = "entry_kind:u8,reserved:[u8;3]=0,mode:u32,name:bytes_u16,object:ObjectId"
+
+[[type]]
+name = "content_record"
+layout = "object:ObjectId,byte_len:u64,offset:u64,next_offset:u64,delivery:u8,reserved:[u8;3]=0; delivered length is next_offset-offset and next_offset<=byte_len; INLINE bytes:bytes_u32 bounded by MAX_INLINE_BYTES and exact delivered length; TRANSFER descriptor:bytes_u32 containing sensitive server-to-client BYTE TransferDescriptor and the sender sends exactly the delivered length before CLOSE; BLOB and PATCH use distinct content kinds"
+
+[[type]]
+name = "diff_record"
+layout = "status:u8,similarity_percent:u8,flags:u16,old_path:bytes_u32 empty or FS WirePath,new_path:bytes_u32 empty or FS WirePath,old_mode:u32,new_mode:u32,old_object_present:u8,new_object_present:u8,reserved:u16=0,optional old_object:ObjectId,optional new_object:ObjectId; BINARY,SUBMODULE,FILTERED preserve diff classification"
+
+[[type]]
+name = "patch_file_record"
+layout = "status:u8,similarity_percent:u8,flags:u16,old_path:bytes_u32 empty or non-root FS WirePath,new_path:bytes_u32 empty or non-root FS WirePath; begins a structured file section and preserves added/modified/deleted/renamed/copied plus BINARY/FILTERED; at least one path is nonempty"
+
+[[type]]
+name = "patch_row_record"
+layout = "old_line:u32,new_line:u32,old_text:bytes_u32,new_text:bytes_u32,old_span_count:u16,reserved:u16=0,repeated old_span:{start:u32,length:u32},new_span_count:u16,reserved:u16=0,repeated new_span:{start:u32,length:u32}; line numbers are one-based and zero means that side is absent; at least one side exists; spans are sorted, non-overlapping byte ranges bounded by their side's text and capped by MAX_PATCH_SPANS"
+
+[[type]]
+name = "patch_gap_record"
+layout = "old_line:u32,new_line:u32; hunk elision/cursor coordinates, one-based with at least one nonzero"
+
+[[type]]
+name = "patch_base_record"
+layout = "object:ObjectId; effective merge base used for the structured patch"
+
+[[type]]
+name = "index_entry_record"
+layout = "stage:u8,status:u8,flags:u16,path:bytes_u32 containing non-root FS WirePath,mode:u32,size:u64,modified_unix_ns:i64,object:ObjectId; stage is 0..3 and flags preserve conflicted,intent-to-add,skip-worktree"
+
+[[type]]
+name = "discovery_record"
+layout = "flags:u16,reserved:u16=0,object_algorithm:u8,reserved:[u8;3]=0,worktree_path:bytes_u32 raw platform bytes empty iff BARE,git_dir:bytes_u32 nonempty raw canonical platform bytes; results are deduplicated by git_dir"
+
+[[type]]
+name = "blame_record"
+layout = "flags:u16,reserved:u16=0,start_line:u32 one-based,end_line_exclusive:u32,original_start_line:u32 one-based,commit:ObjectId,original_path:bytes_u32 containing FS WirePath empty only when unchanged,author:bytes_u16,summary:bytes_u16"
+
+[[type]]
+name = "reflog_record"
+layout = "flags:u16,reserved:u16=0,index:u64,old_object:ObjectId,new_object:ObjectId,committer:bytes_u16,committed_unix_seconds:i64,timezone_minutes:i16,reserved:u16=0,message:bytes_u32"
+
+[[type]]
+name = "worktree_record"
+layout = "flags:u16,reserved:u16=0,path:bytes_u32 raw platform bytes empty iff BARE,head_present:u8,reserved:[u8;3]=0,optional head:ObjectId,branch:bytes_u16 full ref name empty iff DETACHED or BARE,lock_reason:string_u16 empty unless LOCKED"
+
+[[type]]
+name = "fetch_ref_result"
+layout = "flags:u16,status:u16,old_present:u8,new_present:u8,reserved:u16=0,optional old:ObjectId,optional new:ObjectId,name:bytes_u16,detail:string_u16; PRUNED requires no new object, NEW requires no old object, status uses Core status codes"
+
+[[type]]
+name = "entity_record"
+layout = "entity_kind:u16,reserved:u16=0,key:bytes_u16,entity_revision:u64,body:bytes_u32 containing exact EntityBody,Extensions; ADD and REPLACE use the complete record; HEAD key is ASCII HEAD, OPERATION key is ASCII operation, REF/REMOTE/UPSTREAM keys are their raw nonempty names, STATUS key is an encoded non-root FS WirePath, STASH key is its little-endian u32 index, WORKTREE_GENERATION key is ASCII worktrees"
+
+[[type]]
+name = "head_entity_body"
+layout = "flags:u16,reserved:u16=0,object_present:u8,reserved:[u8;3]=0,optional object:ObjectId,symbolic_target:bytes_u16; DETACHED requires object and empty target, UNBORN requires no object and nonempty target, otherwise object and nonempty target"
+
+[[type]]
+name = "ref_entity_body"
+layout = "flags:u16,reserved:u16=0,object:ObjectId,peeled_present:u8,reserved:[u8;3]=0,optional peeled:ObjectId,symbolic_target:bytes_u16; PEELED and SYMBOLIC flags exactly match optional peeled and nonempty target"
+
+[[type]]
+name = "remote_entity_body"
+layout = "flags:u16,reserved:u16=0,fetch_url:bytes_u32,push_url:bytes_u32; URLs are raw configured bytes, each bounded by MAX_REMOTE_BYTES, and push_url is empty when equal to fetch_url"
+
+[[type]]
+name = "operation_entity_body"
+layout = "operation_kind:u8,flags:u8,reserved:u16=0,head_present:u8,reserved:[u8;3]=0,optional head:ObjectId,detail:string_u16; HEAD_PRESENT exactly matches the optional object"
+
+[[type]]
+name = "status_entity_body"
+layout = "index_status:u8,worktree_status:u8,flags:u16,content_present:u8,old_path_present:u8,reserved:u16=0,optional content:ObjectId,optional old_path:bytes_u32 containing non-root FS WirePath; CONTENT_PRESENT and OLD_PATH_PRESENT flags exactly match their optional values; current path is the EntityRecord key"
+
+[[type]]
+name = "upstream_entity_body"
+layout = "flags:u16,reserved:u16=0,ahead:u32,behind:u32,upstream:bytes_u16; EntityRecord key is the local branch's full ref name; GONE requires zero counts and forbids COUNTS_VALID, otherwise COUNTS_VALID says ahead/behind are complete under the walk budget"
+
+[[type]]
+name = "stash_entity_body"
+layout = "object:ObjectId,created_unix_seconds:i64,timezone_minutes:i16,reserved:u16=0,message:bytes_u32; EntityRecord key is the little-endian u32 N of stash@{N}"
+
+[[type]]
+name = "worktree_generation_entity_body"
+layout = "count:u32,reserved:u32=0,digest:u64; the order-independent worktree-set generation; EntityRecord key is ASCII worktrees and clients refetch QUERY WORKTREES whenever count or digest changes"
+
+[[type]]
+name = "entity_patch"
+layout = "entity_kind:u16,reserved:u16=0,key:bytes_u16,observed_revision:u64,fields:u32,replacement:bytes_u32 containing complete EntityRecord with identical kind/key,Extensions"
+
+[[type]]
+name = "removed_entity"
+layout = "entity_kind:u16,reserved:u16=0,key:bytes_u16,removed_revision:u64"
+
+[[type]]
+name = "family_limits"
+layout = "ordered optional extensions: tags 1..10 encode max repositories/session:u32,watches/repository:u32,watched queries/repository:u32,query records:u32,query bytes:u32,cursor bytes:u32,spec bytes:u32,inline bytes:u32,concurrent queries:u32,concurrent fetches:u32"
+
+[[constant]]
+name = "SOURCE_PLATFORM_PATH"
+value = 0
+[[constant]]
+name = "SOURCE_FS"
+value = 1
+[[constant]]
+name = "SOURCE_SUBMODULE"
+value = 2
+[[constant]]
+name = "SOURCE_TERMINAL_CWD"
+value = 3
+
+[[constant]]
+name = "REPOSITORY_BARE"
+value = 1
+[[constant]]
+name = "REPOSITORY_SHALLOW"
+value = 2
+[[constant]]
+name = "REPOSITORY_SPARSE"
+value = 4
+[[constant]]
+name = "REPOSITORY_LINKED"
+value = 8
+[[constant]]
+name = "REPOSITORY_WRITABLE"
+value = 16
+[[constant]]
+name = "REPOSITORY_FETCHABLE"
+value = 32
+[[constant]]
+name = "REPOSITORY_FLAGS"
+value = 63
+
+[[constant]]
+name = "WATCH_REFS_SETTLE_MS_EXTENSION"
+value = 1
+[[constant]]
+name = "WATCH_STATUS_SETTLE_MS_EXTENSION"
+value = 2
+[[constant]]
+name = "WATCH_REF_PREFIXES_EXTENSION"
+value = 3
+
+[[constant]]
+name = "CURSOR_LOG_FRONTIER"
+value = 1
+[[constant]]
+name = "CURSOR_PATH"
+value = 2
+[[constant]]
+name = "CURSOR_PLATFORM_PATH"
+value = 3
+[[constant]]
+name = "CURSOR_PATCH"
+value = 4
+[[constant]]
+name = "CURSOR_POSITION"
+value = 5
+
+[[constant]]
+name = "ENDPOINT_EMPTY"
+value = 0
+[[constant]]
+name = "ENDPOINT_COMMIT"
+value = 1
+[[constant]]
+name = "ENDPOINT_TREE"
+value = 2
+[[constant]]
+name = "ENDPOINT_INDEX"
+value = 3
+[[constant]]
+name = "ENDPOINT_WORKTREE"
+value = 4
+[[constant]]
+name = "ENDPOINT_MERGE_BASE"
+value = 5
+
+[[constant]]
+name = "OBJECT_SHA1"
+value = 0
+[[constant]]
+name = "OBJECT_SHA256"
+value = 1
+
+[[constant]]
+name = "WATCH_HEAD"
+value = 1
+[[constant]]
+name = "WATCH_REFS"
+value = 2
+[[constant]]
+name = "WATCH_REMOTES"
+value = 4
+[[constant]]
+name = "WATCH_OPERATION"
+value = 8
+[[constant]]
+name = "WATCH_STATUS"
+value = 16
+[[constant]]
+name = "WATCH_UPSTREAMS"
+value = 32
+[[constant]]
+name = "WATCH_STASHES"
+value = 64
+[[constant]]
+name = "WATCH_WORKTREE_GENERATION"
+value = 128
+[[constant]]
+name = "WATCH_DATASETS"
+value = 255
+
+[[constant]]
+name = "QUERY_RESOLVE"
+value = 0
+[[constant]]
+name = "QUERY_MERGE_BASE"
+value = 1
+[[constant]]
+name = "QUERY_LOG"
+value = 2
+[[constant]]
+name = "QUERY_TREE"
+value = 3
+[[constant]]
+name = "QUERY_BLOB"
+value = 4
+[[constant]]
+name = "QUERY_DIFF"
+value = 5
+[[constant]]
+name = "QUERY_PATCH"
+value = 6
+[[constant]]
+name = "QUERY_INDEX"
+value = 7
+[[constant]]
+name = "QUERY_DISCOVER"
+value = 8
+[[constant]]
+name = "QUERY_BLAME"
+value = 9
+[[constant]]
+name = "QUERY_REFLOG"
+value = 10
+[[constant]]
+name = "QUERY_WORKTREES"
+value = 11
+
+[[constant]]
+name = "OBJECT_ROLE_RESULT"
+value = 0
+[[constant]]
+name = "OBJECT_ROLE_TIP"
+value = 1
+[[constant]]
+name = "OBJECT_ROLE_HIDE"
+value = 2
+
+[[constant]]
+name = "LOG_FIRST_PARENT"
+value = 1
+[[constant]]
+name = "LOG_TOPO"
+value = 2
+[[constant]]
+name = "LOG_FULL_MESSAGE"
+value = 4
+[[constant]]
+name = "LOG_FOLLOW"
+value = 8
+[[constant]]
+name = "LOG_PATH_OIDS"
+value = 16
+[[constant]]
+name = "LOG_FLAGS"
+value = 31
+[[constant]]
+name = "BLOB_WHOLE"
+value = 1
+[[constant]]
+name = "BLOB_FLAGS"
+value = 1
+[[constant]]
+name = "DIFF_RENAMES"
+value = 1
+[[constant]]
+name = "DIFF_UNTRACKED"
+value = 2
+[[constant]]
+name = "DIFF_IGNORED"
+value = 4
+[[constant]]
+name = "DIFF_IGNORE_SPACE_CHANGE"
+value = 8
+[[constant]]
+name = "DIFF_IGNORE_ALL_SPACE"
+value = 16
+[[constant]]
+name = "DIFF_RAW"
+value = 32
+[[constant]]
+name = "DIFF_FLAGS"
+value = 63
+[[constant]]
+name = "PATCH_RENAMES"
+value = 1
+[[constant]]
+name = "PATCH_UNTRACKED"
+value = 2
+[[constant]]
+name = "PATCH_IGNORED"
+value = 4
+[[constant]]
+name = "PATCH_IGNORE_SPACE_CHANGE"
+value = 8
+[[constant]]
+name = "PATCH_IGNORE_ALL_SPACE"
+value = 16
+[[constant]]
+name = "PATCH_RAW"
+value = 32
+[[constant]]
+name = "PATCH_TEXT"
+value = 64
+[[constant]]
+name = "PATCH_CHAR_SPANS"
+value = 128
+[[constant]]
+name = "PATCH_NO_SPANS"
+value = 256
+[[constant]]
+name = "PATCH_BINARY"
+value = 512
+[[constant]]
+name = "PATCH_FLAGS"
+value = 1023
+[[constant]]
+name = "INDEX_STAGED"
+value = 1
+[[constant]]
+name = "INDEX_UNSTAGED"
+value = 2
+[[constant]]
+name = "INDEX_UNTRACKED"
+value = 4
+[[constant]]
+name = "INDEX_IGNORED"
+value = 8
+[[constant]]
+name = "INDEX_FLAGS"
+value = 15
+
+[[constant]]
+name = "DISCOVER_NESTED"
+value = 1
+[[constant]]
+name = "DISCOVER_BARE"
+value = 2
+[[constant]]
+name = "DISCOVER_QUERY_FLAGS"
+value = 3
+[[constant]]
+name = "BLAME_FOLLOW_RENAMES"
+value = 1
+[[constant]]
+name = "BLAME_FOLLOW_COPIES"
+value = 2
+[[constant]]
+name = "BLAME_FLAGS"
+value = 3
+[[constant]]
+name = "REFLOG_OLDEST_FIRST"
+value = 1
+[[constant]]
+name = "REFLOG_FLAGS"
+value = 1
+[[constant]]
+name = "RENAME_THRESHOLD_MAX"
+value = 100
+
+[[constant]]
+name = "RESULT_OBJECT"
+value = 0
+[[constant]]
+name = "RESULT_COMMIT"
+value = 1
+[[constant]]
+name = "RESULT_TREE_ENTRY"
+value = 2
+[[constant]]
+name = "RESULT_BLOB"
+value = 3
+[[constant]]
+name = "RESULT_DIFF"
+value = 4
+[[constant]]
+name = "RESULT_PATCH"
+value = 5
+[[constant]]
+name = "RESULT_INDEX_ENTRY"
+value = 6
+[[constant]]
+name = "RESULT_DISCOVERY"
+value = 7
+[[constant]]
+name = "RESULT_BLAME"
+value = 8
+[[constant]]
+name = "RESULT_REFLOG"
+value = 9
+[[constant]]
+name = "RESULT_WORKTREE"
+value = 10
+[[constant]]
+name = "RESULT_LOG_PATH"
+value = 11
+[[constant]]
+name = "RESULT_PATCH_FILE"
+value = 12
+[[constant]]
+name = "RESULT_PATCH_ROW"
+value = 13
+[[constant]]
+name = "RESULT_PATCH_GAP"
+value = 14
+[[constant]]
+name = "RESULT_PATCH_BASE"
+value = 15
+
+[[constant]]
+name = "COMMIT_LOSSY_ENCODING"
+value = 1
+[[constant]]
+name = "COMMIT_FLAGS"
+value = 1
+
+[[constant]]
+name = "PAGE_INLINE"
+value = 0
+[[constant]]
+name = "PAGE_TRANSFER"
+value = 1
+[[constant]]
+name = "QUERY_PAGE_MORE"
+value = 1
+[[constant]]
+name = "QUERY_PAGE_FLAGS"
+value = 1
+[[constant]]
+name = "CONTENT_INLINE"
+value = 0
+[[constant]]
+name = "CONTENT_TRANSFER"
+value = 1
+
+[[constant]]
+name = "TREE_BLOB"
+value = 0
+[[constant]]
+name = "TREE_TREE"
+value = 1
+[[constant]]
+name = "TREE_COMMIT"
+value = 2
+[[constant]]
+name = "DIFF_ADDED"
+value = 0
+[[constant]]
+name = "DIFF_MODIFIED"
+value = 1
+[[constant]]
+name = "DIFF_DELETED"
+value = 2
+[[constant]]
+name = "DIFF_RENAMED"
+value = 3
+[[constant]]
+name = "DIFF_COPIED"
+value = 4
+[[constant]]
+name = "DIFF_BINARY_RECORD"
+value = 1
+[[constant]]
+name = "DIFF_SUBMODULE_RECORD"
+value = 2
+[[constant]]
+name = "DIFF_FILTERED_RECORD"
+value = 4
+[[constant]]
+name = "DIFF_RECORD_FLAGS"
+value = 7
+[[constant]]
+name = "PATCH_FILE_BINARY"
+value = 1
+[[constant]]
+name = "PATCH_FILE_FILTERED"
+value = 2
+[[constant]]
+name = "PATCH_FILE_FLAGS"
+value = 3
+[[constant]]
+name = "INDEX_CONFLICTED"
+value = 1
+[[constant]]
+name = "INDEX_INTENT_TO_ADD"
+value = 2
+[[constant]]
+name = "INDEX_SKIP_WORKTREE"
+value = 4
+[[constant]]
+name = "INDEX_ENTRY_FLAGS"
+value = 7
+[[constant]]
+name = "INDEX_STATUS_UNMODIFIED"
+value = 0
+[[constant]]
+name = "INDEX_STATUS_ADDED"
+value = 1
+[[constant]]
+name = "INDEX_STATUS_MODIFIED"
+value = 2
+[[constant]]
+name = "INDEX_STATUS_DELETED"
+value = 3
+[[constant]]
+name = "DISCOVERY_BARE"
+value = 1
+[[constant]]
+name = "DISCOVERY_LINKED"
+value = 2
+[[constant]]
+name = "DISCOVERY_SUBMODULE"
+value = 4
+[[constant]]
+name = "DISCOVERY_FLAGS"
+value = 7
+[[constant]]
+name = "BLAME_RECORD_FLAGS"
+value = 0
+[[constant]]
+name = "REFLOG_RECORD_FLAGS"
+value = 0
+[[constant]]
+name = "WORKTREE_BARE"
+value = 1
+[[constant]]
+name = "WORKTREE_MAIN"
+value = 2
+[[constant]]
+name = "WORKTREE_CURRENT"
+value = 4
+[[constant]]
+name = "WORKTREE_LOCKED"
+value = 8
+[[constant]]
+name = "WORKTREE_PRUNABLE"
+value = 16
+[[constant]]
+name = "WORKTREE_DETACHED"
+value = 32
+[[constant]]
+name = "WORKTREE_FLAGS"
+value = 63
+
+[[constant]]
+name = "ENTITY_HEAD"
+value = 0
+[[constant]]
+name = "ENTITY_REF"
+value = 1
+[[constant]]
+name = "ENTITY_REMOTE"
+value = 2
+[[constant]]
+name = "ENTITY_OPERATION"
+value = 3
+[[constant]]
+name = "ENTITY_STATUS"
+value = 4
+[[constant]]
+name = "ENTITY_UPSTREAM"
+value = 5
+[[constant]]
+name = "ENTITY_STASH"
+value = 6
+[[constant]]
+name = "ENTITY_WORKTREE_GENERATION"
+value = 7
+[[constant]]
+name = "HEAD_DETACHED"
+value = 1
+[[constant]]
+name = "HEAD_UNBORN"
+value = 2
+[[constant]]
+name = "HEAD_FLAGS"
+value = 3
+[[constant]]
+name = "REF_PEELED"
+value = 1
+[[constant]]
+name = "REF_SYMBOLIC"
+value = 2
+[[constant]]
+name = "REF_FLAGS"
+value = 3
+[[constant]]
+name = "REMOTE_DEFAULT"
+value = 1
+[[constant]]
+name = "REMOTE_FLAGS"
+value = 1
+[[constant]]
+name = "OPERATION_MERGE"
+value = 1
+[[constant]]
+name = "OPERATION_REBASE"
+value = 2
+[[constant]]
+name = "OPERATION_CHERRY_PICK"
+value = 3
+[[constant]]
+name = "OPERATION_REVERT"
+value = 4
+[[constant]]
+name = "OPERATION_BISECT"
+value = 5
+[[constant]]
+name = "OPERATION_HEAD_PRESENT"
+value = 1
+[[constant]]
+name = "OPERATION_FLAGS"
+value = 1
+[[constant]]
+name = "WORKTREE_STATUS_NONE"
+value = 0
+[[constant]]
+name = "WORKTREE_STATUS_ADDED"
+value = 1
+[[constant]]
+name = "WORKTREE_STATUS_MODIFIED"
+value = 2
+[[constant]]
+name = "WORKTREE_STATUS_DELETED"
+value = 3
+[[constant]]
+name = "WORKTREE_STATUS_RENAMED"
+value = 4
+[[constant]]
+name = "WORKTREE_STATUS_COPIED"
+value = 5
+[[constant]]
+name = "WORKTREE_STATUS_TYPE_CHANGED"
+value = 6
+[[constant]]
+name = "WORKTREE_STATUS_UNMERGED"
+value = 7
+[[constant]]
+name = "WORKTREE_STATUS_UNTRACKED"
+value = 8
+[[constant]]
+name = "WORKTREE_STATUS_IGNORED"
+value = 9
+[[constant]]
+name = "STATE_STATUS_CONFLICTED"
+value = 1
+[[constant]]
+name = "STATE_STATUS_CONTENT_PRESENT"
+value = 2
+[[constant]]
+name = "STATE_STATUS_OLD_PATH_PRESENT"
+value = 4
+[[constant]]
+name = "STATE_STATUS_FLAGS"
+value = 7
+[[constant]]
+name = "UPSTREAM_GONE"
+value = 1
+[[constant]]
+name = "UPSTREAM_COUNTS_VALID"
+value = 2
+[[constant]]
+name = "UPSTREAM_FLAGS"
+value = 3
+[[constant]]
+name = "ENTITY_PATCH_BODY"
+value = 1
+[[constant]]
+name = "ENTITY_PATCH_EXTENSIONS"
+value = 2
+[[constant]]
+name = "ENTITY_PATCH_FIELDS"
+value = 3
+
+[[constant]]
+name = "FETCH_PRUNE"
+value = 1
+[[constant]]
+name = "FETCH_NO_TAGS"
+value = 2
+[[constant]]
+name = "FETCH_ANCHOR"
+value = 4
+[[constant]]
+name = "FETCH_FLAGS"
+value = 7
+
+[[constant]]
+name = "FETCH_REF_FORCED"
+value = 1
+[[constant]]
+name = "FETCH_REF_PRUNED"
+value = 2
+[[constant]]
+name = "FETCH_REF_NEW"
+value = 4
+[[constant]]
+name = "FETCH_REF_TAG_UPDATE"
+value = 8
+[[constant]]
+name = "FETCH_REF_FLAGS"
+value = 15
+
+[[constant]]
+name = "PROGRESS_CONNECTING"
+value = 0
+[[constant]]
+name = "PROGRESS_NEGOTIATING"
+value = 1
+[[constant]]
+name = "PROGRESS_RECEIVING"
+value = 2
+[[constant]]
+name = "PROGRESS_RESOLVING"
+value = 3
+[[constant]]
+name = "PROGRESS_UPDATE_REFS"
+value = 4
+[[constant]]
+name = "PROGRESS_TOTAL_KNOWN"
+value = 1
+[[constant]]
+name = "PROGRESS_DONE"
+value = 2
+[[constant]]
+name = "PROGRESS_FLAGS"
+value = 3
+
+[[constant]]
+name = "CLOSED_CLIENT_REQUEST"
+value = 0
+[[constant]]
+name = "CLOSED_REPOSITORY_GONE"
+value = 1
+[[constant]]
+name = "CLOSED_PERMISSION_LOST"
+value = 2
+[[constant]]
+name = "CLOSED_BACKEND_FAILED"
+value = 3
+[[constant]]
+name = "CLOSED_RESOURCE_LIMIT"
+value = 4
+
+[[constant]]
+name = "QUERY_CONTENT_KIND"
+value = 0
+[[constant]]
+name = "BLOB_CONTENT_KIND"
+value = 1
+[[constant]]
+name = "PATCH_CONTENT_KIND"
+value = 2
+
+[[constant]]
+name = "MAX_REPOSITORIES_PER_SESSION"
+value = 64
+[[constant]]
+name = "MAX_WATCHES_PER_REPOSITORY"
+value = 32
+[[constant]]
+name = "MAX_WATCHED_QUERIES_PER_REPOSITORY"
+value = 16
+[[constant]]
+name = "MAX_QUERY_RECORDS"
+value = 4096
+[[constant]]
+name = "MAX_QUERY_BYTES"
+value = 4194304
+[[constant]]
+name = "MAX_CURSOR_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_SPEC_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_PATH_BYTES"
+value = 65535
+[[constant]]
+name = "MAX_INLINE_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_REMOTE_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_REFSPECS"
+value = 256
+[[constant]]
+name = "MAX_REF_PREFIXES"
+value = 64
+[[constant]]
+name = "MAX_QUERY_ENDPOINTS"
+value = 256
+[[constant]]
+name = "MAX_PROGRESS_MESSAGE_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_CONCURRENT_QUERIES"
+value = 8
+[[constant]]
+name = "MAX_CONCURRENT_FETCHES"
+value = 4
+[[constant]]
+name = "MAX_COMMIT_PARENTS"
+value = 256
+[[constant]]
+name = "MAX_IDENTITY_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_SUMMARY_BYTES"
+value = 65535
+[[constant]]
+name = "MAX_MESSAGE_BYTES"
+value = 4194304
+[[constant]]
+name = "MAX_PATCH_SPANS"
+value = 4096
+
+[[constant]]
+name = "LIMIT_MAX_REPOSITORIES_PER_SESSION"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_WATCHES_PER_REPOSITORY"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_WATCHED_QUERIES_PER_REPOSITORY"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_QUERY_RECORDS"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_QUERY_BYTES"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_CURSOR_BYTES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_SPEC_BYTES"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_INLINE_BYTES"
+value = 8
+[[constant]]
+name = "LIMIT_MAX_CONCURRENT_QUERIES"
+value = 9
+[[constant]]
+name = "LIMIT_MAX_CONCURRENT_FETCHES"
+value = 10

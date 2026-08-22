@@ -1,0 +1,11 @@
+[package]
+name = "yas-terminal-model"
+version = "0.1.0"
+edition.workspace = true
+description = "Protocol-neutral terminal frame model for YAS"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+unicode-width = "0.2"

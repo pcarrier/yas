@@ -1,0 +1,106 @@
+schema = 1
+family = "yas.transfer"
+
+[[constant]]
+name = "MODE_BYTE"
+value = 0
+
+[[constant]]
+name = "MODE_MESSAGE"
+value = 1
+
+[[constant]]
+name = "DIRECTION_RECEIVER_TO_SENDER"
+value = 1
+
+[[constant]]
+name = "DIRECTION_SENDER_TO_RECEIVER"
+value = 2
+
+[[constant]]
+name = "MESSAGE_START"
+value = 1
+
+[[constant]]
+name = "MESSAGE_END"
+value = 2
+
+[[constant]]
+name = "MAX_OPEN_MESSAGES_EXTENSION"
+value = 1
+[[constant]]
+name = "SENSITIVE_CONTENT_EXTENSION"
+value = 2
+[[constant]]
+name = "UPLOAD_STAGE_EXTENSION"
+value = 3
+[[constant]]
+name = "MAX_UPLOAD_STAGE_LIFETIME_NS"
+value = 3600000000000
+[[constant]]
+name = "DELIVERY_INLINE"
+value = 0
+[[constant]]
+name = "DELIVERY_TRANSFER"
+value = 1
+
+[[event]]
+name = "BYTE_DATA"
+kind = 0x0000
+direction = "bidirectional"
+sensitive = "allowed"
+compression = "forbidden"
+datagram = "forbidden"
+layout = "transfer_id:u32,offset:u64,data:remaining"
+
+[[event]]
+name = "MESSAGE_DATA"
+kind = 0x0001
+direction = "bidirectional"
+sensitive = "allowed"
+compression = "forbidden"
+datagram = "forbidden"
+layout = "transfer_id:u32,sequence:u64,fragment_offset:u64,flags:u8,reserved:[u8;3]=0,nonempty data:remaining"
+
+[[event]]
+name = "CREDIT"
+kind = 0x0002
+direction = "bidirectional"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "transfer_id:u32,cumulative_limit:u64"
+
+[[event]]
+name = "CLOSE"
+kind = 0x0003
+direction = "bidirectional"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "transfer_id:u32,final_data_bytes:u64,status:u16,reserved:u16=0,detail:bytes_u32"
+
+[[event]]
+name = "RESET"
+kind = 0x0004
+direction = "bidirectional"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "transfer_id:u32,status:u16,reserved:u16=0,detail:bytes_u32"
+
+[[type]]
+name = "descriptor"
+layout = "transfer_id:u32,mode:u8,direction:u8,flags:u16,receiver_send_credit:u64,sender_send_credit:u64,max_item_bytes:u64,max_chunk_bytes:u32,content_family:u16,content_kind:u16,content_version:u16,Extensions"
+[[type]]
+name = "message_limits_extension"
+layout = "tag 1 max_open_messages:u32,nonzero,default 1"
+[[type]]
+name = "sensitive_content_extension"
+layout = "required tag 2 with an empty value; DATA, MESSAGE_DATA, CLOSE, and RESET for the descriptor require the SENSITIVE frame flag"
+[[type]]
+name = "upload_stage_extension"
+layout = "required tag 3 value staging_handle:u64,expires_server_ns:u64; the handle is scoped by the descriptor content_family; only on a sensitive receiver-to-sender BYTE upload descriptor; before the family commit succeeds, RESET of any descriptor atomically discards the entire stage and retires every sibling descriptor with the same content_family and staging handle; expiry or owning-session loss performs the same discard; CLOSE only seals one descriptor and never commits or discards the stage; expiry is nonzero and no more than 3600000000000 ns after descriptor creation"
+[[type]]
+name = "inline_or_transfer"
+layout = "delivery:u8,reserved:[u8;3]=0,byte_len:u64,content_hash:[u8;32],inline data:bytes_u32 or TransferDescriptor"

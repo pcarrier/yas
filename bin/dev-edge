@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if (( $# != 1 )); then
+  echo "usage: bin/dev-edge PORT" >&2
+  exit 2
+fi
+
+runtime="/run/user/$(id -u)"
+unset YAS_SOCK TMPDIR
+if [[ -d "$runtime" ]]; then
+  export XDG_RUNTIME_DIR="$runtime"
+else
+  unset XDG_RUNTIME_DIR
+fi
+
+export YAS_ADDR="${YAS_DEV_EDGE_HOST:-127.0.0.1}:$1"
+export YAS_PASSPHRASE="${YAS_PASSPHRASE:-dev}"
+exec ./target/profiling/yas edge

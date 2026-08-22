@@ -1,0 +1,17 @@
+[package]
+name = "yas-ext-systemd"
+description = "Live systemd system and user unit state, on a YAS native channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# The published object is `systemd.wasm`; the crate name only matters to cargo.
+[[bin]]
+name = "systemd"
+path = "src/main.rs"
+
+[dependencies]
+yas-guest.workspace = true
+yas-wire.workspace = true

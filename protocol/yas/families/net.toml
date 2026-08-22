@@ -1,0 +1,254 @@
+schema = 1
+family = "yas.net"
+
+limits = [
+  { name = "MAX_HOST_BYTES", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 255 },
+  { name = "MAX_LOCAL_ADDRESS_BYTES", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_PIPE_NAME_BYTES", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_ALPN_PROTOCOLS", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_ALPN_BYTES", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 255 },
+  { name = "MAX_EARLY_DATA_BYTES", tag = 6, type = "u32", required = true, hard_min = 0, hard_max = 16384 },
+  { name = "MAX_FLOWS_PER_SESSION", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_PENDING_OPENS", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 32 },
+  { name = "MAX_BUFFERED_PER_FLOW", tag = 9, type = "u64", required = true, hard_min = 1, hard_max = 8388608 },
+  { name = "MAX_DATAGRAM_PAYLOAD", tag = 10, type = "u32", required = true, hard_min = 1, hard_max = 65507 },
+  { name = "MAX_DATAGRAM_QUEUE", tag = 11, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "CONNECT_TIMEOUT_NS", tag = 12, type = "u64", required = true, hard_min = 1, hard_max = 10000000000 },
+  { name = "MAX_MUTATION_REPLAYS", tag = 13, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+]
+
+[[constant]]
+name = "ADDRESS_TCP"
+value = 0
+[[constant]]
+name = "ADDRESS_UDP"
+value = 1
+[[constant]]
+name = "ADDRESS_UNIX_STREAM"
+value = 2
+[[constant]]
+name = "ADDRESS_UNIX_DATAGRAM"
+value = 3
+[[constant]]
+name = "ADDRESS_UNIX_SEQPACKET"
+value = 4
+[[constant]]
+name = "ADDRESS_WINDOWS_PIPE"
+value = 5
+
+[[constant]]
+name = "UNIX_FILESYSTEM"
+value = 0
+[[constant]]
+name = "UNIX_ABSTRACT"
+value = 1
+
+[[constant]]
+name = "PIPE_MODE_AUTO"
+value = 0
+[[constant]]
+name = "PIPE_MODE_BYTE"
+value = 1
+[[constant]]
+name = "PIPE_MODE_MESSAGE"
+value = 2
+
+[[constant]]
+name = "TLS_VERIFY_STRICT"
+value = 0
+[[constant]]
+name = "TLS_VERIFY_INSECURE"
+value = 1
+
+[[constant]]
+name = "DELIVERY_NOT_APPLICABLE"
+value = 0
+[[constant]]
+name = "DELIVERY_NATIVE_DATAGRAM"
+value = 1
+[[constant]]
+name = "DELIVERY_RELIABLE_TUNNEL"
+value = 2
+
+[[constant]]
+name = "DELIVERY_NATIVE_REQUIRED"
+value = 0
+[[constant]]
+name = "DELIVERY_PREFER_NATIVE"
+value = 1
+[[constant]]
+name = "DELIVERY_REQUIRE_RELIABLE_TUNNEL"
+value = 2
+[[constant]]
+name = "DELIVERY_PREFERENCE_NOT_APPLICABLE"
+value = 255
+
+[[constant]]
+name = "DROP_OLDEST"
+value = 0
+[[constant]]
+name = "DROP_LATEST"
+value = 1
+[[constant]]
+name = "DROP_NOT_APPLICABLE"
+value = 255
+
+[[constant]]
+name = "MODE_BYTE"
+value = 0
+[[constant]]
+name = "MODE_MESSAGE"
+value = 1
+[[constant]]
+name = "MODE_DATAGRAM"
+value = 2
+
+[[constant]]
+name = "DIRECTION_CLIENT_TO_PEER"
+value = 1
+[[constant]]
+name = "DIRECTION_PEER_TO_CLIENT"
+value = 2
+[[constant]]
+name = "DIRECTION_DUPLEX"
+value = 3
+
+[[constant]]
+name = "DATAGRAM_STATS_FINAL"
+value = 1
+
+[[constant]]
+name = "FLOW_CONTENT_KIND"
+value = 0
+
+[[constant]]
+name = "MAX_HOST_BYTES"
+value = 255
+[[constant]]
+name = "MAX_LOCAL_ADDRESS_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_PIPE_NAME_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_ALPN_PROTOCOLS"
+value = 16
+[[constant]]
+name = "MAX_ALPN_BYTES"
+value = 255
+[[constant]]
+name = "MAX_EARLY_DATA_BYTES"
+value = 16384
+[[constant]]
+name = "MAX_FLOWS_PER_SESSION"
+value = 256
+[[constant]]
+name = "MAX_PENDING_OPENS"
+value = 32
+[[constant]]
+name = "MAX_BUFFERED_PER_FLOW"
+value = 8388608
+[[constant]]
+name = "MAX_DATAGRAM_PAYLOAD"
+value = 65507
+[[constant]]
+name = "MAX_DATAGRAM_QUEUE"
+value = 256
+[[constant]]
+name = "CONNECT_TIMEOUT_NS"
+value = 10000000000
+
+[[constant]]
+name = "LIMIT_MAX_HOST_BYTES"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_LOCAL_ADDRESS_BYTES"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_PIPE_NAME_BYTES"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_ALPN_PROTOCOLS"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_ALPN_BYTES"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_EARLY_DATA_BYTES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_FLOWS_PER_SESSION"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_PENDING_OPENS"
+value = 8
+[[constant]]
+name = "LIMIT_MAX_BUFFERED_PER_FLOW"
+value = 9
+[[constant]]
+name = "LIMIT_MAX_DATAGRAM_PAYLOAD"
+value = 10
+[[constant]]
+name = "LIMIT_MAX_DATAGRAM_QUEUE"
+value = 11
+[[constant]]
+name = "LIMIT_CONNECT_TIMEOUT_NS"
+value = 12
+[[constant]]
+name = "MAX_MUTATION_REPLAYS"
+value = 65536
+[[constant]]
+name = "LIMIT_MAX_MUTATION_REPLAYS"
+value = 13
+
+[[request]]
+name = "OPEN"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],address:bytes_u32 containing NetAddress,delivery_preference:u8,drop_policy:u8,reserved:u16=0,initial_receive_credit:u64,early_data:bytes_u32,tls_options:bytes_u32 containing zero or TlsOptions,Extensions; ResultPrefix + NetEndpoint"
+
+[[request]]
+name = "CLOSE"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "flow_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix"
+
+[[event]]
+name = "DATAGRAM"
+kind = 0x0000
+direction = "bidirectional"
+sensitive = "required"
+compression = "forbidden"
+datagram = "net_native_flow"
+layout = "flow_handle:u64,sequence:u64,payload:remaining"
+
+[[event]]
+name = "DATAGRAM_STATS"
+kind = 0x0001
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "flow_handle:u64,revision:u64,flags:u16,reserved:u16=0,client_to_peer_delivered:u64,peer_to_client_delivered:u64,client_oversized_drops:u64,peer_oversized_drops:u64,client_congestive_drops:u64,peer_congestive_drops:u64,transport_errors:u64,Extensions"
+
+[[type]]
+name = "net_address"
+layout = "kind:u8,reserved:[u8;3]=0; TCP/UDP host:string_u16,port:u16,reserved:u16=0; Unix kind:u8,reserved:[u8;3]=0,name:bytes_u32; Windows pipe requested_mode:u8,reserved:[u8;3]=0,name:string_u16"
+
+[[type]]
+name = "tls_options"
+layout = "verification:u8,reserved:[u8;3]=0,sni:string_u16,alpn_count:u16,reserved:u16=0,repeated protocol:bytes_u16,Extensions"
+
+[[type]]
+name = "net_endpoint"
+layout = "flow_handle:u64,mode:u8,direction:u8,selected_delivery:u8,reserved:u8=0,max_datagram_payload:u32,server_instance_limit:u32,max_message_bytes:u64,local_address:bytes_u32 containing zero or NetAddress,peer_address:bytes_u32 containing NetAddress,negotiated_alpn:bytes_u16,descriptor:bytes_u32 containing zero or sensitive bidirectional TransferDescriptor,Extensions"
+
+[[type]]
+name = "family_limits"
+layout = "extension tags 1 max_host_bytes:u32,2 max_local_address_bytes:u32,3 max_pipe_name_bytes:u32,4 max_alpn_protocols:u32,5 max_alpn_bytes:u32,6 max_early_data_bytes:u32,7 max_flows_per_session:u32,8 max_pending_opens:u32,9 max_buffered_per_flow:u64,10 max_datagram_payload:u32,11 max_datagram_queue:u32,12 connect_timeout_ns:u64"

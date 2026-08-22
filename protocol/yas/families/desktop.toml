@@ -1,0 +1,280 @@
+schema = 1
+family = "yas.desktop"
+
+limits = [
+  { name = "MAX_TRAY_ITEMS", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_NOTIFICATIONS", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_MENU_NODES", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_NOTIFICATION_ACTIONS", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_INLINE_MENU_BYTES", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_INLINE_ASSET_BYTES", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+]
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; optional extension tag 1 contains datasets:u8 (bit0 tray, bit1 notifications), absent defaults to both; ResultPrefix + StateWatchResult"
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+[[request]]
+name = "GET_MENU"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "tray_handle:u64,tray_revision:u64,menu_revision:u64,initial_receive_credit:u64,Extensions; ResultPrefix + InlineOrTransfer"
+[[request]]
+name = "TRAY_ACTION"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "tray_handle:u64,tray_revision:u64,menu_revision:u64,operation_id:[u8;16],action_kind:u8,flags:u8,reserved:u16=0,value:i32,item_handle:u64,Extensions; ResultPrefix; MENU_ITEM requires nonzero menu_revision and item_handle; all other kinds require both zero; only SCROLL accepts flags/value and value is nonzero"
+[[request]]
+name = "NOTIFICATION_ACTION"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "notification_handle:u64,revision:u64,action_kind:u8,reserved:[u8;3]=0,action_handle:u64,operation_id:[u8;16],reply:string_u32,Extensions; ResultPrefix; action_handle is nonzero iff ACTION and reply is valid only for ACTION"
+[[request]]
+name = "FETCH_ASSET"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "content_hash:[u8;32],initial_receive_credit:u64,Extensions; ResultPrefix + InlineOrTransfer"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<DesktopRecord>"
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[constant]]
+name = "WATCH_TRAY"
+value = 1
+[[constant]]
+name = "WATCH_NOTIFICATIONS"
+value = 2
+[[constant]]
+name = "RECORD_TRAY"
+value = 16
+[[constant]]
+name = "RECORD_NOTIFICATION"
+value = 17
+[[constant]]
+name = "WATCH_DATASET_EXTENSION"
+value = 1
+[[constant]]
+name = "NOTIFICATION_IMAGE_HASH_EXTENSION"
+value = 1
+[[constant]]
+name = "NOTIFICATION_APPLICATION_ICON_HASH_EXTENSION"
+value = 2
+[[constant]]
+name = "NOTIFICATION_PROGRESS_EXTENSION"
+value = 3
+[[constant]]
+name = "NOTIFICATION_REPLY_EXTENSION"
+value = 4
+[[constant]]
+name = "ASSET_CONTENT_KIND"
+value = 1
+[[constant]]
+name = "MAX_INLINE_ASSET_BYTES"
+value = 32768
+[[constant]]
+name = "MENU_CONTENT_KIND"
+value = 0
+[[constant]]
+name = "MAX_INLINE_MENU_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_MENU_NODES"
+value = 4096
+[[constant]]
+name = "MAX_NOTIFICATION_ACTIONS"
+value = 256
+[[constant]]
+name = "MAX_TRAY_ITEMS"
+value = 1024
+[[constant]]
+name = "MAX_NOTIFICATIONS"
+value = 4096
+[[constant]]
+name = "LIMIT_MAX_TRAY_ITEMS"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_NOTIFICATIONS"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_MENU_NODES"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_NOTIFICATION_ACTIONS"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_INLINE_MENU_BYTES"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_INLINE_ASSET_BYTES"
+value = 6
+
+[[constant]]
+name = "TRAY_ACTION_ACTIVATE"
+value = 0
+[[constant]]
+name = "TRAY_ACTION_SECONDARY_ACTIVATE"
+value = 1
+[[constant]]
+name = "TRAY_ACTION_SCROLL"
+value = 2
+[[constant]]
+name = "TRAY_ACTION_MENU_ITEM"
+value = 3
+[[constant]]
+name = "TRAY_ACTION_SCROLL_HORIZONTAL"
+value = 1
+[[constant]]
+name = "TRAY_ACTION_FLAGS_MASK"
+value = 1
+
+[[constant]]
+name = "NOTIFICATION_ACTION_DEFAULT"
+value = 0
+[[constant]]
+name = "NOTIFICATION_ACTION_ACTION"
+value = 1
+[[constant]]
+name = "NOTIFICATION_ACTION_DISMISS"
+value = 2
+
+[[constant]]
+name = "TRAY_STATUS_PASSIVE"
+value = 0
+[[constant]]
+name = "TRAY_STATUS_ACTIVE"
+value = 1
+[[constant]]
+name = "TRAY_STATUS_NEEDS_ATTENTION"
+value = 2
+[[constant]]
+name = "NOTIFICATION_URGENCY_LOW"
+value = 0
+[[constant]]
+name = "NOTIFICATION_URGENCY_NORMAL"
+value = 1
+[[constant]]
+name = "NOTIFICATION_URGENCY_CRITICAL"
+value = 2
+[[constant]]
+name = "NOTIFICATION_RESIDENT"
+value = 1
+[[constant]]
+name = "NOTIFICATION_TRANSIENT"
+value = 2
+[[constant]]
+name = "NOTIFICATION_HAS_REPLY"
+value = 4
+[[constant]]
+name = "NOTIFICATION_HAS_PROGRESS"
+value = 8
+[[constant]]
+name = "NOTIFICATION_FLAGS_MASK"
+value = 15
+[[constant]]
+name = "NOTIFICATION_CLOSED_EXPIRED"
+value = 1
+[[constant]]
+name = "NOTIFICATION_CLOSED_DISMISSED"
+value = 2
+[[constant]]
+name = "NOTIFICATION_CLOSED_BY_CALLER"
+value = 3
+[[constant]]
+name = "NOTIFICATION_CLOSED_UNDEFINED"
+value = 4
+[[constant]]
+name = "MENU_NODE_ROOT"
+value = 0
+[[constant]]
+name = "MENU_NODE_ITEM"
+value = 1
+[[constant]]
+name = "MENU_NODE_SEPARATOR"
+value = 2
+[[constant]]
+name = "MENU_NODE_SUBMENU"
+value = 3
+[[constant]]
+name = "MENU_ENABLED"
+value = 1
+[[constant]]
+name = "MENU_CHECKED"
+value = 2
+[[constant]]
+name = "MENU_RADIO"
+value = 4
+[[constant]]
+name = "MENU_VISIBLE"
+value = 8
+[[constant]]
+name = "MENU_FLAGS_MASK"
+value = 15
+
+[[type]]
+name = "tray_record"
+layout = "tray_handle:u64,revision:u64,menu_revision:u64,status:u8,reserved:[u8;3]=0,title:string_u16,icon_hash:[u8;32],Extensions"
+[[type]]
+name = "notification_record"
+layout = "notification_handle:u64,revision:u64,flags:u16,urgency:u8,reserved:u8=0,expires_server_ns:u64,application:string_u16,summary:string_u16,body:string_u32,action_count:u16,repeated action_handle:u64,label:string_u16,Extensions; extension tag 1 content_image_hash:[u8;32], tag 2 application_icon_hash:[u8;32], tag 3 notification_progress, tag 4 notification_reply; HAS_PROGRESS/HAS_REPLY flags are set iff their extensions are present"
+[[type]]
+name = "state_entity_body"
+layout = "entity_kind:u16,reserved:u16=0; ADD/REPLACE complete tray_record or notification_record; PATCH entity handle:u64,revision:u64,Extensions, with notification tags 1..4 using their complete codecs and a zero-byte value clearing that field; REMOVE tray handle:u64,revision:u64; REMOVE notification handle:u64,revision:u64,close_reason:u8,reserved:[u8;3]=0"
+[[type]]
+name = "notification_progress"
+layout = "value:u32,maximum:u32; maximum is nonzero and value <= maximum"
+[[type]]
+name = "notification_reply"
+layout = "placeholder:string_u16"
+[[type]]
+name = "notification_close_reason"
+layout = "u8: EXPIRED=1, DISMISSED=2, CLOSED_BY_CALLER=3, UNDEFINED=4"
+[[type]]
+name = "watch_datasets"
+layout = "StateWatch extension tag 1 value datasets:u8 where bit0 tray, bit1 notifications; absent defaults to both"
+[[type]]
+name = "menu_tree"
+layout = "tray_handle:u64,tray_revision:u64,menu_revision:u64,node_count:u32,repeated node:bytes_u32,Extensions; nodes preorder and parent-before-child"
+[[type]]
+name = "menu_node"
+layout = "node_handle:u64,parent_handle:u64,kind:u8,flags:u8,reserved:u16=0,position:u32,action_handle:u64,label:string_u16,shortcut:string_u16,icon_hash:[u8;32],Extensions"
+[[type]]
+name = "family_limits"
+layout = "ordered optional extensions: tags 1..6 encode max tray items:u32,notifications:u32,menu nodes:u32,notification actions:u32,inline menu bytes:u32,inline asset bytes:u32; all tags are present in a selected family descriptor"

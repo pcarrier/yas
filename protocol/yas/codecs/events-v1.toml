@@ -1,0 +1,16 @@
+schema = 1
+name = "events-v1"
+const_name = "EVENTS_CODEC_V1"
+family = "yas.events"
+id = 1
+version = 1
+direction = "server_to_client"
+layout = "first_sequence:u64,record_count:u16,reserved:u16=0,repeated record_len:u32 then sequence:u64,monotonic_ns:u64,event_id:u32,record_flags:u16,event_flags:u16,payload:remaining-within-record. Records are nonempty, sequence-consecutive, and event_id is from the generated Events catalog. Record flag bit0 is REQUIRED; event_flags preserves the stable event-specific u16 flags unchanged. Unknown optional event IDs are skipped; unknown required IDs fail the batch."
+golden_hex = "0100000000000000010000001c000000010000000000000002000000000000000300000000000000"
+
+[[constant]]
+name = "RECORD_REQUIRED"
+value = 1
+[[constant]]
+name = "RECORD_FLAGS_MASK"
+value = 1

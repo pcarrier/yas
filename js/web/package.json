@@ -1,0 +1,32 @@
+{
+  "name": "yas-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "bun run scripts/check-native-replay.ts",
+    "test:replay": "bun run scripts/check-native-replay.ts"
+  },
+  "dependencies": {
+    "@yas-run/core": "workspace:*",
+    "@yas-run/ui": "workspace:*",
+    "solid-js": "^1.9.13",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@yas-run/browser": "file:../../crates/browser/pkg",
+    "@fontsource/fira-code": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@fontsource/source-code-pro": "^5.3.0",
+    "@lezer/generator": "^1.8.0",
+    "@tailwindcss/vite": "^4.3.0",
+    "tailwindcss": "^4.3.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vite-plugin-solid": "^2.11.12"
+  }
+}

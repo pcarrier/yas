@@ -1,0 +1,51 @@
+export {
+  leafCount,
+  validateLayoutNode,
+  validateWorkspaceLayout,
+  sameLayoutTree,
+  LAYOUT_MAX_DEPTH,
+  LAYOUT_MAX_PANES,
+} from "./model";
+export type {
+  LayoutNode,
+  LayoutSplit,
+  LayoutChild,
+  LayoutLeaf,
+  LayoutRect,
+  LayoutDirection,
+} from "./model";
+
+export {
+  enumeratePanes,
+  cascadeRect,
+  clampRect,
+  withChild,
+  assignSessionsToPanes,
+  carryAssignmentsToPanes,
+  buildCandidateOrder,
+  assignmentsAfterDrop,
+  reconcileAssignments,
+  adjustWeights,
+  surfaceAssignment,
+  isSurfaceAssignment,
+  parseSurfaceAssignment,
+  editorAssignment,
+  previewAssignment,
+  diffAssignment,
+  parseDiffArg,
+  commitAssignment,
+  manageAssignment,
+  isTileAssignment,
+  parseTileAssignment,
+  webAssignment,
+  isWebAssignment,
+  parseWebAssignment,
+  isContentAssignment,
+} from "./tree";
+export type {
+  WorkspaceLayout,
+  LayoutPane,
+  LayoutAssignments,
+  TileAssignment,
+  DiffSide,
+} from "./tree";

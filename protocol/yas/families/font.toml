@@ -1,0 +1,210 @@
+schema = 1
+family = "yas.font"
+
+limits = [
+  { name = "MAX_FAMILIES", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 65535 },
+  { name = "MAX_FACES_PER_FAMILY", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 65535 },
+  { name = "MAX_DESCRIPTION_BYTES", tag = 3, type = "u64", required = true, hard_min = 1, hard_max = 67108864 },
+  { name = "MAX_FACE_BYTES", tag = 4, type = "u64", required = true, hard_min = 1, hard_max = 67108864 },
+  { name = "MAX_CONCURRENT_FETCHES", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_SCAN_DURATION_NS", tag = 6, type = "u64", required = true, hard_min = 1, hard_max = 300000000000 },
+  { name = "REFRESH_INTERVAL_NS", tag = 7, type = "u64", required = true, hard_min = 0, hard_max = 86400000000000 },
+]
+
+[[constant]]
+name = "FAMILY_MONOSPACE"
+value = 1
+
+[[constant]]
+name = "FAMILY_VARIABLE"
+value = 2
+
+[[constant]]
+name = "FAMILY_COLOR"
+value = 4
+
+[[constant]]
+name = "FAMILY_FETCHABLE"
+value = 8
+
+[[constant]]
+name = "DELIVERY_INLINE"
+value = 0
+
+[[constant]]
+name = "DELIVERY_TRANSFER"
+value = 1
+
+[[constant]]
+name = "FORMAT_SFNT_TRUETYPE"
+value = 0
+
+[[constant]]
+name = "FORMAT_SFNT_CFF"
+value = 1
+
+[[constant]]
+name = "FORMAT_WOFF"
+value = 2
+
+[[constant]]
+name = "FORMAT_WOFF2"
+value = 3
+
+[[constant]]
+name = "STYLE_NORMAL"
+value = 0
+
+[[constant]]
+name = "STYLE_ITALIC"
+value = 1
+
+[[constant]]
+name = "STYLE_OBLIQUE"
+value = 2
+
+[[constant]]
+name = "FACE_VARIABLE"
+value = 1
+
+[[constant]]
+name = "FACE_COLOR"
+value = 2
+
+[[constant]]
+name = "FACE_FETCHABLE"
+value = 4
+
+[[constant]]
+name = "DESCRIPTION_CONTENT_KIND"
+value = 0
+
+[[constant]]
+name = "FACE_BYTES_CONTENT_KIND"
+value = 1
+
+[[constant]]
+name = "MAX_FAMILIES"
+value = 65535
+
+[[constant]]
+name = "MAX_FACES_PER_FAMILY"
+value = 65535
+
+[[constant]]
+name = "MAX_DESCRIPTION_BYTES"
+value = 67108864
+
+[[constant]]
+name = "MAX_FACE_BYTES"
+value = 67108864
+
+[[constant]]
+name = "MAX_CONCURRENT_FETCHES"
+value = 1024
+
+[[constant]]
+name = "MAX_SCAN_DURATION_NS"
+value = 300000000000
+
+[[constant]]
+name = "MAX_REFRESH_INTERVAL_NS"
+value = 86400000000000
+
+[[constant]]
+name = "LIMIT_MAX_FAMILIES"
+value = 1
+
+[[constant]]
+name = "LIMIT_MAX_FACES_PER_FAMILY"
+value = 2
+
+[[constant]]
+name = "LIMIT_MAX_DESCRIPTION_BYTES"
+value = 3
+
+[[constant]]
+name = "LIMIT_MAX_FACE_BYTES"
+value = 4
+
+[[constant]]
+name = "LIMIT_MAX_CONCURRENT_FETCHES"
+value = 5
+
+[[constant]]
+name = "LIMIT_MAX_SCAN_DURATION_NS"
+value = 6
+
+[[constant]]
+name = "LIMIT_REFRESH_INTERVAL_NS"
+value = 7
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+
+[[request]]
+name = "DESCRIBE"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "font_handle:u64,generation:u64,initial_receive_credit:u64,Extensions; ResultPrefix + DescribeResult"
+
+[[request]]
+name = "FETCH"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "face_handle:u64,expected_content_hash:[u8;32],initial_receive_credit:u64,Extensions; ResultPrefix + FetchResult"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<FontFamilyRecord>"
+
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[type]]
+name = "family_record"
+layout = "font_handle:u64,generation:u64,flags:u16,face_count:u16,family:string_u16,display:string_u16,Extensions"
+
+[[type]]
+name = "description"
+layout = "family:string_u16,face_count:u16,repeated face_record:bytes_u32,Extensions"
+
+[[type]]
+name = "face_record"
+layout = "face_handle:u64,content_hash:[u8;32],byte_len:u64,format:u8,style:u8,face_flags:u16,weight_range:[u16;3],stretch_range:[u16;3],slant:i16,units_per_em:u16,metrics:[i32;4],subfamily:string_u16,postscript:string_u16,Extensions"
+
+[[type]]
+name = "family_limits"
+layout = "extension tags 1 max_families:u32,2 max_faces_per_family:u32,3 max_description_bytes:u64,4 max_face_bytes:u64,5 max_concurrent_fetches:u32,6 max_scan_duration_ns:u64,7 refresh_interval_ns:u64"

@@ -1,0 +1,812 @@
+schema = 1
+family = "yas.terminal"
+
+limits = [
+  { name = "MAX_TERMINALS_PER_SESSION", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 65535 },
+  { name = "MAX_VIEWS_PER_SESSION", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_VIEW_ROWS", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_VIEW_COLS", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_INPUT_BYTES", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 16384 },
+  { name = "MAX_INLINE_QUERY_BYTES", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_QUERY_RECORDS", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_HYPERLINK_URI_BYTES", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+]
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+[[request]]
+name = "CREATE"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "rows:u16,cols:u16,reserved:u32=0,operation_id:[u8;16],launch:bytes_u32,Extensions; ResultPrefix + CreateResult"
+[[request]]
+name = "RESTART"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,operation_id:[u8;16],launch_mode:u8,cutover_mode:u8,reserved:u16=0,optional launch:bytes_u32,Extensions; ResultPrefix + RestartResult"
+[[request]]
+name = "SIGNAL"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,operation_id:[u8;16],signal:u16,reserved:u16=0,Extensions; ResultPrefix"
+[[request]]
+name = "CLOSE"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,operation_id:[u8;16]; ResultPrefix"
+[[request]]
+name = "SET_DEADLINE"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,operation_id:[u8;16],mode:u8,reserved:[u8;7]=0,duration_ns:u64; ResultPrefix"
+[[request]]
+name = "RESIZE"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,rows:u16,cols:u16; ResultPrefix + state_revision:u64"
+[[request]]
+name = "SET_FOCUS"
+kind = 0x0008
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,focused:u8,reserved:[u8;3]=0; ResultPrefix"
+[[request]]
+name = "SCROLL"
+kind = 0x0009
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,mode:u8,reserved:[u8;7]=0,amount:i64; ResultPrefix + applied_offset:i64"
+[[request]]
+name = "OPEN_VIEW"
+kind = 0x000a
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,rows:u16,cols:u16,max_fps:u16,codec_count:u8,reserved:u8=0,repeated codec_version:u16,Extensions; ResultPrefix + OpenViewResult"
+[[request]]
+name = "CONFIGURE_VIEW"
+kind = 0x000b
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32,Extensions; ResultPrefix"
+[[request]]
+name = "RESET_VIEW"
+kind = 0x000c
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32; ResultPrefix"
+[[request]]
+name = "READ"
+kind = 0x000d
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,generation:u32,cursor_kind:u8,representation:u8,flags:u16=0,cursor_a:u64,cursor_b:u32,max_bytes:u32,initial_receive_credit:u64,Extensions; ABSOLUTE a=start oldest-relative row,b=max rows (zero through end); TAIL a=rows skipped from one-past-tail,b=max rows (zero through oldest); ResultPrefix + QueryBody"
+[[request]]
+name = "SEARCH"
+kind = 0x000e
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,generation:u32,flags:u16,reserved:u16=0,start_cursor:QueryCursor kind SEARCH_CURSOR_POSITION with a=oldest-relative row,b=column,max_results:u32,query:bytes_u32,initial_receive_credit:u64,Extensions; BACKWARD reverses traversal; result coordinates and next cursor are oldest-relative and end-exclusive; ResultPrefix + QueryBody"
+[[request]]
+name = "CWD"
+kind = 0x000f
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,generation:u32,reserved:u32=0,initial_receive_credit:u64,Extensions; ResultPrefix + QueryBody"
+[[request]]
+name = "JOURNAL"
+kind = 0x0010
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,generation:u32,flags:u16,limit:u16,from_index:u64,initial_receive_credit:u64,Extensions; without TAIL from_index is an absolute command index; with TAIL it is records skipped back from next_index; ResultPrefix + QueryBody"
+[[request]]
+name = "OUTPUT"
+kind = 0x0011
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,generation:u32,cursor_kind:u8,flags:u8=0,reserved:u16=0,cursor_a:u64,cursor_b:u32,max_bytes:u32,initial_receive_credit:u64,Extensions; COMMAND a=index,b=column; LATEST_COMMAND a=0,b=column; SEQUENCE and PROBE a=sequence,b=column; ResultPrefix + QueryBody"
+[[request]]
+name = "WAIT"
+kind = 0x0012
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,generation:u32,wait_kind:u8,flags:u8=0,reserved:u16=0,cursor_a:u64,cursor_b:u32,max_bytes:u32,timeout_ns:u64,needle:bytes_u32,initial_receive_credit:u64,Extensions; OUTPUT uses a=sequence,b=column and nonempty needle and returns OutputResult; COMMAND uses a=index,b=0 and empty needle; LATEST_COMMAND uses a=b=0 and empty needle; command waits return one-record JournalResult; ResultPrefix + QueryBody"
+[[request]]
+name = "COPY_RANGE"
+kind = 0x0013
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,generation:u32,representation:u8,reserved:[u8;3]=0,start_row:i64,start_col:u32,end_row:i64,end_col:u32,max_bytes:u32,initial_receive_credit:u64,Extensions; rows are inclusive oldest-retained coordinates with negative values relative to one-past-tail, end_col is exclusive; ResultPrefix + QueryBody"
+[[request]]
+name = "CLOSE_VIEW"
+kind = 0x0014
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "view_id:u32; ResultPrefix"
+[[request]]
+name = "SEARCH_CATALOG"
+kind = 0x0015
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "max_results:u32 in 1..=MAX_QUERY_RECORDS,query:string_u32 UTF-8 <= MAX_CATALOG_SEARCH_QUERY_BYTES,Extensions; server trims query and performs a case-insensitive regex search across every terminal title, visible grid, and scrollback; invalid or empty regex returns no entries; ResultPrefix + CatalogSearchResult"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<TerminalRecord>"
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+[[event]]
+name = "WRITE"
+kind = 0x0010
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "terminal_handle:u64,data:remaining"
+[[event]]
+name = "INPUT"
+kind = 0x0011
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "ViewFeedback,data:remaining"
+[[event]]
+name = "MOUSE"
+kind = 0x0012
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "ViewFeedback,client_monotonic_ns:u64,action:u8,button:u8,modifiers:u16,column:i32,row:i32"
+[[event]]
+name = "WHEEL"
+kind = 0x0013
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "ViewFeedback,client_monotonic_ns:u64,source:u8,reserved:[u8;3]=0,dx_32_32:i64,dy_32_32:i64"
+[[event]]
+name = "WHEEL_AT"
+kind = 0x0014
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "ViewFeedback,client_monotonic_ns:u64,source:u8,reserved:[u8;3]=0,dx_32_32:i64,dy_32_32:i64,column:i32,row:i32"
+[[event]]
+name = "FRAME"
+kind = 0x0020
+direction = "server_to_client"
+sensitive = "required"
+compression = "forbidden"
+datagram = "forbidden"
+layout = "view_id:u32,frame_sequence:u32,frame_flags:u16,optional base_sequence:u32,grid_payload:remaining"
+[[event]]
+name = "FRAME_CHUNK"
+kind = 0x0021
+direction = "server_to_client"
+sensitive = "required"
+compression = "forbidden"
+datagram = "forbidden"
+layout = "view_id:u32,frame_sequence:u32,chunk_index:u16,chunk_count:u16,logical_frame_len:u32,chunk:remaining"
+[[event]]
+name = "FRAME_ACK"
+kind = 0x0022
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "ViewFeedback"
+
+[[constant]]
+name = "LIFECYCLE_RUNNING"
+value = 0
+[[constant]]
+name = "LIFECYCLE_EXITED"
+value = 1
+[[constant]]
+name = "COMMAND_DEFAULT_SHELL"
+value = 0
+[[constant]]
+name = "COMMAND_ARGV"
+value = 1
+[[constant]]
+name = "COMMAND_SHELL_COMMAND"
+value = 2
+[[constant]]
+name = "CWD_SERVER_DEFAULT"
+value = 0
+[[constant]]
+name = "CWD_PATH"
+value = 1
+[[constant]]
+name = "CWD_TERMINAL"
+value = 2
+[[constant]]
+name = "ENVIRONMENT_SERVER"
+value = 0
+[[constant]]
+name = "ENVIRONMENT_EMPTY"
+value = 1
+[[constant]]
+name = "ENVIRONMENT_SET"
+value = 0
+[[constant]]
+name = "ENVIRONMENT_REMOVE"
+value = 1
+[[constant]]
+name = "LAUNCH_REPLAY"
+value = 0
+[[constant]]
+name = "LAUNCH_REPLACE"
+value = 1
+[[constant]]
+name = "CUTOVER_STOP_THEN_START"
+value = 0
+[[constant]]
+name = "CUTOVER_START_THEN_SWITCH"
+value = 1
+[[constant]]
+name = "DEADLINE_CLEAR"
+value = 0
+[[constant]]
+name = "DEADLINE_SET"
+value = 1
+[[constant]]
+name = "SCROLL_ABSOLUTE"
+value = 0
+[[constant]]
+name = "SCROLL_RELATIVE"
+value = 1
+[[constant]]
+name = "SIGNAL_INTERRUPT"
+value = 0
+[[constant]]
+name = "SIGNAL_TERMINATE"
+value = 1
+[[constant]]
+name = "SIGNAL_KILL"
+value = 2
+[[constant]]
+name = "SIGNAL_HANGUP"
+value = 3
+[[constant]]
+name = "QUERY_INLINE"
+value = 0
+[[constant]]
+name = "QUERY_TRANSFER"
+value = 1
+[[constant]]
+name = "QUERY_CONTENT_KIND"
+value = 0
+[[constant]]
+name = "QUERY_EXTENSION_INLINE_BYTES"
+value = 1
+[[constant]]
+name = "QUERY_EXTENSION_TRANSFER"
+value = 2
+[[constant]]
+name = "QUERY_EXTENSION_NEXT_CURSOR"
+value = 3
+[[constant]]
+name = "QUERY_EXTENSION_TOTAL_LINES"
+value = 4
+[[constant]]
+name = "QUERY_EXTENSION_SATISFYING_STATE_REVISION"
+value = 5
+[[constant]]
+name = "QUERY_REPRESENTATION_PLAIN"
+value = 0
+[[constant]]
+name = "QUERY_REPRESENTATION_STYLED"
+value = 1
+[[constant]]
+name = "QUERY_REPRESENTATION_BOTH"
+value = 2
+[[constant]]
+name = "QUERY_ENCODING_UTF8"
+value = 0
+[[constant]]
+name = "QUERY_ENCODING_TERMINAL_RECORDS"
+value = 1
+[[constant]]
+name = "QUERY_ENCODING_BYTES"
+value = 2
+[[constant]]
+name = "QUERY_TRUNCATED"
+value = 1
+[[constant]]
+name = "CONTENT_TEXT"
+value = 0
+[[constant]]
+name = "CONTENT_PATH"
+value = 1
+[[constant]]
+name = "CONTENT_STYLED_LINES"
+value = 2
+[[constant]]
+name = "CONTENT_SEARCH_RESULTS"
+value = 3
+[[constant]]
+name = "CONTENT_JOURNAL"
+value = 4
+[[constant]]
+name = "CONTENT_OUTPUT"
+value = 5
+[[constant]]
+name = "CONTENT_TEXT_AND_STYLED"
+value = 6
+[[constant]]
+name = "READ_CURSOR_ABSOLUTE"
+value = 0
+[[constant]]
+name = "READ_CURSOR_TAIL"
+value = 1
+[[constant]]
+name = "READ_FLAGS"
+value = 0
+[[constant]]
+name = "SEARCH_REGEX"
+value = 1
+[[constant]]
+name = "SEARCH_CASE_SENSITIVE"
+value = 2
+[[constant]]
+name = "SEARCH_BACKWARD"
+value = 4
+[[constant]]
+name = "SEARCH_FLAGS"
+value = 7
+[[constant]]
+name = "SEARCH_CURSOR_POSITION"
+value = 0
+[[constant]]
+name = "MAX_CATALOG_SEARCH_QUERY_BYTES"
+value = 1024
+[[constant]]
+name = "MAX_CATALOG_SEARCH_CONTEXT_BYTES"
+value = 4096
+[[constant]]
+name = "CATALOG_SEARCH_TRUNCATED"
+value = 1
+[[constant]]
+name = "CATALOG_SEARCH_RESULT_FLAGS"
+value = 1
+[[constant]]
+name = "CATALOG_SEARCH_SOURCE_TITLE"
+value = 0
+[[constant]]
+name = "CATALOG_SEARCH_SOURCE_VISIBLE"
+value = 1
+[[constant]]
+name = "CATALOG_SEARCH_SOURCE_SCROLLBACK"
+value = 2
+[[constant]]
+name = "CATALOG_SEARCH_MATCH_TITLE"
+value = 1
+[[constant]]
+name = "CATALOG_SEARCH_MATCH_VISIBLE"
+value = 2
+[[constant]]
+name = "CATALOG_SEARCH_MATCH_SCROLLBACK"
+value = 4
+[[constant]]
+name = "CATALOG_SEARCH_MATCH_MASK"
+value = 7
+[[constant]]
+name = "JOURNAL_TAIL"
+value = 1
+[[constant]]
+name = "JOURNAL_REQUEST_FLAGS"
+value = 1
+[[constant]]
+name = "OUTPUT_CURSOR_COMMAND"
+value = 0
+[[constant]]
+name = "OUTPUT_CURSOR_LATEST_COMMAND"
+value = 1
+[[constant]]
+name = "OUTPUT_CURSOR_SEQUENCE"
+value = 2
+[[constant]]
+name = "OUTPUT_CURSOR_PROBE"
+value = 3
+[[constant]]
+name = "OUTPUT_REQUEST_FLAGS"
+value = 0
+[[constant]]
+name = "WAIT_OUTPUT"
+value = 0
+[[constant]]
+name = "WAIT_COMMAND"
+value = 1
+[[constant]]
+name = "WAIT_LATEST_COMMAND"
+value = 2
+[[constant]]
+name = "WAIT_FLAGS"
+value = 0
+[[constant]]
+name = "JOURNAL_RUNNING"
+value = 1
+[[constant]]
+name = "JOURNAL_HAS_EXIT"
+value = 2
+[[constant]]
+name = "JOURNAL_NO_COMMAND"
+value = 4
+[[constant]]
+name = "JOURNAL_INCOMPLETE"
+value = 8
+[[constant]]
+name = "JOURNAL_EVICTED"
+value = 16
+[[constant]]
+name = "JOURNAL_PTY_EXITED"
+value = 32
+[[constant]]
+name = "OUTPUT_TRUNCATED"
+value = 1
+[[constant]]
+name = "OUTPUT_EVICTED"
+value = 2
+[[constant]]
+name = "OUTPUT_ALT_SCREEN"
+value = 4
+[[constant]]
+name = "OUTPUT_MATCHED"
+value = 8
+[[constant]]
+name = "STATE_TITLE_EXTENSION"
+value = 1
+[[constant]]
+name = "STATE_CWD_EXTENSION"
+value = 2
+[[constant]]
+name = "STATE_COMMAND_DISPLAY_EXTENSION"
+value = 3
+[[constant]]
+name = "STATE_EXIT_EXTENSION"
+value = 4
+[[constant]]
+name = "STATE_DEADLINE_SERVER_NS_EXTENSION"
+value = 5
+[[constant]]
+name = "STATE_APP_HANDLE_EXTENSION"
+value = 6
+[[constant]]
+name = "STATE_JOURNAL_CURSOR_EXTENSION"
+value = 7
+[[constant]]
+name = "STATE_RESOURCE_TAG_EXTENSION"
+value = 8
+[[constant]]
+name = "LAUNCH_DEADLINE_AFTER_NS_EXTENSION"
+value = 1
+[[constant]]
+name = "LAUNCH_APP_HANDLE_EXTENSION"
+value = 2
+[[constant]]
+name = "CREATE_INITIAL_VIEW_EXTENSION"
+value = 1
+[[constant]]
+name = "CREATE_RESOURCE_TAG_EXTENSION"
+value = 2
+[[constant]]
+name = "CREATE_RESULT_INITIAL_VIEW_EXTENSION"
+value = 1
+[[constant]]
+name = "CONFIGURE_ROWS_EXTENSION"
+value = 1
+[[constant]]
+name = "CONFIGURE_COLS_EXTENSION"
+value = 2
+[[constant]]
+name = "CONFIGURE_MAX_FPS_EXTENSION"
+value = 3
+[[constant]]
+name = "CONFIGURE_PRESENTATION_METRICS_EXTENSION"
+value = 4
+[[constant]]
+name = "CONFIGURE_QUEUE_TARGET_EXTENSION"
+value = 5
+[[constant]]
+name = "FRAME_KEYFRAME"
+value = 1
+[[constant]]
+name = "FRAME_FINAL_STATE"
+value = 2
+[[constant]]
+name = "FRAME_DIMENSIONS"
+value = 4
+[[constant]]
+name = "FRAME_CURSOR"
+value = 8
+[[constant]]
+name = "FRAME_MODES"
+value = 16
+[[constant]]
+name = "FRAME_SCROLLBACK"
+value = 32
+[[constant]]
+name = "FRAME_VIEW_OFFSET"
+value = 64
+[[constant]]
+name = "FRAME_TITLE"
+value = 128
+[[constant]]
+name = "FRAME_COMPONENTS"
+value = 256
+[[constant]]
+name = "FRAME_CODEC_COMPRESSED"
+value = 512
+[[constant]]
+name = "FRAME_EXPLICIT_BASE"
+value = 1024
+[[constant]]
+name = "MOUSE_ACTION_MOVE"
+value = 0
+[[constant]]
+name = "MOUSE_ACTION_DOWN"
+value = 1
+[[constant]]
+name = "MOUSE_ACTION_UP"
+value = 2
+[[constant]]
+name = "MOUSE_BUTTON_NONE"
+value = 0
+[[constant]]
+name = "MOUSE_BUTTON_LEFT"
+value = 1
+[[constant]]
+name = "MOUSE_BUTTON_MIDDLE"
+value = 2
+[[constant]]
+name = "MOUSE_BUTTON_RIGHT"
+value = 3
+[[constant]]
+name = "MOUSE_BUTTON_BACK"
+value = 4
+[[constant]]
+name = "MOUSE_BUTTON_FORWARD"
+value = 5
+[[constant]]
+name = "MODIFIER_SHIFT"
+value = 1
+[[constant]]
+name = "MODIFIER_CTRL"
+value = 2
+[[constant]]
+name = "MODIFIER_ALT"
+value = 4
+[[constant]]
+name = "MODIFIER_SUPER"
+value = 8
+[[constant]]
+name = "MODIFIER_CAPS_LOCK"
+value = 16
+[[constant]]
+name = "MODIFIER_NUM_LOCK"
+value = 32
+[[constant]]
+name = "WHEEL_SOURCE_UNKNOWN"
+value = 0
+[[constant]]
+name = "WHEEL_SOURCE_WHEEL"
+value = 1
+[[constant]]
+name = "WHEEL_SOURCE_FINGER"
+value = 2
+[[constant]]
+name = "WHEEL_SOURCE_CONTINUOUS"
+value = 3
+[[constant]]
+name = "EXIT_KIND_CODE"
+value = 0
+[[constant]]
+name = "EXIT_KIND_SIGNAL"
+value = 1
+[[constant]]
+name = "EXIT_KIND_OTHER"
+value = 2
+[[constant]]
+name = "EXIT_REASON_UNKNOWN"
+value = 0
+[[constant]]
+name = "EXIT_REASON_INTERRUPT"
+value = 1
+[[constant]]
+name = "EXIT_REASON_TERMINATE"
+value = 2
+[[constant]]
+name = "EXIT_REASON_KILL"
+value = 3
+[[constant]]
+name = "EXIT_REASON_HANGUP"
+value = 4
+
+[[constant]]
+name = "MAX_TERMINALS_PER_SESSION"
+value = 65535
+[[constant]]
+name = "MAX_VIEWS_PER_SESSION"
+value = 4096
+[[constant]]
+name = "MAX_VIEW_ROWS"
+value = 4096
+[[constant]]
+name = "MAX_VIEW_COLS"
+value = 4096
+[[constant]]
+name = "MAX_INPUT_BYTES"
+value = 16384
+[[constant]]
+name = "MAX_INLINE_QUERY_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_QUERY_RECORDS"
+value = 4096
+[[constant]]
+name = "MAX_HYPERLINK_URI_BYTES"
+value = 4096
+
+[[constant]]
+name = "LIMIT_MAX_TERMINALS_PER_SESSION"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_VIEWS_PER_SESSION"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_VIEW_ROWS"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_VIEW_COLS"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_INPUT_BYTES"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_INLINE_QUERY_BYTES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_QUERY_RECORDS"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_HYPERLINK_URI_BYTES"
+value = 8
+
+[[type]]
+name = "terminal_state_record"
+layout = "terminal_handle:u64,lifecycle:u8,reserved:u8=0,rows:u16,cols:u16,generation:u32,used_rows:u32,Extensions"
+[[type]]
+name = "launch"
+layout = "command_kind:u8,cwd_kind:u8,environment_base:u8,reserved:u8=0,command_variant,cwd_variant,environment_count:u16,repeated key:bytes_u16,entry_kind:u8,value:bytes_u32,Extensions"
+[[type]]
+name = "create_result"
+layout = "terminal_handle:u64,state_revision:u64,generation:u32,reserved:u32=0,Extensions"
+[[type]]
+name = "restart_result"
+layout = "state_revision:u64,generation:u32,reserved:u32=0"
+[[type]]
+name = "open_view_result"
+layout = "view_id:u32,codec_version:u16,max_inflight_frames:u8,reserved:u8=0,max_encoded_frame:u32,max_decoded_frame:u32,first_sequence:u32,Extensions"
+[[type]]
+name = "initial_view_request"
+layout = "rows:u16,cols:u16,max_fps:u16,codec_count:u8,reserved:u8=0,repeated codec_version:u16,Extensions"
+[[type]]
+name = "view_feedback"
+layout = "view_id:u32,presented_sequence:u32,decoder_queue_depth:u8,available_frame_slots:u8"
+[[type]]
+name = "presentation_metrics"
+layout = "viewport_width_px:u32,viewport_height_px:u32,cell_width_16_16:u32,cell_height_16_16:u32,device_scale_16_16:u32"
+[[type]]
+name = "exit_record"
+layout = "kind:u8,reason:u8,reserved:u16=0,code:i32,detail:string_u32"
+[[type]]
+name = "search_results"
+layout = "count:u32,repeated start_row:u64,start_col:u32,end_row:u64,end_col:u32,preview:string_u32; rows are oldest-retained and ranges end-exclusive"
+[[type]]
+name = "catalog_search"
+layout = "max_results:u32 in 1..=MAX_QUERY_RECORDS,query:string_u32 UTF-8 <= MAX_CATALOG_SEARCH_QUERY_BYTES,Extensions"
+[[type]]
+name = "catalog_search_entry"
+layout = "terminal_handle:u64,generation:u32,score:u32,primary_source:u8,matched_sources:u8,reserved:u16=0,scroll_offset:u64 where 0 means no scrollback jump,context:string_u32 UTF-8 <= MAX_CATALOG_SEARCH_CONTEXT_BYTES; matched_sources uses CATALOG_SEARCH_MATCH_MASK and contains primary source bit"
+[[type]]
+name = "catalog_search_result"
+layout = "flags:u16 CATALOG_SEARCH_RESULT_FLAGS,reserved:u16=0,count:u32 <= MAX_QUERY_RECORDS,repeated CatalogSearchEntry,Extensions; entries rank score descending, the requester's lead terminal first on a tie, then terminal_handle ascending; a deterministic prefix is returned and TRUNCATED is set when max_results or the peer frame limit omits later entries"
+[[type]]
+name = "journal_result"
+layout = "oldest_index:u64,next_index:u64,count:u32,repeated index:u64,generation:u32,flags:u16,reserved:u16=0,exit_code:i32,start_seq:u64,end_seq:u64,started_unix_ms:u64,ended_unix_ms:u64,command:string_u32"
+[[type]]
+name = "output_result"
+layout = "generation:u32,flags:u16,reserved:u16=0,start_seq:u64,start_col:u32,next_seq:u64,next_col:u32,text:bytes_u32"
+[[type]]
+name = "styled_lines"
+layout = "line_count:u32,repeated row:i64,start_col:u32,cell_count:u32,cells:[u8;12]*cell_count,overflow_count:u32,repeated cell_offset:u32,text:string_u32,hyperlink_count:u32,repeated start_col:u32,cell_count:u32,uri:string_u16; line start_col and hyperlink columns are original absolute columns"
+[[type]]
+name = "query_body"
+layout = "delivery:u8,content_kind:u8,encoding:u8,reserved:u8=0,flags:u16,reserved:u16=0,Extensions tags 1 inline_bytes,2 sensitive TransferDescriptor,3 next_cursor,4 total_lines:u64,5 satisfying_state_revision:u64; content kind fixes encoding and next-cursor layout"
+[[type]]
+name = "query_cursor"
+layout = "kind:u8,a:u64,b:u32; READ/OUTPUT next cursor preserves the request cursor kind and exact next coordinate"
+[[type]]
+name = "query_next_cursor"
+layout = "CONTENT_TEXT/STYLED_LINES/TEXT_AND_STYLED uses QueryCursor with READ kind; CONTENT_SEARCH_RESULTS uses QueryCursor kind SEARCH_CURSOR_POSITION with a=oldest-relative row,b=column; CONTENT_OUTPUT always uses QueryCursor kind OUTPUT_CURSOR_SEQUENCE with a=next_seq,b=next_col (COMMAND/LATEST_COMMAND/PROBE normalize and SEQUENCE preserves); CONTENT_JOURNAL is next absolute command index:u64; CONTENT_PATH has no cursor"
+[[type]]
+name = "text_and_styled"
+layout = "plain:bytes_u32 UTF-8,styled:bytes_u32 containing StyledLines"
+[[type]]
+name = "family_limits"
+layout = "ordered optional extensions: tags 1..8 encode max terminals/session:u32,views/session:u32,view rows:u32,view columns:u32,input bytes:u32,inline query bytes:u32,query records:u32,hyperlink URI bytes:u32; all tags are present in a selected family descriptor"

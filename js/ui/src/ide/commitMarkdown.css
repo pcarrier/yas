@@ -1,0 +1,149 @@
+.yas-commit-markdown {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.yas-commit-markdown > :first-child,
+.yas-commit-markdown > :first-child > :first-child {
+  margin-top: 0;
+}
+
+.yas-commit-markdown > :last-child,
+.yas-commit-markdown > :last-child > :last-child {
+  margin-bottom: 0;
+}
+
+.yas-commit-markdown--subject {
+  font-weight: 700;
+}
+
+.yas-commit-markdown--subject :where(p, h1, h2, h3, h4, h5, h6) {
+  margin: 0;
+  font: inherit;
+}
+
+.yas-commit-markdown--body {
+  margin-top: 0.4em;
+}
+
+.yas-commit-markdown--body :where(p, ul, ol, blockquote, pre, table, hr) {
+  margin: 0 0 0.75em;
+}
+
+.yas-commit-markdown--body :where(h1, h2, h3, h4, h5, h6) {
+  margin: 1em 0 0.4em;
+  line-height: 1.2;
+}
+
+.yas-commit-markdown--body h1 {
+  font-size: 1.35em;
+}
+
+.yas-commit-markdown--body h2 {
+  font-size: 1.25em;
+}
+
+.yas-commit-markdown--body h3 {
+  font-size: 1.15em;
+}
+
+.yas-commit-markdown--body :where(h4, h5, h6) {
+  font-size: 1em;
+}
+
+.yas-commit-markdown :where(ul, ol) {
+  padding-left: 2em;
+}
+
+.yas-commit-markdown li + li {
+  margin-top: 0.2em;
+}
+
+.yas-commit-markdown blockquote {
+  padding-left: 0.8em;
+  border-left: 3px solid currentColor;
+  opacity: 0.8;
+}
+
+.yas-commit-markdown code {
+  padding: 0.08em 0.3em;
+  border: 1px solid rgb(127 127 127 / 25%);
+  border-radius: 3px;
+  background: rgb(127 127 127 / 12%);
+  font: inherit;
+}
+
+.yas-commit-markdown pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0.7em;
+  border: 1px solid rgb(127 127 127 / 25%);
+  border-radius: 4px;
+  background: rgb(127 127 127 / 12%);
+  white-space: pre;
+  word-break: normal;
+}
+
+.yas-commit-markdown pre code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.yas-commit-markdown a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.yas-commit-markdown img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.yas-commit-markdown .yas-mermaid {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0 0 0.75em;
+}
+
+.yas-commit-markdown .yas-mermaid svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin-inline: auto;
+}
+
+.yas-commit-markdown hr {
+  border: 0;
+  border-top: 1px solid currentColor;
+  opacity: 0.35;
+}
+
+.yas-commit-markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.yas-commit-markdown :where(th, td) {
+  padding: 0.3em 0.5em;
+  border: 1px solid rgb(127 127 127 / 35%);
+  text-align: left;
+}
+
+/* Markdown preview links that cannot be handled in-app remain inert. Local
+   links get the modifier below and are routed to a preview or editor tile
+   instead of resolving against the browser app's origin. */
+.yas-md-link {
+  color: var(--yas-md-link, inherit);
+  border-bottom: 1px dotted currentColor;
+  opacity: 0.85;
+  cursor: default;
+}
+
+.yas-md-link--local {
+  cursor: pointer;
+}

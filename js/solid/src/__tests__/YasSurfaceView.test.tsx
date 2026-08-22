@@ -1,0 +1,304 @@
+import { cleanup, render } from "@solidjs/testing-library";
+import { createSignal } from "solid-js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { YasWorkspace, ConnectionId } from "@yas-run/core";
+import { YasWorkspaceProvider } from "../YasContext";
+import { YasSurfaceView } from "../YasSurfaceView";
+
+const mockAttach = vi.fn();
+const mockDispose = vi.fn();
+const mockSetDisplaySize = vi.fn();
+const mockRequestResize = vi.fn();
+const mockSetTouchMode = vi.fn();
+
+// The real canvas decodes video and probes WebCodecs; the view's contract
+// with it is just these calls.
+vi.mock("@yas-run/core", async () => {
+  const actual =
+    await vi.importActual<typeof import("@yas-run/core")>("@yas-run/core");
+  return {
+    ...actual,
+    detectCodecSupport: () => {},
+    YasSurfaceCanvas: class {
+      canvasElement = null;
+      attach = mockAttach;
+      dispose = mockDispose;
+      setDisplaySize = mockSetDisplaySize;
+      requestResize = mockRequestResize;
+      setConnectionId = vi.fn();
+      setSurfaceId = vi.fn();
+      setLive = vi.fn();
+      setTouchMode = mockSetTouchMode;
+    },
+  };
+});
+
+/** No connection, so the view never reads a surface store. */
+const workspace = {
+  getConnection: () => null,
+  subscribe: () => () => {},
+} as unknown as YasWorkspace;
+
+/** jsdom has no ResizeObserver, and the view falls back to the container's
+ *  bounding rect when none of its callbacks ever fire — which is the path
+ *  under test. */
+class NoopResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+const PANE_CSS_W = 800;
+const PANE_CSS_H = 600;
+
+function renderView(
+  zoom: () => number | undefined,
+  zoomMode: () => "relative" | "exact" | undefined = () => undefined,
+  touchMode: () => "pointer" | "direct" | undefined = () => undefined,
+  resizeKey: () => string | number | null | undefined = () => undefined,
+) {
+  return render(() => (
+    <YasWorkspaceProvider workspace={workspace}>
+      <YasSurfaceView
+        connectionId={"conn-1" as ConnectionId}
+        surfaceId={7}
+        resizable
+        zoom={zoom()}
+        zoomMode={zoomMode()}
+        touchMode={touchMode()}
+        resizeKey={resizeKey()}
+      />
+    </YasWorkspaceProvider>
+  ));
+}
+
+describe("YasSurfaceView zoom", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+    vi.stubGlobal("devicePixelRatio", 1);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      () =>
+        ({
+          width: PANE_CSS_W,
+          height: PANE_CSS_H,
+          left: 0,
+          top: 0,
+        }) as DOMRect,
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    mockSetDisplaySize.mockClear();
+    mockRequestResize.mockClear();
+    mockSetTouchMode.mockClear();
+    mockAttach.mockClear();
+    mockDispose.mockClear();
+  });
+
+  it("asks the compositor for DPI × zoom while keeping the pane's pixels", () => {
+    renderView(() => 1.5);
+    // 800×600 device pixels either way — zoom does not change how many
+    // pixels the pane has, only how many logical pixels the app fits in
+    // them (800 × 120/180 = 533 wide).
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 180, 120);
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(800, 600, 180);
+  });
+
+  it("sends the display's DPI alone at 100%", () => {
+    renderView(() => 1);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(800, 600, 120);
+  });
+
+  it("updates direct touch mode without remounting the canvas", () => {
+    const [touchMode, setTouchMode] = createSignal<"pointer" | "direct">(
+      "direct",
+    );
+    renderView(
+      () => 1,
+      () => undefined,
+      touchMode,
+    );
+    expect(mockSetTouchMode).toHaveBeenLastCalledWith("direct");
+
+    setTouchMode("pointer");
+    expect(mockSetTouchMode).toHaveBeenLastCalledWith("pointer");
+  });
+
+  it("uses direct touch when touchMode is absent", () => {
+    renderView(() => 1);
+    expect(mockSetTouchMode).toHaveBeenLastCalledWith("direct");
+  });
+
+  it("treats an absent zoom as 100%", () => {
+    renderView(() => undefined);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
+  });
+
+  it("re-sends the box when the zoom changes without a resize", () => {
+    const [zoom, setZoom] = createSignal(1);
+    renderView(zoom);
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(800, 600, 120);
+
+    // Nothing about the container changed, so the ResizeObserver would
+    // never fire — the zoom effect has to re-derive the scale itself.
+    setZoom(2);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 240, 120);
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(800, 600, 240);
+  });
+
+  it("resizes on solo and restore when ResizeObserver never fires", () => {
+    let width = 400;
+    vi.mocked(HTMLElement.prototype.getBoundingClientRect).mockImplementation(
+      () => ({ width, height: 600 }) as DOMRect,
+    );
+    const [solo, setSolo] = createSignal<string | null>(null);
+    renderView(() => 1, undefined, undefined, solo);
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(400, 600, 120);
+
+    // Ancestor styles may update after the view's reactive effect. The frame
+    // callback must measure the final geometry, not reuse the observed box.
+    setSolo("0");
+    width = 1000;
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(1000, 600, 120);
+
+    setSolo(null);
+    width = 400;
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(400, 600, 120);
+    expect(mockAttach).toHaveBeenCalledTimes(1);
+    expect(mockDispose).not.toHaveBeenCalled();
+    expect(mockSetDisplaySize).not.toHaveBeenCalledWith(null);
+  });
+
+  it("uses the final box after rapid solo toggles", () => {
+    let width = 400;
+    vi.mocked(HTMLElement.prototype.getBoundingClientRect).mockImplementation(
+      () => ({ width, height: 600 }) as DOMRect,
+    );
+    const [solo, setSolo] = createSignal<string | null>(null);
+    renderView(() => 1, undefined, undefined, solo);
+    vi.advanceTimersByTime(50);
+    mockRequestResize.mockClear();
+
+    setSolo("0");
+    width = 1000;
+    setSolo(null);
+    width = 400;
+    setSolo("0");
+    width = 1200;
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize.mock.calls).toEqual([[1200, 600, 120]]);
+  });
+
+  it("clamps a nonsensical zoom instead of asking for a zero scale", () => {
+    renderView(() => 0);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
+  });
+
+  it("sends a sub-1x relative scale so a 1x pane can zoom out", () => {
+    renderView(() => 0.5);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 60, 120);
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(800, 600, 60);
+  });
+
+  it("zooms out into the display's own DPI where there is some", () => {
+    // 2x pane: 1600×1200 device pixels for the same 800×600 CSS box.  75%
+    // lands on 1.5x, above the floor, so the app really does get more
+    // logical pixels (1600 × 120/180 = 1066) than at 100%.
+    vi.stubGlobal("devicePixelRatio", 2);
+    renderView(() => 0.75);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(1600, 1200, 180, 240);
+  });
+
+  it("uses an exact scale independently of display DPI", () => {
+    vi.stubGlobal("devicePixelRatio", 2);
+    renderView(
+      () => 1,
+      () => "exact",
+    );
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(1600, 1200, 120, 240);
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(1600, 1200, 120);
+  });
+
+  it("re-sends the box when switching between relative and exact scale", () => {
+    vi.stubGlobal("devicePixelRatio", 2);
+    const [mode, setMode] = createSignal<"relative" | "exact">("relative");
+    renderView(() => 1, mode);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(1600, 1200, 240, 240);
+
+    setMode("exact");
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(1600, 1200, 120, 240);
+  });
+
+  /** A view with no display size takes no input at all — every pointer, wheel,
+   *  keyboard and IME path in the canvas is gated on one — and is served a
+   *  thumbnail-grade stream. That must be opt-in, never the default. */
+  function renderBare(resizable?: boolean) {
+    return render(() => (
+      <YasWorkspaceProvider workspace={workspace}>
+        <YasSurfaceView
+          connectionId={"conn-1" as ConnectionId}
+          surfaceId={7}
+          resizable={resizable}
+        />
+      </YasWorkspaceProvider>
+    ));
+  }
+
+  it("owns its surface's size when resizable is not mentioned", () => {
+    renderBare();
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
+  });
+
+  it("stays a passive preview when resizable is false", () => {
+    renderBare(false);
+    expect(mockSetDisplaySize).not.toHaveBeenCalled();
+    expect(mockRequestResize).not.toHaveBeenCalled();
+  });
+
+  it("withdraws its resize claim when a mounted view becomes hidden", () => {
+    const [resizable, setResizable] = createSignal(true);
+    render(() => (
+      <YasWorkspaceProvider workspace={workspace}>
+        <YasSurfaceView
+          connectionId={"conn-1" as ConnectionId}
+          surfaceId={7}
+          resizable={resizable()}
+        />
+      </YasWorkspaceProvider>
+    ));
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
+
+    setResizable(false);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(null);
+    mockSetDisplaySize.mockClear();
+    mockRequestResize.mockClear();
+    vi.advanceTimersByTime(50);
+    expect(mockSetDisplaySize).not.toHaveBeenCalled();
+    expect(mockRequestResize).not.toHaveBeenCalled();
+
+    setResizable(true);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
+  });
+
+  it("clips a logical surface to its own view", () => {
+    const view = renderBare();
+    const container = view.container.firstElementChild as HTMLElement;
+    expect(container.style.position).toBe("relative");
+    expect(container.style.overflow).toBe("hidden");
+  });
+});

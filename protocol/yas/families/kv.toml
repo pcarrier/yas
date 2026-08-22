@@ -1,0 +1,242 @@
+schema = 1
+family = "yas.kv"
+
+limits = [
+  { name = "MAX_KEY_BYTES", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_VALUE_BYTES", tag = 2, type = "u64", required = true, hard_min = 0, hard_max = 4194304 },
+  { name = "MAX_INLINE_BYTES", tag = 3, type = "u32", required = true, hard_min = 0, hard_max = 32768 },
+  { name = "MAX_ENTRIES", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 16384 },
+  { name = "MAX_STORE_BYTES", tag = 5, type = "u64", required = true, hard_min = 1, hard_max = 268435456 },
+  { name = "MAX_NAMESPACES_PER_SESSION", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_STAGES_PER_SESSION", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_STAGED_BYTES_PER_SESSION", tag = 8, type = "u64", required = true, hard_min = 1, hard_max = 67108864 },
+  { name = "MAX_BATCH_ITEMS", tag = 9, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+]
+
+[[constant]]
+name = "CONTENT_NONE"
+value = 0
+[[constant]]
+name = "CONTENT_INLINE"
+value = 1
+
+[[constant]]
+name = "PRECONDITION_ANY"
+value = 0
+[[constant]]
+name = "PRECONDITION_ABSENT"
+value = 1
+[[constant]]
+name = "PRECONDITION_HASH"
+value = 2
+[[constant]]
+name = "PRECONDITION_REVISION"
+value = 3
+[[constant]]
+name = "PRECONDITION_HASH_AND_REVISION"
+value = 4
+
+[[constant]]
+name = "VALUE_INLINE"
+value = 0
+[[constant]]
+name = "VALUE_STAGED"
+value = 1
+
+[[constant]]
+name = "MUTATION_PUT"
+value = 0
+[[constant]]
+name = "MUTATION_DELETE"
+value = 1
+
+[[constant]]
+name = "MUTATION_DURABLE"
+value = 1
+
+[[constant]]
+name = "VALUE_CONTENT_KIND"
+value = 0
+
+[[constant]]
+name = "MAX_KEY_BYTES"
+value = 256
+[[constant]]
+name = "MAX_VALUE_BYTES"
+value = 4194304
+[[constant]]
+name = "MAX_INLINE_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_ENTRIES"
+value = 16384
+[[constant]]
+name = "MAX_STORE_BYTES"
+value = 268435456
+[[constant]]
+name = "MAX_NAMESPACES_PER_SESSION"
+value = 16
+[[constant]]
+name = "MAX_STAGES_PER_SESSION"
+value = 16
+[[constant]]
+name = "MAX_STAGED_BYTES_PER_SESSION"
+value = 67108864
+[[constant]]
+name = "MAX_BATCH_ITEMS"
+value = 256
+
+[[constant]]
+name = "LIMIT_MAX_KEY_BYTES"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_VALUE_BYTES"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_INLINE_BYTES"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_ENTRIES"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_STORE_BYTES"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_NAMESPACES_PER_SESSION"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_STAGES_PER_SESSION"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_STAGED_BYTES_PER_SESSION"
+value = 8
+[[constant]]
+name = "LIMIT_MAX_BATCH_ITEMS"
+value = 9
+
+[[request]]
+name = "OPEN"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "prefix:bytes_u16,Extensions; ResultPrefix + namespace_handle:u64,store_revision:u64,Extensions"
+
+[[request]]
+name = "CLOSE"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "namespace_handle:u64,Extensions; ResultPrefix"
+
+[[request]]
+name = "WATCH"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "namespace_handle:u64,inline_max:u32,reserved:u32=0,state_watch:bytes_u32 containing StateWatch; ResultPrefix + StateWatchResult"
+
+[[request]]
+name = "UNWATCH"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+
+[[request]]
+name = "GET"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "namespace_handle:u64,relative_key:bytes_u16,initial_receive_credit:u64,Extensions; ResultPrefix + key_revision:u64,InlineOrTransfer"
+
+[[request]]
+name = "STAGE_VALUE"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "byte_len:u64,content_hash:[u8;32],Extensions; ResultPrefix + staging_handle:u64,byte_len:u64,content_hash:[u8;32],sensitive receiver-to-sender BYTE TransferDescriptor with required upload-stage extension naming that handle; before a PUT or BATCH using the handle succeeds, RESET of the returned descriptor discards the stage"
+
+[[request]]
+name = "PUT"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "namespace_handle:u64,operation_id:[u8;16],flags:u16,reserved:u16=0,relative_key:bytes_u16,Precondition,ValueSource,Extensions; ResultPrefix + MutationResult"
+
+[[request]]
+name = "DELETE"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "namespace_handle:u64,operation_id:[u8;16],flags:u16,reserved:u16=0,relative_key:bytes_u16,Precondition,Extensions; ResultPrefix + MutationResult"
+
+[[request]]
+name = "BATCH"
+kind = 0x0008
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "namespace_handle:u64,operation_id:[u8;16],flags:u16,item_count:u16,repeated mutation:bytes_u32,Extensions; ResultPrefix + store_revision:u64,item_count:u16,reserved:u16=0,repeated MutationResult:bytes_u32,Extensions"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<KvEntryRecord>"
+
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[type]]
+name = "entry_record"
+layout = "relative_key:bytes_u16,content_hash:[u8;32],byte_len:u64,modification_revision:u64,modified_unix_ns:i64,content:u8,reserved:[u8;3]=0,optional inline_value:bytes_u32,Extensions"
+
+[[type]]
+name = "remove_record"
+layout = "relative_key:bytes_u16,modification_revision:u64"
+
+[[type]]
+name = "precondition"
+layout = "kind:u8,reserved:[u8;3]=0; ANY/ABSENT empty, HASH expected_hash:[u8;32], REVISION expected_revision:u64, HASH_AND_REVISION both"
+
+[[type]]
+name = "value_source"
+layout = "kind:u8,reserved:[u8;3]=0; INLINE value:bytes_u32 (at most 32 KiB), STAGED staging_handle:u64"
+
+[[type]]
+name = "mutation"
+layout = "kind:u8,reserved:[u8;3]=0,relative_key:bytes_u16,Precondition,PUT-only ValueSource,Extensions"
+
+[[type]]
+name = "mutation_result"
+layout = "status:u16,reserved:u16=0,modification_revision:u64,modified_unix_ns:i64,content_hash:[u8;32],byte_len:u64,Extensions; modified_unix_ns is the committed mutation time for OK and the current entry time when a non-OK status publishes current metadata"
+
+[[type]]
+name = "family_limits"
+layout = "extension tags 1 max_key_bytes:u32,2 max_value_bytes:u64,3 max_inline_bytes:u32,4 max_entries:u32,5 max_store_bytes:u64,6 max_namespaces_per_session:u32,7 max_stages_per_session:u32,8 max_staged_bytes_per_session:u64,9 max_batch_items:u32"

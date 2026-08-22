@@ -1,0 +1,28 @@
+[package]
+name = "yas-git"
+version = "0.1.0"
+edition.workspace = true
+description = "Git introspection engine: repo state streaming, object reads, diffs and patches"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+yas-fssync = { workspace = true }
+gix = { version = "0.73", default-features = false, features = [
+    "parallel",
+    "index",
+    "revision",
+    "status",
+    "blob-diff",
+    "dirwalk",
+    "attributes",
+    "worktree-mutation",
+    "blame",
+] }
+imara-diff = "0.2"
+encoding_rs = "0.8"
+notify = "8"
+# `GIT binary patch` bodies are zlib streams, as git writes them. Already in
+# the tree via gix's own object store, so this adds an edge, not a crate.
+flate2 = "1"

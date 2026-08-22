@@ -1,0 +1,13 @@
+schema = 1
+name = "media-pcm-f32le-v1"
+const_name = "MEDIA_CODEC_PCM_F32LE"
+family = "yas.media"
+id = 2
+version = 1
+direction = "bidirectional"
+layout = "Interleaved IEEE-754 binary32 little-endian samples in MediaFormat channel order; finite values are in [-1,1], negative zero is canonicalized to positive zero, and payload length is a nonzero multiple of channels*4. One FRAME payload contains complete sample frames and no codec-local header."
+golden_hex = "000000000000803f000080bf"
+
+[[constant]]
+name = "SAMPLE_BYTES"
+value = 4

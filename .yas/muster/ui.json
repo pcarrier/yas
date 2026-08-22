@@ -1,0 +1,12 @@
+{
+  "description": "Vite UI dev server on :${PORTS} (${INSTANCE})",
+  "requires": ["js"],
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-ui", "${PORTS}"],
+  "env": {
+    "YAS_DEV_EDGE_PORT": "${PORTS+1}",
+    "YAS_DEV_EXT_PORT": "${PORTS+3}"
+  },
+  "readyWhen": { "log": "ready in" },
+  "timeoutStart": "2m",
+  "restartOnSuccess": true
+}

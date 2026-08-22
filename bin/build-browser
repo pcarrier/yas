@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Build WASM module
+(cd crates/browser && wasm-pack build --target web --release --out-dir pkg)
+# wasm-bindgen externalizes the terminal drawing helpers under `snippets/`,
+# but wasm-pack 0.14 does not add that directory to the generated npm `files`
+# allowlist. Keep local installs and the published package self-contained.
+pnpm --dir crates/browser/pkg pkg set 'files[3]=snippets'
+
+# Install JS dependencies and build UI
+(cd js && pnpm install --prefer-offline)
+(cd js/ui && pnpm run build)
