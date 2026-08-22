@@ -1,0 +1,2254 @@
+import { TapButton } from "./TapButton";
+import {
+  For,
+  Index,
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onMount,
+  type Accessor,
+  type JSX,
+} from "solid-js";
+import { Portal } from "solid-js/web";
+import {
+  MENU_NODE_CHECKMARK,
+  MENU_NODE_ENABLED,
+  MENU_NODE_RADIO,
+  MENU_NODE_SEPARATOR,
+  MENU_NODE_SUBMENU,
+  MENU_NODE_VISIBLE,
+  MPRIS_CAN_CONTROL,
+  MPRIS_CAN_GO_NEXT,
+  MPRIS_CAN_GO_PREVIOUS,
+  MPRIS_CAN_PAUSE,
+  MPRIS_CAN_PLAY,
+  MPRIS_CAN_SEEK,
+  TRAY_MENU_OK,
+  TRAY_STATUS_NEEDS_ATTENTION,
+  TRAY_STATUS_PASSIVE,
+  type YasConnectionSnapshot,
+  type YasWorkspace,
+  type DesktopImage,
+  type DesktopId,
+  type DesktopNotification,
+  type MediaId,
+  type MprisAction,
+  type MprisArtwork,
+  type MprisPlayer,
+  type PortalRequest,
+  type PortalChoiceValue,
+  type TrayItem,
+  type TrayMenu,
+  type TrayMenuNode,
+} from "@yas-run/core";
+import { createRemoteCommandAnchor } from "./mediaSessionAnchor";
+import { desktopWorkerRegistration } from "./preview";
+import {
+  desktopDelivery,
+  desktopNativeTag,
+  desktopResourceKey,
+  canRaiseMpris,
+  canSeekMpris,
+  desktopNotificationHasDetail,
+  matchesDesktopNotification,
+  mprisHasProgress,
+  mprisMediaSessionKey,
+  mprisSeekTargetUs,
+  popupViewportShift,
+  portalDialogFocusTarget,
+  reconcileMprisSubscriptions,
+  samePortalPresentationEntry,
+  selectMediaSessionEntry,
+  trayPrimaryGesture,
+  trayPrimaryOpensMenu,
+  type TrayPrimaryGesture,
+  type MprisSubscriptionTarget,
+} from "./desktopPresentation";
+import { t, tp } from "./i18n";
+import { mergeStyle, ui, z, type Theme, type UIScale } from "./theme";
+
+type TrayEntry = {
+  connectionId: string;
+  connectionLabel: string;
+  readOnly: boolean;
+  item: TrayItem;
+};
+
+type NotificationEntry = {
+  connectionId: string;
+  connectionLabel: string;
+  bootGeneration: bigint | null;
+  readOnly: boolean;
+  item: DesktopNotification;
+};
+
+type Toast = NotificationEntry & { key: string };
+type MenuState = { entry: TrayEntry; menu: TrayMenu };
+type MprisStoreTarget = MprisSubscriptionTarget & {
+  act(playerId: MediaId, action: MprisAction): Promise<void>;
+  positionUs(playerId: MediaId): number;
+};
+type MprisEntry = {
+  connectionId: string;
+  connectionLabel: string;
+  readOnly: boolean;
+  store: MprisStoreTarget;
+  player: MprisPlayer;
+};
+type PortalEntry = {
+  connectionId: string;
+  connectionLabel: string;
+  readOnly: boolean;
+  request: PortalRequest;
+};
+
+export const DESKTOP_DATA_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+export const MPRIS_ARTWORK_URL_MAX_CHARS = 8 * 1024;
+export const MPRIS_ARTWORK_SIZE_CACHE_MAX_ITEMS = 16;
+export const MPRIS_ARTWORK_SIZE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+export const MPRIS_ARTWORK_MAX_PENDING_MEASURES = 4;
+const imageUrlCache = new WeakMap<Uint8Array, string>();
+
+function imageUrl(
+  image: DesktopImage | { png: Uint8Array },
+): string | undefined {
+  if (image.png.length === 0 || image.png.length > DESKTOP_DATA_IMAGE_MAX_BYTES)
+    return undefined;
+  const cached = imageUrlCache.get(image.png);
+  if (cached) return cached;
+  let binary = "";
+  for (let offset = 0; offset < image.png.length; offset += 0x8000) {
+    binary += String.fromCharCode(
+      ...image.png.subarray(offset, offset + 0x8000),
+    );
+  }
+  const url = `data:image/png;base64,${btoa(binary)}`;
+  imageUrlCache.set(image.png, url);
+  return url;
+}
+
+/**
+ * Source for a player's cover. A forwarded URL is used as-is so the browser
+ * fetches it off this thread and caches it across track changes; only art that
+ * arrived as bytes pays the base64 encode below.
+ */
+function artworkUrl(artwork: MprisArtwork | null): string | undefined {
+  if (!artwork) return undefined;
+  return artwork.kind === "url"
+    ? artwork.url.length <= MPRIS_ARTWORK_URL_MAX_CHARS
+      ? artwork.url
+      : undefined
+    : imageUrl(artwork);
+}
+
+function mediaTime(microseconds: number): string {
+  if (!Number.isFinite(microseconds) || microseconds < 0) return "--:--";
+  const seconds = Math.floor(microseconds / 1_000_000);
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function notificationKey(connectionId: string, id: DesktopId): string {
+  return `${connectionId}:${desktopResourceKey(id)}`;
+}
+
+function compareResourceId(a: MediaId | DesktopId, b: MediaId | DesktopId) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+async function postWorker(message: object): Promise<void> {
+  const registration = await desktopWorkerRegistration();
+  registration?.active?.postMessage(message);
+}
+
+function notificationTitle(item: DesktopNotification): string {
+  return item.summary || item.appName || t("desktop.notification");
+}
+
+function Popup(props: {
+  theme: Theme;
+  scale: UIScale;
+  children: JSX.Element;
+  width?: string;
+  maxHeight?: string;
+}) {
+  let el: HTMLDivElement | undefined;
+  // Slid back on screen after layout rather than positioned differently: the
+  // popup belongs to the button it hangs from, and only the browser knows
+  // where that landed once the bar has finished sharing out its width.
+  const [shift, setShift] = createSignal(0);
+  const reposition = () => {
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const applied = shift();
+    setShift(
+      popupViewportShift(
+        { left: rect.left - applied, right: rect.right - applied },
+        window.innerWidth,
+      ),
+    );
+  };
+  onMount(() => {
+    reposition();
+    // Rotating a phone changes both the anchor and the width available.
+    window.addEventListener("resize", reposition);
+    onCleanup(() => window.removeEventListener("resize", reposition));
+  });
+  return (
+    <div
+      ref={el}
+      style={{
+        position: "absolute",
+        bottom: "100%",
+        right: 0,
+        transform: shift() === 0 ? undefined : `translateX(${shift()}px)`,
+        "margin-bottom": `${props.scale.tightGap}px`,
+        width: props.width ?? "min(28em, calc(100vw - 2em))",
+        "max-height": props.maxHeight ?? "min(70vh, 36em)",
+        overflow: "auto",
+        "background-color": props.theme.solidPanelBg,
+        color: props.theme.fg,
+        border: `1px solid ${props.theme.border}`,
+        "box-shadow": "0 8px 24px rgba(0,0,0,0.35)",
+        "z-index": z.statusMenu,
+      }}
+    >
+      {props.children}
+    </div>
+  );
+}
+
+function MprisChrome(props: {
+  workspace: YasWorkspace;
+  connections: readonly YasConnectionSnapshot[];
+  connectionLabels: ReadonlyMap<string, string>;
+  readOnlyConnections: ReadonlySet<string>;
+  theme: Theme;
+  scale: UIScale;
+  compact: boolean;
+  focusedConnectionId?: string;
+  onRaisePlayer?: (player: {
+    connectionId: string;
+    desktopEntry: string;
+    identity: string;
+  }) => void;
+  closeOthers: () => void;
+}) {
+  const [open, setOpen] = createSignal(false);
+  const [actionError, setActionError] = createSignal<string>();
+  const [manualMediaSessionKey, setManualMediaSessionKey] =
+    createSignal<string>();
+  const [playingOrderRevision, setPlayingOrderRevision] = createSignal(0);
+  const playingStates = new Map<string, boolean>();
+  const playingOrder = new Map<string, number>();
+  let playingClock = 0;
+  const players = createMemo<MprisEntry[]>(() => {
+    const entries: MprisEntry[] = [];
+    for (const snapshot of props.connections) {
+      if (!snapshot.supportsDesktopMedia) continue;
+      const connection = props.workspace.getConnection(snapshot.id);
+      if (!connection) continue;
+      for (const player of connection.mprisStore.players.values()) {
+        entries.push({
+          connectionId: snapshot.id,
+          connectionLabel: props.connectionLabels.get(snapshot.id) ?? "",
+          readOnly: props.readOnlyConnections.has(snapshot.id),
+          store: connection.mprisStore,
+          player,
+        });
+      }
+    }
+    return entries.sort(
+      (a, b) =>
+        Number(b.player.active) - Number(a.player.active) ||
+        props.connections.findIndex((item) => item.id === a.connectionId) -
+          props.connections.findIndex((item) => item.id === b.connectionId) ||
+        compareResourceId(a.player.playerId, b.player.playerId),
+    );
+  });
+  createEffect(() => {
+    const live = new Set<string>();
+    let changed = false;
+    for (const entry of players()) {
+      const key = mprisMediaSessionKey(entry);
+      live.add(key);
+      const playing =
+        !entry.readOnly &&
+        entry.player.active &&
+        entry.player.playbackStatus === "playing";
+      if (playing && playingStates.get(key) !== true) {
+        playingOrder.set(key, ++playingClock);
+        if (
+          manualMediaSessionKey() !== undefined &&
+          manualMediaSessionKey() !== key
+        ) {
+          setManualMediaSessionKey(undefined);
+        }
+        changed = true;
+      }
+      playingStates.set(key, playing);
+    }
+    for (const key of [...playingStates.keys()]) {
+      if (live.has(key)) continue;
+      playingStates.delete(key);
+      playingOrder.delete(key);
+      changed = true;
+    }
+    if (changed) setPlayingOrderRevision((revision) => revision + 1);
+  });
+  const mediaSessionActive = createMemo(() => {
+    playingOrderRevision();
+    return selectMediaSessionEntry(
+      players(),
+      props.focusedConnectionId,
+      playingOrder,
+      manualMediaSessionKey(),
+    );
+  });
+  const active = createMemo(() => {
+    const coordinated = mediaSessionActive();
+    return (
+      (coordinated?.player.active ? coordinated : undefined) ??
+      players().find((entry) => entry.player.active) ??
+      coordinated ??
+      players()[0]
+    );
+  });
+
+  const mprisSubscriptions = new Set<MprisSubscriptionTarget>();
+  createEffect(() => {
+    const stores = props.connections
+      .filter((snapshot) => snapshot.supportsDesktopMedia)
+      .map((snapshot) => props.workspace.getConnection(snapshot.id)?.mprisStore)
+      .filter((store) => store !== undefined);
+    reconcileMprisSubscriptions(mprisSubscriptions, stores);
+  });
+  onCleanup(() => reconcileMprisSubscriptions(mprisSubscriptions, []));
+
+  /** Resolves once the server has answered, however it answered: a caller that
+   *  showed the action as already taken needs to know when to stop. */
+  const act = (entry: MprisEntry, action: MprisAction): Promise<void> => {
+    setActionError(undefined);
+    if (action.kind === "raise") {
+      props.onRaisePlayer?.({
+        connectionId: entry.connectionId,
+        desktopEntry: entry.player.desktopEntry,
+        identity: entry.player.identity,
+      });
+    }
+    if (entry.readOnly) return Promise.resolve();
+    // Keep the native handle and the controller that produced it together.
+    // Re-looking up the connection here can cross a reconnect/HMR swap and
+    // send a live-looking player's action to a store that does not own it.
+    return entry.store
+      .act(entry.player.playerId, action)
+      .then(() => {
+        if (action.kind === "select") {
+          setManualMediaSessionKey(mprisMediaSessionKey(entry));
+        }
+      })
+      .catch((error: unknown) => {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : t("desktop.mediaActionFailed"),
+        );
+        setOpen(true);
+      });
+  };
+  const capable = (entry: MprisEntry, flag: number) =>
+    !entry.readOnly &&
+    (entry.player.capabilityFlags & (MPRIS_CAN_CONTROL | flag)) ===
+      (MPRIS_CAN_CONTROL | flag);
+
+  // Elapsed time has to be redrawn on a clock of our own. Position is the one
+  // MPRIS property players do not announce -- the spec excludes it from
+  // PropertiesChanged -- so the store's extrapolation is correct but nothing
+  // ever asks it for a new answer. Ticking only while the list is open and
+  // something is actually running keeps a paused, or unwatched, popup at rest.
+  const [tick, setTick] = createSignal(0);
+  const anyPlaying = createMemo(() =>
+    players().some((entry) => entry.player.playbackStatus === "playing"),
+  );
+  createEffect(() => {
+    if (!open() || !anyPlaying()) return;
+    const timer = setInterval(() => setTick((value) => value + 1), 250);
+    onCleanup(() => clearInterval(timer));
+  });
+
+  // WebKit picks Now Playing artwork out of the array by `sizes` and shows
+  // nothing when no entry declares one, so a cover without it reaches iPadOS as
+  // a blank tile. Neither artwork kind carries dimensions — a forwarded URL has
+  // none to send — so they are measured here instead: the browser has to decode
+  // the image anyway, and its intrinsic size is the truth a server guess would
+  // only approximate. `null` records a source that failed, so a broken cover is
+  // attempted once rather than on every metadata change.
+  const [artworkSizes, setArtworkSizes] = createSignal<
+    ReadonlyMap<string, string | null>
+  >(new Map());
+  const artworkMeasures = new Map<string, HTMLImageElement>();
+  const rememberArtworkSize = (src: string, size: string | null) => {
+    setArtworkSizes((known) => {
+      const next = new Map(known);
+      next.delete(src);
+      next.set(src, size);
+      let bytes = 0;
+      for (const [key, value] of next) {
+        bytes += 64 + key.length * 2 + (value?.length ?? 0) * 2;
+      }
+      while (
+        next.size > MPRIS_ARTWORK_SIZE_CACHE_MAX_ITEMS ||
+        bytes > MPRIS_ARTWORK_SIZE_CACHE_MAX_BYTES
+      ) {
+        const oldest = next.keys().next().value;
+        if (oldest === undefined) break;
+        const oldValue = next.get(oldest);
+        next.delete(oldest);
+        bytes -= 64 + oldest.length * 2 + (oldValue?.length ?? 0) * 2;
+        const pending = artworkMeasures.get(oldest);
+        if (pending) {
+          artworkMeasures.delete(oldest);
+          pending.onload = null;
+          pending.onerror = null;
+          pending.src = "";
+        }
+      }
+      return next;
+    });
+  };
+  const measureArtwork = (src: string) => {
+    if (
+      artworkSizes().has(src) ||
+      artworkMeasures.has(src) ||
+      64 + src.length * 2 > MPRIS_ARTWORK_SIZE_CACHE_MAX_BYTES
+    )
+      return;
+    while (artworkMeasures.size >= MPRIS_ARTWORK_MAX_PENDING_MEASURES) {
+      const oldest = artworkMeasures.entries().next().value as
+        | [string, HTMLImageElement]
+        | undefined;
+      if (!oldest) break;
+      artworkMeasures.delete(oldest[0]);
+      oldest[1].onload = null;
+      oldest[1].onerror = null;
+      oldest[1].src = "";
+    }
+    rememberArtworkSize(src, null);
+    const image = new Image();
+    artworkMeasures.set(src, image);
+    const settle = (size: string | null) => {
+      if (artworkMeasures.get(src) !== image) return;
+      artworkMeasures.delete(src);
+      if (artworkSizes().has(src)) rememberArtworkSize(src, size);
+    };
+    image.onload = () =>
+      settle(
+        image.naturalWidth > 0
+          ? `${image.naturalWidth}x${image.naturalHeight}`
+          : null,
+      );
+    image.onerror = () => settle(null);
+    image.src = src;
+  };
+
+  // Created once and reused: the element itself is the routing target, so
+  // rebuilding it per track would drop the audio session it exists to hold.
+  const commandAnchor = createRemoteCommandAnchor();
+  onCleanup(() => {
+    commandAnchor?.dispose();
+    for (const image of artworkMeasures.values()) {
+      image.onload = null;
+      image.onerror = null;
+      image.src = "";
+    }
+    artworkMeasures.clear();
+  });
+
+  const session = "mediaSession" in navigator ? navigator.mediaSession : null;
+  const enabledActions = new Map<MediaSessionAction, boolean>();
+  let publishedMetadata: readonly unknown[] = [];
+  let sessionPublished = false;
+  const clearMediaSession = () => {
+    if (!session || !sessionPublished) return;
+    for (const action of enabledActions.keys()) {
+      try {
+        session.setActionHandler(action, null);
+      } catch {
+        // A browser may expose Media Session without every action.
+      }
+    }
+    enabledActions.clear();
+    publishedMetadata = [];
+    sessionPublished = false;
+    session.metadata = null;
+    session.playbackState = "none";
+    try {
+      session.setPositionState();
+    } catch {
+      // A partial implementation may expose Media Session without position.
+    }
+  };
+  // Effect cleanup also runs before every update. Only the component lifetime
+  // owns teardown; clearing between snapshots makes iPad Now Playing blink.
+  onCleanup(clearMediaSession);
+
+  createEffect(() => {
+    const entry = mediaSessionActive();
+    if (!session) return;
+    if (!entry) {
+      clearMediaSession();
+      commandAnchor?.release();
+      return;
+    }
+    sessionPublished = true;
+    const player = entry.player;
+    const artwork = artworkUrl(player.artwork);
+    if (artwork) measureArtwork(artwork);
+    const size = artwork ? artworkSizes().get(artwork) : undefined;
+    const title = player.title || player.identity;
+    const artist = player.artists.join(", ");
+    const metadata = [title, artist, player.album, artwork, size];
+    // Constructing metadata must not be able to cost the transport controls:
+    // a throw here would skip the playback state and every action handler
+    // below, leaving a Now Playing panel whose buttons do nothing.
+    try {
+      if (metadata.some((value, index) => value !== publishedMetadata[index])) {
+        session.metadata = new MediaMetadata({
+          title,
+          artist,
+          album: player.album,
+          artwork: artwork
+            ? [size ? { src: artwork, sizes: size } : { src: artwork }]
+            : [],
+        });
+        publishedMetadata = metadata;
+      }
+    } catch {
+      // A partial implementation may reject metadata it cannot represent.
+    }
+    const playbackState =
+      player.playbackStatus === "stopped" ? "none" : player.playbackStatus;
+    if (session.playbackState !== playbackState) {
+      session.playbackState = playbackState;
+    }
+    const handler = (
+      action: MediaSessionAction,
+      enabled: boolean,
+      callback: (
+        current: MprisEntry,
+        details: MediaSessionActionDetails,
+      ) => void,
+    ) => {
+      if (enabledActions.get(action) === enabled) return;
+      try {
+        session.setActionHandler(
+          action,
+          enabled
+            ? (details) => {
+                // Retained handlers must resolve the current player, store,
+                // and track revision after metadata updates or reconnects.
+                const current = mediaSessionActive();
+                if (current) callback(current, details);
+              }
+            : null,
+        );
+        enabledActions.set(action, enabled);
+      } catch {
+        // Unsupported action in a partially implemented browser API.
+      }
+    };
+    handler("play", capable(entry, MPRIS_CAN_PLAY), (current) =>
+      act(current, { kind: "play" }),
+    );
+    handler("pause", capable(entry, MPRIS_CAN_PAUSE), (current) =>
+      act(current, { kind: "pause" }),
+    );
+    handler(
+      "stop",
+      !entry.readOnly && Boolean(player.capabilityFlags & MPRIS_CAN_CONTROL),
+      (current) => act(current, { kind: "stop" }),
+    );
+    handler("previoustrack", capable(entry, MPRIS_CAN_GO_PREVIOUS), (current) =>
+      act(current, { kind: "previous" }),
+    );
+    handler("nexttrack", capable(entry, MPRIS_CAN_GO_NEXT), (current) =>
+      act(current, { kind: "next" }),
+    );
+    handler(
+      "seekbackward",
+      capable(entry, MPRIS_CAN_SEEK),
+      (current, details) =>
+        act(current, {
+          kind: "seek",
+          offsetUs: -Math.round((details.seekOffset ?? 10) * 1_000_000),
+        }),
+    );
+    handler("seekforward", capable(entry, MPRIS_CAN_SEEK), (current, details) =>
+      act(current, {
+        kind: "seek",
+        offsetUs: Math.round((details.seekOffset ?? 10) * 1_000_000),
+      }),
+    );
+    handler("seekto", capable(entry, MPRIS_CAN_SEEK), (current, details) => {
+      if (details.seekTime === undefined) return;
+      act(current, {
+        kind: "setPosition",
+        positionUs: Math.round(details.seekTime * 1_000_000),
+        trackRevision: current.player.trackRevision,
+      });
+    });
+    // Hold the audio session only while something is actually controllable:
+    // a player exposing no transport has no commands to route, and the session
+    // is not worth claiming for a panel that would ignore it anyway.
+    if (
+      capable(entry, MPRIS_CAN_PLAY) ||
+      capable(entry, MPRIS_CAN_PAUSE) ||
+      capable(entry, MPRIS_CAN_GO_NEXT) ||
+      capable(entry, MPRIS_CAN_GO_PREVIOUS)
+    ) {
+      commandAnchor?.engage();
+    } else {
+      commandAnchor?.release();
+    }
+    try {
+      if (player.lengthUs > 0 && player.rate > 0) {
+        const position = entry.store.positionUs(player.playerId);
+        session.setPositionState({
+          duration: player.lengthUs / 1_000_000,
+          playbackRate: player.rate,
+          position: Math.min(position, player.lengthUs) / 1_000_000,
+        });
+      } else {
+        session.setPositionState();
+      }
+    } catch {
+      // Invalid or browser-rejected position state is non-fatal.
+    }
+  });
+
+  const controls = (entry: Accessor<MprisEntry>) => (
+    <span style={{ display: "flex", "align-items": "center" }}>
+      <TapButton
+        disabled={!capable(entry(), MPRIS_CAN_GO_PREVIOUS)}
+        onClick={() => void act(entry(), { kind: "previous" })}
+        title={t("desktop.mediaPrevious")}
+        aria-label={t("desktop.mediaPrevious")}
+        style={ui.btn}
+      >
+        ◀|
+      </TapButton>
+      <TapButton
+        disabled={
+          entry().player.playbackStatus === "playing"
+            ? !capable(entry(), MPRIS_CAN_PAUSE)
+            : !capable(entry(), MPRIS_CAN_PLAY)
+        }
+        onClick={() => {
+          const current = entry();
+          void act(current, {
+            kind:
+              current.player.playbackStatus === "playing" ? "pause" : "play",
+          });
+        }}
+        title={
+          entry().player.playbackStatus === "playing"
+            ? t("desktop.mediaPause")
+            : t("desktop.mediaPlay")
+        }
+        style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
+      >
+        {entry().player.playbackStatus === "playing" ? "Ⅱ" : "▶"}
+      </TapButton>
+      <TapButton
+        disabled={!capable(entry(), MPRIS_CAN_GO_NEXT)}
+        onClick={() => void act(entry(), { kind: "next" })}
+        title={t("desktop.mediaNext")}
+        aria-label={t("desktop.mediaNext")}
+        style={ui.btn}
+      >
+        |▶
+      </TapButton>
+    </span>
+  );
+  const togglePopup = () => {
+    props.closeOthers();
+    setOpen((value) => !value);
+  };
+
+  return (
+    <Show when={active()}>
+      {(current) => (
+        <span style={{ display: "flex", "align-items": "center" }}>
+          <Show when={!props.compact}>
+            <TapButton
+              onClick={togglePopup}
+              title={t("desktop.mediaPlayers")}
+              aria-haspopup="menu"
+              aria-expanded={open()}
+              style={{
+                ...ui.btn,
+                "max-width": "14em",
+                overflow: "hidden",
+                "text-overflow": "ellipsis",
+                "white-space": "nowrap",
+                "font-size": `${props.scale.sm}px`,
+              }}
+            >
+              {current().player.title || current().player.identity}
+            </TapButton>
+            {controls(current)}
+          </Show>
+          <Show when={props.compact}>
+            <TapButton
+              onClick={togglePopup}
+              title={t("desktop.mediaPlayers")}
+              aria-label={t("desktop.mediaPlayers")}
+              aria-haspopup="menu"
+              aria-expanded={open()}
+              style={{
+                ...ui.btn,
+                "font-size": `${props.scale.md}px`,
+              }}
+            >
+              ♪
+            </TapButton>
+          </Show>
+          <Show when={open()}>
+            <Popup
+              theme={props.theme}
+              scale={props.scale}
+              width="min(30em, calc(100vw - 2em))"
+            >
+              <Show when={actionError()}>
+                {(message) => (
+                  <div
+                    role="alert"
+                    style={{
+                      padding: `${props.scale.panelPadding}px`,
+                      color: props.theme.errorText,
+                      border: `1px solid ${props.theme.errorText}`,
+                      "background-color": props.theme.solidPanelBg,
+                    }}
+                  >
+                    {message()}
+                  </div>
+                )}
+              </Show>
+              <Index each={players()}>
+                {(entry) => {
+                  const art = () => artworkUrl(entry().player.artwork);
+                  // Keep the row alive across metadata updates. Replacing its
+                  // DOM node between pointer-down and click drops the gesture.
+                  const [scrubUs, setScrubUs] = createSignal<number>();
+                  const positionUs = () => {
+                    const held = scrubUs();
+                    if (held !== undefined) return held;
+                    tick();
+                    const current = entry();
+                    return current.store.positionUs(current.player.playerId);
+                  };
+                  const seekable = () => {
+                    const current = entry();
+                    return canSeekMpris(
+                      current.readOnly,
+                      current.player.capabilityFlags,
+                      current.player.lengthUs,
+                    );
+                  };
+                  // The scrub stays shown until the server answers, so the
+                  // handle does not flick back to where the track was while
+                  // the seek is in flight. The bridge re-reads and pushes the
+                  // new position before it replies, so by the time this
+                  // releases there is a truthful position to fall back to.
+                  const seek = async (value: number) => {
+                    const current = entry();
+                    const target = mprisSeekTargetUs(
+                      value,
+                      current.player.lengthUs,
+                    );
+                    setScrubUs(target);
+                    await act(current, {
+                      kind: "setPosition",
+                      positionUs: target,
+                      trackRevision: current.player.trackRevision,
+                    });
+                    setScrubUs(undefined);
+                  };
+                  return (
+                    <article
+                      style={{
+                        display: "grid",
+                        "grid-template-columns": "3em minmax(0, 1fr) auto",
+                        gap: `${props.scale.gap}px`,
+                        padding: `${props.scale.panelPadding}px`,
+                        "border-bottom": `1px solid ${props.theme.subtleBorder}`,
+                      }}
+                    >
+                      <Show
+                        when={art()}
+                        fallback={
+                          <span
+                            style={{
+                              "font-size": "2em",
+                              "text-align": "center",
+                            }}
+                          >
+                            ♪
+                          </span>
+                        }
+                      >
+                        {(src) => (
+                          <img
+                            src={src()}
+                            alt=""
+                            width={48}
+                            height={48}
+                            style={{ "object-fit": "cover" }}
+                          />
+                        )}
+                      </Show>
+                      <TapButton
+                        disabled={entry().readOnly}
+                        onClick={() => void act(entry(), { kind: "select" })}
+                        style={{
+                          ...ui.btn,
+                          "min-width": 0,
+                          "text-align": "left",
+                        }}
+                      >
+                        <strong
+                          style={{
+                            display: "block",
+                            overflow: "hidden",
+                            "text-overflow": "ellipsis",
+                          }}
+                        >
+                          {entry().player.title || entry().player.identity}
+                        </strong>
+                        <small style={{ color: props.theme.dimFg }}>
+                          {[
+                            entry().player.artists.join(", "),
+                            entry().player.album,
+                            entry().connectionLabel,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </small>
+                      </TapButton>
+                      <span
+                        style={{
+                          display: "flex",
+                          "flex-direction": "column",
+                          "align-items": "end",
+                        }}
+                      >
+                        {controls(entry)}
+                        <Show
+                          when={canRaiseMpris(
+                            entry().readOnly,
+                            entry().player.capabilityFlags,
+                          )}
+                        >
+                          <TapButton
+                            onClick={() => void act(entry(), { kind: "raise" })}
+                            style={ui.btn}
+                          >
+                            {t("desktop.mediaRaise")}
+                          </TapButton>
+                        </Show>
+                      </span>
+                      <Show when={mprisHasProgress(entry().player.lengthUs)}>
+                        {/* Its own row under the text, not beside it: a bar
+                            squeezed into the title column would be too short
+                            to aim with on the phone this popup also serves. */}
+                        <div
+                          style={{
+                            "grid-column": "2 / -1",
+                            display: "flex",
+                            "align-items": "center",
+                            gap: `${props.scale.tightGap}px`,
+                            color: props.theme.dimFg,
+                            "font-size": `${props.scale.sm}px`,
+                          }}
+                        >
+                          <span
+                            style={{ "font-variant-numeric": "tabular-nums" }}
+                          >
+                            {mediaTime(positionUs())}
+                          </span>
+                          <input
+                            type="range"
+                            min={0}
+                            max={entry().player.lengthUs}
+                            step={1_000}
+                            value={positionUs()}
+                            disabled={!seekable()}
+                            title={t("desktop.mediaSeek")}
+                            aria-label={t("desktop.mediaSeek")}
+                            aria-valuetext={`${mediaTime(positionUs())} / ${mediaTime(entry().player.lengthUs)}`}
+                            onInput={(event) =>
+                              setScrubUs(Number(event.currentTarget.value))
+                            }
+                            onChange={(event) =>
+                              void seek(Number(event.currentTarget.value))
+                            }
+                            style={{
+                              flex: 1,
+                              "min-width": 0,
+                              margin: 0,
+                              "accent-color": props.theme.fg,
+                              cursor: seekable() ? "pointer" : "default",
+                            }}
+                          />
+                          <span
+                            style={{ "font-variant-numeric": "tabular-nums" }}
+                          >
+                            {mediaTime(entry().player.lengthUs)}
+                          </span>
+                        </div>
+                      </Show>
+                    </article>
+                  );
+                }}
+              </Index>
+            </Popup>
+          </Show>
+        </span>
+      )}
+    </Show>
+  );
+}
+
+function PortalChrome(props: {
+  workspace: YasWorkspace;
+  connections: readonly YasConnectionSnapshot[];
+  connectionLabels: ReadonlyMap<string, string>;
+  readOnlyConnections: ReadonlySet<string>;
+  theme: Theme;
+  scale: UIScale;
+}) {
+  const [selected, setSelected] = createSignal<ReadonlySet<bigint>>(new Set());
+  const [choiceValues, setChoiceValues] = createSignal<
+    ReadonlyMap<string, string>
+  >(new Map());
+  let dialog: HTMLDivElement | undefined;
+  let restoreFocus: Element | null = null;
+  const requests = createMemo<PortalEntry[]>(() => {
+    const entries: PortalEntry[] = [];
+    for (const snapshot of props.connections) {
+      const connection = props.workspace.getConnection(snapshot.id);
+      if (!snapshot.supportsDesktopMedia || !connection) continue;
+      if (props.readOnlyConnections.has(snapshot.id)) continue;
+      for (const request of connection.mediaStore.requests.values()) {
+        entries.push({
+          connectionId: snapshot.id,
+          connectionLabel:
+            props.connectionLabels.get(snapshot.id) ?? snapshot.id,
+          readOnly: props.readOnlyConnections.has(snapshot.id),
+          request,
+        });
+      }
+    }
+    return entries;
+  });
+  const active = createMemo<PortalEntry | undefined>(
+    () => requests()[0],
+    undefined,
+    { equals: samePortalPresentationEntry },
+  );
+
+  createEffect(() => {
+    const entry = active();
+    if (!entry) return;
+    setSelected(new Set<bigint>());
+    setChoiceValues(
+      new Map(
+        entry.request.kind === "access"
+          ? entry.request.choices.map((choice) => [
+              choice.id,
+              choice.initialValue,
+            ])
+          : [],
+      ),
+    );
+    restoreFocus = document.activeElement;
+    queueMicrotask(() => dialog?.focus());
+    onCleanup(() => {
+      if (restoreFocus instanceof HTMLElement) restoreFocus.focus();
+    });
+  });
+
+  const reply = (entry: PortalEntry, decision: "deny" | "grant") => {
+    if (entry.readOnly) return;
+    const choices: PortalChoiceValue[] = [...choiceValues()].map(
+      ([id, value]) => ({
+        id,
+        value,
+      }),
+    );
+    props.workspace
+      .getConnection(entry.connectionId)
+      ?.mediaStore.reply(
+        entry.request.requestId,
+        decision,
+        entry.request.kind === "screencast" ? [...selected()] : [],
+        entry.request.kind === "access" ? choices : [],
+      );
+  };
+
+  return (
+    <Show when={active()} keyed>
+      {(entry) => (
+        <Portal>
+          <div
+            style={{
+              position: "fixed",
+              inset: 0,
+              display: "grid",
+              "place-items": "center",
+              padding: "1em",
+              "background-color": "rgba(0,0,0,0.55)",
+              "z-index": z.disconnected + 1,
+            }}
+          >
+            <div
+              ref={dialog}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="yas-portal-title"
+              tabIndex={-1}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  reply(entry, "deny");
+                  return;
+                }
+                if (event.key !== "Tab" || !dialog) return;
+                const target = portalDialogFocusTarget(
+                  dialog,
+                  document.activeElement,
+                  event.shiftKey,
+                );
+                if (target) {
+                  event.preventDefault();
+                  target.focus();
+                }
+              }}
+              style={{
+                width: "min(42em, 100%)",
+                "max-height": "min(80vh, 48em)",
+                overflow: "auto",
+                padding: `${props.scale.panelPadding}px`,
+                "background-color": props.theme.solidPanelBg,
+                color: props.theme.fg,
+                border: `1px solid ${props.theme.border}`,
+                "box-shadow": "0 12px 36px rgba(0,0,0,0.45)",
+              }}
+            >
+              <h2 id="yas-portal-title" style={{ margin: 0 }}>
+                {entry.request.kind === "access"
+                  ? entry.request.title || t("desktop.portalAccess")
+                  : t("desktop.portalScreenCast")}
+              </h2>
+              <p style={{ color: props.theme.dimFg }}>
+                {[entry.request.appId, entry.connectionLabel]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </p>
+              <Show
+                when={entry.request.kind === "access" ? entry.request : null}
+              >
+                {(request) => (
+                  <>
+                    <Show when={request().subtitle}>
+                      <h3>{request().subtitle}</h3>
+                    </Show>
+                    <p style={{ "white-space": "pre-wrap" }}>
+                      {request().body}
+                    </p>
+                    <For each={request().choices}>
+                      {(choice) => (
+                        <label
+                          style={{
+                            display: "block",
+                            "margin-top": `${props.scale.gap}px`,
+                          }}
+                        >
+                          {choice.label}
+                          <select
+                            value={
+                              choiceValues().get(choice.id) ??
+                              choice.initialValue
+                            }
+                            onChange={(event) => {
+                              const next = new Map(choiceValues());
+                              next.set(choice.id, event.currentTarget.value);
+                              setChoiceValues(next);
+                            }}
+                            style={{ display: "block", width: "100%" }}
+                          >
+                            <For each={choice.options}>
+                              {(option) => (
+                                <option value={option.id}>
+                                  {option.value}
+                                </option>
+                              )}
+                            </For>
+                          </select>
+                        </label>
+                      )}
+                    </For>
+                  </>
+                )}
+              </Show>
+              <Show
+                when={
+                  entry.request.kind === "screencast" ? entry.request : null
+                }
+              >
+                {(request) => (
+                  <fieldset style={{ border: 0, padding: 0 }}>
+                    <legend>{t("desktop.portalChooseWindows")}</legend>
+                    <div
+                      style={{
+                        display: "grid",
+                        "grid-template-columns":
+                          "repeat(auto-fit, minmax(12em, 1fr))",
+                        gap: `${props.scale.gap}px`,
+                      }}
+                    >
+                      <For each={request().candidates}>
+                        {(candidate) => (
+                          <label
+                            style={{
+                              display: "block",
+                              padding: `${props.scale.tightGap}px`,
+                              border: `1px solid ${
+                                selected().has(candidate.surfaceId)
+                                  ? props.theme.accent
+                                  : props.theme.border
+                              }`,
+                            }}
+                          >
+                            <Show
+                              when={imageUrl({ png: candidate.thumbnailPng })}
+                            >
+                              {(src) => (
+                                <img
+                                  src={src()}
+                                  alt=""
+                                  style={{
+                                    width: "100%",
+                                    "aspect-ratio": "16 / 9",
+                                    "object-fit": "contain",
+                                  }}
+                                />
+                              )}
+                            </Show>
+                            <input
+                              type={request().multiple ? "checkbox" : "radio"}
+                              name="yas-screencast-source"
+                              checked={selected().has(candidate.surfaceId)}
+                              onChange={() => {
+                                const next = request().multiple
+                                  ? new Set(selected())
+                                  : new Set<bigint>();
+                                if (next.has(candidate.surfaceId))
+                                  next.delete(candidate.surfaceId);
+                                else if (next.size < 4)
+                                  next.add(candidate.surfaceId);
+                                setSelected(next);
+                              }}
+                            />{" "}
+                            <strong>
+                              {candidate.title || candidate.appId}
+                            </strong>
+                            <small
+                              style={{
+                                display: "block",
+                                color: props.theme.dimFg,
+                              }}
+                            >
+                              {candidate.appId} · {candidate.width}×
+                              {candidate.height}
+                            </small>
+                          </label>
+                        )}
+                      </For>
+                    </div>
+                  </fieldset>
+                )}
+              </Show>
+              <div
+                style={{
+                  display: "flex",
+                  "justify-content": "end",
+                  gap: `${props.scale.gap}px`,
+                  "margin-top": `${props.scale.panelPadding}px`,
+                }}
+              >
+                <TapButton
+                  disabled={entry.readOnly}
+                  onClick={() => reply(entry, "deny")}
+                  style={ui.btn}
+                >
+                  {entry.request.kind === "access"
+                    ? entry.request.denyLabel
+                    : t("desktop.portalDeny")}
+                </TapButton>
+                <TapButton
+                  disabled={
+                    entry.readOnly ||
+                    (entry.request.kind === "screencast" &&
+                      selected().size === 0)
+                  }
+                  onClick={() => reply(entry, "grant")}
+                  style={{
+                    ...ui.btn,
+                    padding: `${props.scale.controlY}px ${props.scale.controlX}px`,
+                    "background-color": props.theme.accent,
+                  }}
+                >
+                  {entry.request.kind === "access"
+                    ? entry.request.grantLabel
+                    : t("desktop.portalShare")}
+                </TapButton>
+              </div>
+            </div>
+          </div>
+        </Portal>
+      )}
+    </Show>
+  );
+}
+
+/** Summary, a dim line of provenance, then whatever detail the sender supplied.
+ *  Nothing is hidden: the content image is clamped to a thumbnail rather than
+ *  banner-sized, which is what used to make a single notification take over the
+ *  popup. Clicking the row keeps its freedesktop meaning and activates the
+ *  default action, so that action needs no button of its own. */
+function NotificationCard(props: {
+  entry: NotificationEntry;
+  theme: Theme;
+  scale: UIScale;
+  toast?: boolean;
+  invoke: (key: string | null) => void;
+  dismiss: () => void;
+}) {
+  const icon = createMemo(() => imageUrl(props.entry.item.icon));
+  const image = createMemo(() => imageUrl(props.entry.item.image));
+  const detail = createMemo(() =>
+    desktopNotificationHasDetail(props.entry.item),
+  );
+  const defaultAction = createMemo(() =>
+    props.entry.item.actions.some((action) => action.key === "default"),
+  );
+  const extraActions = createMemo(() =>
+    props.entry.item.actions.filter((action) => action.key !== "default"),
+  );
+  const provenance = () =>
+    [props.entry.item.appName, props.entry.connectionLabel]
+      .filter(Boolean)
+      .join(" · ");
+  const iconSize = () => Math.round(props.scale.icon / 2);
+  return (
+    <article
+      style={{
+        display: "grid",
+        "grid-template-columns": "auto minmax(0, 1fr) auto",
+        "align-items": "center",
+        "column-gap": `${props.scale.gap}px`,
+        "row-gap": `${props.scale.tightGap}px`,
+        padding: `${props.scale.tightGap}px ${props.scale.gap}px`,
+        "border-bottom": props.toast
+          ? undefined
+          : `1px solid ${props.theme.subtleBorder}`,
+        "background-color": props.theme.solidPanelBg,
+        color: props.theme.fg,
+        "font-size": `${props.scale.md}px`,
+      }}
+    >
+      {/* The column is reserved even without an icon: rows sit in a list, and
+          a sender that ships no icon must not shift its neighbours' text. */}
+      <Show
+        when={icon()}
+        fallback={<span style={{ width: `${iconSize()}px` }} />}
+      >
+        {(src) => (
+          <img
+            src={src()}
+            alt=""
+            width={iconSize()}
+            height={iconSize()}
+            style={{ "object-fit": "contain", "align-self": "start" }}
+          />
+        )}
+      </Show>
+      <TapButton
+        disabled={!defaultAction() || props.entry.readOnly}
+        onClick={() => props.invoke(null)}
+        style={mergeStyle(ui.btn, {
+          display: "block",
+          "min-width": 0,
+          padding: 0,
+          opacity: 1,
+          "font-size": "inherit",
+          "text-align": "left",
+          cursor:
+            defaultAction() && !props.entry.readOnly ? "pointer" : "default",
+        })}
+      >
+        <strong style={{ display: "block", "overflow-wrap": "anywhere" }}>
+          {notificationTitle(props.entry.item)}
+        </strong>
+        <Show when={provenance()}>
+          <small
+            style={{
+              display: "block",
+              color: props.theme.dimFg,
+              "font-size": `${props.scale.sm}px`,
+              "overflow-wrap": "anywhere",
+            }}
+          >
+            {provenance()}
+          </small>
+        </Show>
+      </TapButton>
+      <TapButton
+        disabled={props.entry.readOnly}
+        onClick={props.dismiss}
+        title={t("desktop.dismiss")}
+        aria-label={t("desktop.dismiss")}
+        style={mergeStyle(ui.btn, {
+          "align-self": "start",
+          color: props.theme.dimFg,
+          "font-size": `${props.scale.lg}px`,
+          "line-height": 1,
+          padding: `${props.scale.tightGap}px`,
+        })}
+      >
+        ×
+      </TapButton>
+      <Show when={detail()}>
+        <div
+          style={{
+            "grid-column": 2,
+            display: "grid",
+            /* The sender's content image is a thumbnail beside the body, not a
+               banner above it: senders ship 512px squares for a 16px slot. */
+            "grid-template-columns": image()
+              ? "minmax(0, 1fr) auto"
+              : "minmax(0, 1fr)",
+            "align-items": "start",
+            gap: `${props.scale.tightGap}px`,
+            "padding-bottom": `${props.scale.tightGap}px`,
+          }}
+        >
+          <Show when={props.entry.item.body}>
+            <span
+              style={{
+                "white-space": "pre-wrap",
+                "overflow-wrap": "anywhere",
+              }}
+            >
+              {props.entry.item.body}
+            </span>
+          </Show>
+          <Show when={image()}>
+            {(src) => (
+              <img
+                src={src()}
+                alt=""
+                style={{
+                  "grid-column": 2,
+                  "grid-row": 1,
+                  "max-width": `${props.scale.icon}px`,
+                  "max-height": `${props.scale.icon}px`,
+                  "object-fit": "contain",
+                }}
+              />
+            )}
+          </Show>
+          <Show when={extraActions().length > 0}>
+            <div
+              style={{
+                "grid-column": "1 / -1",
+                display: "flex",
+                "flex-wrap": "wrap",
+                gap: `${props.scale.tightGap}px`,
+              }}
+            >
+              <For each={extraActions()}>
+                {(action) => (
+                  <TapButton
+                    disabled={props.entry.readOnly}
+                    onClick={() => props.invoke(action.key)}
+                    style={mergeStyle(ui.btn, {
+                      "font-size": `${props.scale.sm}px`,
+                      padding: `${props.scale.controlY}px ${props.scale.controlX}px`,
+                      border: `1px solid ${props.theme.border}`,
+                    })}
+                  >
+                    {action.label}
+                  </TapButton>
+                )}
+              </For>
+            </div>
+          </Show>
+        </div>
+      </Show>
+    </article>
+  );
+}
+
+function MenuNodes(props: {
+  nodes: readonly TrayMenuNode[];
+  parentId: DesktopId;
+  depth: number;
+  readOnly: boolean;
+  theme: Theme;
+  scale: UIScale;
+  openSubmenu: (id: DesktopId) => void;
+  click: (id: DesktopId) => void;
+}) {
+  const children = createMemo(() =>
+    props.nodes
+      .filter(
+        (node) =>
+          node.parentId === props.parentId &&
+          (node.flags & MENU_NODE_VISIBLE) !== 0,
+      )
+      .sort((a, b) => a.position - b.position),
+  );
+  return (
+    <div role={props.depth === 0 ? "menu" : "group"}>
+      <For each={children()}>
+        {(node) => {
+          const separator = () => (node.flags & MENU_NODE_SEPARATOR) !== 0;
+          const submenu = () => (node.flags & MENU_NODE_SUBMENU) !== 0;
+          const checked = () => node.toggleState === 1;
+          const role = () =>
+            node.flags & MENU_NODE_RADIO
+              ? "menuitemradio"
+              : node.flags & MENU_NODE_CHECKMARK
+                ? "menuitemcheckbox"
+                : "menuitem";
+          return (
+            <Show
+              when={!separator()}
+              fallback={
+                <hr
+                  role="separator"
+                  style={{
+                    border: 0,
+                    "border-top": `1px solid ${props.theme.border}`,
+                  }}
+                />
+              }
+            >
+              <TapButton
+                role={role()}
+                aria-checked={
+                  node.flags & (MENU_NODE_RADIO | MENU_NODE_CHECKMARK)
+                    ? checked()
+                    : undefined
+                }
+                aria-haspopup={submenu() ? "menu" : undefined}
+                disabled={
+                  props.readOnly || (node.flags & MENU_NODE_ENABLED) === 0
+                }
+                onClick={() =>
+                  submenu() ? props.openSubmenu(node.id) : props.click(node.id)
+                }
+                style={{
+                  ...ui.btn,
+                  width: "100%",
+                  display: "grid",
+                  "grid-template-columns": "1.25em minmax(0, 1fr) auto",
+                  gap: `${props.scale.tightGap}px`,
+                  padding: `${props.scale.controlY}px ${props.scale.controlX}px`,
+                  "padding-left": `${props.scale.controlX + props.depth * props.scale.gap}px`,
+                  "text-align": "left",
+                  opacity:
+                    (node.flags & MENU_NODE_ENABLED) === 0 || props.readOnly
+                      ? 0.5
+                      : 1,
+                }}
+              >
+                <span>
+                  <Show
+                    when={imageUrl(node.icon)}
+                    fallback={
+                      node.toggleState >= 0 ? (checked() ? "✓" : "") : ""
+                    }
+                  >
+                    {(src) => <img src={src()} alt="" width={16} height={16} />}
+                  </Show>
+                </span>
+                <span>{node.label}</span>
+                <span>{submenu() ? "›" : ""}</span>
+              </TapButton>
+              <Show when={submenu()}>
+                <MenuNodes
+                  {...props}
+                  parentId={node.id}
+                  depth={props.depth + 1}
+                />
+              </Show>
+            </Show>
+          );
+        }}
+      </For>
+    </div>
+  );
+}
+
+export function DesktopChrome(props: {
+  workspace: YasWorkspace;
+  connections: readonly YasConnectionSnapshot[];
+  connectionLabels: ReadonlyMap<string, string>;
+  readOnlyConnections: ReadonlySet<string>;
+  theme: Theme;
+  scale: UIScale;
+  compact: boolean;
+  focusedConnectionId?: string;
+  onRaisePlayer?: (player: {
+    connectionId: string;
+    desktopEntry: string;
+    identity: string;
+  }) => void;
+}) {
+  const [toasts, setToasts] = createSignal<Toast[]>([]);
+  const [bellOpen, setBellOpen] = createSignal(false);
+  const [trayOpen, setTrayOpen] = createSignal(false);
+  const [menu, setMenu] = createSignal<MenuState | null>(null);
+  /**
+   * Tracks an explicit `openMenu` request so a menu update from the server is
+   * only shown when the user asked for it. Without this, clicking a menu item
+   * closes the menu but the application's own menu refresh (e.g. updating a
+   * checkmark) arrives a moment later and reopens it.
+   */
+  const [pendingMenuKey, setPendingMenuKey] = createSignal<string | null>(null);
+  const menuKey = (connectionId: string, trayId: DesktopId) =>
+    `${connectionId}:${desktopResourceKey(trayId)}`;
+  const [permission, setPermission] = createSignal<NotificationPermission>(
+    typeof Notification === "undefined" ? "denied" : Notification.permission,
+  );
+  const toastTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const nativeShown = new Map<
+    string,
+    {
+      tag: string;
+      connectionId: string;
+      bootGeneration: string;
+      notificationId: string;
+    }
+  >();
+  let root: HTMLSpanElement | undefined;
+
+  const tray = createMemo<TrayEntry[]>(() => {
+    const entries: TrayEntry[] = [];
+    for (const snapshot of props.connections) {
+      const connection = props.workspace.getConnection(snapshot.id);
+      if (!snapshot.supportsDesktop || !connection) continue;
+      for (const item of connection.desktopStore.tray.values()) {
+        entries.push({
+          connectionId: snapshot.id,
+          connectionLabel: props.connectionLabels.get(snapshot.id) ?? "",
+          readOnly: props.readOnlyConnections.has(snapshot.id),
+          item,
+        });
+      }
+    }
+    return entries.sort(
+      (a, b) =>
+        props.connections.findIndex((item) => item.id === a.connectionId) -
+          props.connections.findIndex((item) => item.id === b.connectionId) ||
+        a.item.category - b.item.category ||
+        compareResourceId(a.item.trayId, b.item.trayId),
+    );
+  });
+  const visibleTray = createMemo(() =>
+    tray().filter((entry) => entry.item.status !== TRAY_STATUS_PASSIVE),
+  );
+  const trayKey = (entry: TrayEntry) =>
+    menuKey(entry.connectionId, entry.item.trayId);
+  const trayByKey = createMemo(
+    () => new Map(tray().map((entry) => [trayKey(entry), entry])),
+  );
+  // Connection snapshots arrive during presses. Key the DOM by tray handle
+  // and read current properties through an accessor so a refresh cannot
+  // detach the finger's target or discard TapButton's gesture tracking.
+  const currentTrayEntry = (key: string) =>
+    createMemo<TrayEntry>(
+      (previous) => trayByKey().get(key) ?? previous,
+      trayByKey().get(key)!,
+    );
+  const overflowTray = createMemo(() => {
+    const shown = new Set(
+      visibleTray()
+        .slice(0, props.compact ? 0 : 4)
+        .map(
+          (entry) =>
+            `${entry.connectionId}:${desktopResourceKey(entry.item.trayId)}`,
+        ),
+    );
+    return tray().filter(
+      (entry) =>
+        !shown.has(
+          `${entry.connectionId}:${desktopResourceKey(entry.item.trayId)}`,
+        ),
+    );
+  });
+  const desktopEnabled = createMemo(() =>
+    props.connections.some((connection) => connection.supportsDesktop),
+  );
+  const notifications = createMemo<NotificationEntry[]>(() => {
+    const entries: NotificationEntry[] = [];
+    for (const snapshot of props.connections) {
+      const connection = props.workspace.getConnection(snapshot.id);
+      if (!snapshot.supportsDesktop || !connection) continue;
+      for (const item of connection.desktopStore.notifications.values()) {
+        entries.push({
+          connectionId: snapshot.id,
+          connectionLabel: props.connectionLabels.get(snapshot.id) ?? "",
+          bootGeneration: snapshot.bootGeneration,
+          readOnly: props.readOnlyConnections.has(snapshot.id),
+          item,
+        });
+      }
+    }
+    return entries;
+  });
+
+  const invoke = (entry: NotificationEntry, key: string | null) => {
+    if (entry.readOnly) return;
+    const store = props.workspace.getConnection(
+      entry.connectionId,
+    )?.desktopStore;
+    if (key == null) {
+      store?.invokeDefault(entry.item.notificationId, entry.item.revision);
+    } else {
+      store?.invokeAction(entry.item.notificationId, entry.item.revision, key);
+    }
+  };
+  const dismiss = (entry: NotificationEntry) => {
+    if (entry.readOnly) return;
+    props.workspace
+      .getConnection(entry.connectionId)
+      ?.desktopStore.dismiss(entry.item.notificationId, entry.item.revision);
+  };
+
+  const showNative = (entry: NotificationEntry) => {
+    const tag = desktopNativeTag(
+      entry.connectionId,
+      entry.bootGeneration,
+      entry.item.notificationId,
+    );
+    if (!tag) return;
+    nativeShown.set(
+      notificationKey(entry.connectionId, entry.item.notificationId),
+      {
+        tag,
+        connectionId: entry.connectionId,
+        bootGeneration: entry.bootGeneration!.toString(),
+        notificationId: desktopResourceKey(entry.item.notificationId),
+      },
+    );
+    void postWorker({
+      type: "yas-desktop-notification-show",
+      tag,
+      connectionId: entry.connectionId,
+      bootGeneration: entry.bootGeneration!.toString(),
+      notificationId: desktopResourceKey(entry.item.notificationId),
+      revision: desktopResourceKey(entry.item.revision),
+      title: notificationTitle(entry.item),
+      body: entry.item.body,
+      icon: imageUrl(entry.item.icon),
+      image: imageUrl(entry.item.image),
+    });
+  };
+
+  const raise = (entry: NotificationEntry) => {
+    const delivery = desktopDelivery(document.visibilityState, permission());
+    if (delivery === "native") {
+      showNative(entry);
+      return;
+    }
+    if (delivery === "toast") {
+      const key = notificationKey(
+        entry.connectionId,
+        entry.item.notificationId,
+      );
+      setToasts((items) => [
+        ...items.filter((item) => item.key !== key),
+        { ...entry, key },
+      ]);
+      const previous = toastTimers.get(key);
+      if (previous) clearTimeout(previous);
+      toastTimers.set(
+        key,
+        setTimeout(
+          () => {
+            setToasts((items) => items.filter((item) => item.key !== key));
+            toastTimers.delete(key);
+          },
+          entry.item.urgency === 2 ? 10_000 : 6_000,
+        ),
+      );
+    }
+  };
+
+  createEffect(() => {
+    const cleanups: (() => void)[] = [];
+    for (const snapshot of props.connections) {
+      const connection = props.workspace.getConnection(snapshot.id);
+      if (!snapshot.supportsDesktop || !connection) continue;
+      const label = props.connectionLabels.get(snapshot.id) ?? "";
+      const readOnly = props.readOnlyConnections.has(snapshot.id);
+      cleanups.push(
+        connection.desktopStore.onNotificationRaised((item) =>
+          raise({
+            connectionId: snapshot.id,
+            connectionLabel: label,
+            bootGeneration: snapshot.bootGeneration,
+            readOnly,
+            item,
+          }),
+        ),
+        connection.desktopStore.onTrayMenu((next) => {
+          const entry = tray().find(
+            (candidate) =>
+              candidate.connectionId === snapshot.id &&
+              candidate.item.trayId === next.trayId,
+          );
+          const key = menuKey(snapshot.id, next.trayId);
+          const expecting = pendingMenuKey();
+          const current = menu();
+          if (next.status === TRAY_MENU_OK && entry) {
+            if (
+              expecting === key ||
+              (current?.entry.connectionId === snapshot.id &&
+                current.entry.item.trayId === next.trayId)
+            ) {
+              setMenu({ entry, menu: next });
+            }
+            if (expecting === key) setPendingMenuKey(null);
+          } else if (next.status !== TRAY_MENU_OK) {
+            setMenu(null);
+            if (expecting === key) setPendingMenuKey(null);
+          }
+        }),
+      );
+    }
+    onCleanup(() => cleanups.forEach((cleanup) => cleanup()));
+  });
+
+  createEffect(() => {
+    const active = new Set(
+      notifications().map(
+        (entry) =>
+          `${entry.connectionId}:${entry.bootGeneration}:${desktopResourceKey(entry.item.notificationId)}:${desktopResourceKey(entry.item.revision)}`,
+      ),
+    );
+    setToasts((items) =>
+      items.filter((entry) =>
+        active.has(
+          `${entry.connectionId}:${entry.bootGeneration}:${desktopResourceKey(entry.item.notificationId)}:${desktopResourceKey(entry.item.revision)}`,
+        ),
+      ),
+    );
+    for (const [key, shown] of nativeShown) {
+      const current = notifications().find(
+        (entry) =>
+          entry.connectionId === shown.connectionId &&
+          String(entry.bootGeneration) === shown.bootGeneration &&
+          desktopResourceKey(entry.item.notificationId) ===
+            shown.notificationId,
+      );
+      if (!current) {
+        nativeShown.delete(key);
+        void postWorker({
+          type: "yas-desktop-notification-close",
+          tag: shown.tag,
+        });
+      }
+    }
+  });
+
+  const openTrayMenu = (entry: TrayEntry, parentId: DesktopId = 0n) => {
+    if (entry.readOnly) return;
+    setTrayOpen(false);
+    setBellOpen(false);
+    setPendingMenuKey(menuKey(entry.connectionId, entry.item.trayId));
+    props.workspace
+      .getConnection(entry.connectionId)
+      ?.desktopStore.openMenu(
+        entry.item.trayId,
+        menu()?.entry.item.trayId === entry.item.trayId
+          ? menu()!.menu.menuRevision
+          : 0n,
+        parentId,
+      );
+  };
+  const activateTray = (entry: TrayEntry, gesture: TrayPrimaryGesture) => {
+    if (entry.readOnly) return;
+    if (gesture === "menu") openTrayMenu(entry);
+    else if (gesture === "activate") {
+      props.workspace
+        .getConnection(entry.connectionId)
+        ?.desktopStore.activate(entry.item.trayId);
+    }
+  };
+
+  onMount(() => {
+    const pointer = (event: PointerEvent) => {
+      if (root && !root.contains(event.target as Node)) {
+        setBellOpen(false);
+        setTrayOpen(false);
+        setMenu(null);
+        setPendingMenuKey(null);
+      }
+    };
+    const key = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setBellOpen(false);
+      setTrayOpen(false);
+      setMenu(null);
+      setPendingMenuKey(null);
+    };
+    const worker = (event: MessageEvent) => {
+      const data = event.data as {
+        type?: string;
+        connectionId?: string;
+        bootGeneration?: string;
+        notificationId?: string;
+        revision?: string;
+      } | null;
+      if (data?.type !== "yas-desktop-notification-click") return;
+      const entry = notifications().find(
+        (candidate) =>
+          candidate.connectionId === data.connectionId &&
+          candidate.bootGeneration?.toString() === data.bootGeneration &&
+          matchesDesktopNotification(candidate.item, data),
+      );
+      if (
+        entry &&
+        entry.item.actions.some((action) => action.key === "default")
+      ) {
+        invoke(entry, null);
+      }
+    };
+    document.addEventListener("pointerdown", pointer, true);
+    document.addEventListener("keydown", key, true);
+    navigator.serviceWorker?.addEventListener("message", worker);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", pointer, true);
+      document.removeEventListener("keydown", key, true);
+      navigator.serviceWorker?.removeEventListener("message", worker);
+      toastTimers.forEach(clearTimeout);
+    });
+  });
+
+  const trayButton = (entry: Accessor<TrayEntry>): JSX.Element => {
+    let primaryPointerType: string | null = null;
+    // A long press on a touch screen fires `contextmenu` and then a trailing
+    // `click` on the same press. The press has already opened the menu, so
+    // letting the click through activated the item as well: the app's window
+    // came up behind the menu the user was reading, and the repaint that
+    // followed could take the menu with it.
+    let openedFromLongPress = false;
+    const icon = () => imageUrl(entry().item.icon);
+    const iconSize = () =>
+      `var(--yas-bar-icon-size, ${props.scale.icon / 2}px)`;
+    const title = () =>
+      [
+        entry().item.tooltipTitle || entry().item.title || entry().item.appId,
+        entry().item.tooltipBody,
+        entry().connectionLabel,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    const primaryClick = (
+      pointerType = primaryPointerType,
+      openedMenu = openedFromLongPress,
+    ) => {
+      const gesture = trayPrimaryGesture(
+        entry().item.flags,
+        pointerType,
+        openedMenu,
+      );
+      primaryPointerType = null;
+      openedFromLongPress = false;
+      activateTray(entry(), gesture);
+    };
+    return (
+      <TapButton
+        disabled={entry().readOnly}
+        onPointerDown={(event) => {
+          primaryPointerType = event.pointerType;
+          openedFromLongPress = false;
+        }}
+        onPointerCancel={() => {
+          primaryPointerType = null;
+        }}
+        onClick={() => primaryClick()}
+        // TapButton cancels touch activation when this press opens a context
+        // menu, so a completed tap cannot be the trailing long-press click.
+        onTouchClick={() => primaryClick("touch", false)}
+        onContextMenu={(event) => {
+          openedFromLongPress = primaryPointerType === "touch";
+          primaryPointerType = null;
+          event.preventDefault();
+          openTrayMenu(entry());
+        }}
+        onAuxClick={(event) => {
+          if (event.button !== 1 || entry().readOnly) return;
+          props.workspace
+            .getConnection(entry().connectionId)
+            ?.desktopStore.secondaryActivate(entry().item.trayId);
+        }}
+        onWheel={(event) => {
+          if (entry().readOnly) return;
+          event.preventDefault();
+          const horizontal = Math.abs(event.deltaX) > Math.abs(event.deltaY);
+          const raw = horizontal ? event.deltaX : event.deltaY;
+          props.workspace
+            .getConnection(entry().connectionId)
+            ?.desktopStore.scroll(
+              entry().item.trayId,
+              Math.max(-1_000, Math.min(1_000, Math.trunc(raw))),
+              horizontal,
+            );
+        }}
+        title={title()}
+        aria-label={title() || t("desktop.trayItem")}
+        aria-haspopup={
+          trayPrimaryOpensMenu(entry().item.flags, true) ? "menu" : undefined
+        }
+        style={mergeStyle(ui.btn, {
+          width: `var(--yas-bar-button-width, ${props.scale.icon / 2}px)`,
+          "min-height": iconSize(),
+          "flex-shrink": 0,
+          "align-self": "stretch",
+          display: "grid",
+          "place-items": "center",
+          padding: 0,
+          "font-size": iconSize(),
+          "line-height": 1,
+          "border-radius": "3px",
+          "background-color":
+            entry().item.status === TRAY_STATUS_NEEDS_ATTENTION
+              ? props.theme.warning
+              : "transparent",
+          opacity: entry().readOnly ? 0.5 : 1,
+          "touch-action": "manipulation",
+          "-webkit-touch-callout": "none",
+        })}
+      >
+        <Show when={icon()} fallback={<span>●</span>}>
+          <img
+            src={icon()}
+            alt=""
+            draggable={false}
+            style={{
+              // Percentage dimensions follow the wider hit area and can
+              // make the image's intrinsic grid size overflow the bar.
+              width: iconSize(),
+              height: iconSize(),
+              display: "block",
+              "object-fit": "contain",
+              "pointer-events": "none",
+            }}
+          />
+        </Show>
+      </TapButton>
+    );
+  };
+
+  return (
+    <span
+      ref={root}
+      data-yas-desktop-chrome=""
+      style={{ display: "flex", "align-items": "center", position: "relative" }}
+    >
+      {/* Camera and microphone are not here: their controls, their preview
+          and their privacy indicator all belong to the media panel, which
+          costs the bar one glyph instead of a row of chips. See
+          `mediaDevices.ts` and the `media` entry in StatusBar's tools. */}
+      <PortalChrome
+        workspace={props.workspace}
+        connections={props.connections}
+        connectionLabels={props.connectionLabels}
+        readOnlyConnections={props.readOnlyConnections}
+        theme={props.theme}
+        scale={props.scale}
+      />
+      <MprisChrome
+        workspace={props.workspace}
+        connections={props.connections}
+        connectionLabels={props.connectionLabels}
+        readOnlyConnections={props.readOnlyConnections}
+        theme={props.theme}
+        scale={props.scale}
+        compact={props.compact}
+        focusedConnectionId={props.focusedConnectionId}
+        onRaisePlayer={props.onRaisePlayer}
+        closeOthers={() => {
+          setBellOpen(false);
+          setTrayOpen(false);
+          setMenu(null);
+          setPendingMenuKey(null);
+        }}
+      />
+      <For
+        each={visibleTray()
+          .slice(0, props.compact ? 0 : 4)
+          .map(trayKey)}
+      >
+        {(key) => trayButton(currentTrayEntry(key))}
+      </For>
+      <Show when={overflowTray().length > 0}>
+        <TapButton
+          onClick={() => {
+            setTrayOpen((open) => !open);
+            setBellOpen(false);
+          }}
+          title={t("desktop.trayOverflow")}
+          aria-label={t("desktop.trayOverflow")}
+          aria-haspopup="menu"
+          aria-expanded={trayOpen()}
+          style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
+        >
+          ◉{overflowTray().length}
+        </TapButton>
+        <Show when={trayOpen()}>
+          <Popup theme={props.theme} scale={props.scale} width="18em">
+            <div role="menu" style={{ padding: `${props.scale.tightGap}px` }}>
+              <For each={overflowTray().map(trayKey)}>
+                {(key) => {
+                  const entry = currentTrayEntry(key);
+                  return (
+                    <div
+                      style={{
+                        display: "flex",
+                        "align-items": "center",
+                        gap: `${props.scale.gap}px`,
+                      }}
+                    >
+                      {trayButton(entry)}
+                      <span
+                        style={{ "min-width": 0, "overflow-wrap": "anywhere" }}
+                      >
+                        {entry().item.title ||
+                          entry().item.appId ||
+                          t("desktop.trayItem")}
+                        <Show when={entry().connectionLabel}>
+                          <small
+                            style={{
+                              display: "block",
+                              color: props.theme.dimFg,
+                            }}
+                          >
+                            {entry().connectionLabel}
+                          </small>
+                        </Show>
+                      </span>
+                    </div>
+                  );
+                }}
+              </For>
+            </div>
+          </Popup>
+        </Show>
+      </Show>
+      <Show
+        when={
+          desktopEnabled() &&
+          (notifications().length > 0 || permission() !== "granted")
+        }
+      >
+        <TapButton
+          onClick={() => {
+            setBellOpen((open) => !open);
+            setTrayOpen(false);
+          }}
+          title={t("desktop.notifications")}
+          aria-label={t("desktop.notifications")}
+          aria-haspopup="menu"
+          aria-expanded={bellOpen()}
+          style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
+        >
+          ♢
+          <Show when={notifications().length > 0}>
+            {notifications().length}
+          </Show>
+        </TapButton>
+        <Show when={bellOpen()}>
+          <Popup
+            theme={props.theme}
+            scale={props.scale}
+            width="min(21em, calc(100vw - 1.5em))"
+            maxHeight="min(60vh, 30em)"
+          >
+            <Show when={notifications().length > 1}>
+              <header
+                style={{
+                  display: "flex",
+                  "align-items": "center",
+                  "justify-content": "space-between",
+                  gap: `${props.scale.gap}px`,
+                  padding: `${props.scale.tightGap}px ${props.scale.gap}px`,
+                  "border-bottom": `1px solid ${props.theme.subtleBorder}`,
+                  color: props.theme.dimFg,
+                  "font-size": `${props.scale.sm}px`,
+                }}
+              >
+                <span>
+                  {tp("desktop.notificationCount", {
+                    count: notifications().length,
+                  })}
+                </span>
+                <TapButton
+                  onClick={() => notifications().forEach(dismiss)}
+                  style={mergeStyle(ui.btn, {
+                    "font-size": "inherit",
+                    padding: `0 ${props.scale.tightGap}px`,
+                  })}
+                >
+                  {t("desktop.dismissAll")}
+                </TapButton>
+              </header>
+            </Show>
+            <Show
+              when={notifications().length > 0}
+              fallback={
+                <p
+                  style={{
+                    margin: 0,
+                    padding: `${props.scale.gap}px`,
+                    color: props.theme.dimFg,
+                  }}
+                >
+                  {t("desktop.noNotifications")}
+                </p>
+              }
+            >
+              <For each={notifications()}>
+                {(entry) => (
+                  <NotificationCard
+                    entry={entry}
+                    theme={props.theme}
+                    scale={props.scale}
+                    invoke={(action) => invoke(entry, action)}
+                    dismiss={() => dismiss(entry)}
+                  />
+                )}
+              </For>
+            </Show>
+            <Show when={permission() === "default"}>
+              <TapButton
+                onClick={async () => {
+                  if (typeof Notification === "undefined") return;
+                  const result = await Notification.requestPermission();
+                  setPermission(result);
+                  if (result === "granted") await desktopWorkerRegistration();
+                }}
+                style={mergeStyle(ui.btn, {
+                  display: "block",
+                  width: "100%",
+                  padding: `${props.scale.tightGap}px ${props.scale.gap}px`,
+                  "border-top": `1px solid ${props.theme.subtleBorder}`,
+                  "font-size": `${props.scale.sm}px`,
+                  color: props.theme.dimFg,
+                  "text-align": "left",
+                })}
+              >
+                {t("desktop.enableSystemNotifications")}
+              </TapButton>
+            </Show>
+            <Show when={permission() === "denied"}>
+              <p
+                style={{
+                  margin: 0,
+                  padding: `${props.scale.tightGap}px ${props.scale.gap}px`,
+                  "border-top": `1px solid ${props.theme.subtleBorder}`,
+                  "font-size": `${props.scale.sm}px`,
+                  color: props.theme.dimFg,
+                }}
+              >
+                {t("desktop.systemNotificationsBlocked")}
+              </p>
+            </Show>
+          </Popup>
+        </Show>
+      </Show>
+      <Show when={menu()} keyed>
+        {(state) => (
+          <Popup theme={props.theme} scale={props.scale} width="20em">
+            <MenuNodes
+              nodes={state.menu.nodes}
+              parentId={0n}
+              depth={0}
+              readOnly={state.entry.readOnly}
+              theme={props.theme}
+              scale={props.scale}
+              openSubmenu={(id) => openTrayMenu(state.entry, id)}
+              click={(id) => {
+                props.workspace
+                  .getConnection(state.entry.connectionId)
+                  ?.desktopStore.clickMenuItem(
+                    state.entry.item.trayId,
+                    state.menu.menuRevision,
+                    id,
+                  );
+                setMenu(null);
+                setPendingMenuKey(null);
+              }}
+            />
+          </Popup>
+        )}
+      </Show>
+      <Portal>
+        <div
+          aria-live="polite"
+          style={{
+            position: "fixed",
+            right: "1em",
+            bottom: "3em",
+            width: "min(24em, calc(100vw - 2em))",
+            display: "flex",
+            "flex-direction": "column",
+            gap: `${props.scale.gap}px`,
+            "z-index": z.disconnected,
+            "pointer-events": "none",
+          }}
+        >
+          <For each={toasts()}>
+            {(toast) => (
+              <div
+                role="status"
+                style={{
+                  border: `1px solid ${props.theme.border}`,
+                  "box-shadow": "0 8px 24px rgba(0,0,0,0.35)",
+                  "pointer-events": "auto",
+                }}
+              >
+                <NotificationCard
+                  entry={toast}
+                  theme={props.theme}
+                  scale={props.scale}
+                  toast
+                  invoke={(key) => invoke(toast, key)}
+                  dismiss={() => dismiss(toast)}
+                />
+              </div>
+            )}
+          </For>
+        </div>
+      </Portal>
+    </span>
+  );
+}

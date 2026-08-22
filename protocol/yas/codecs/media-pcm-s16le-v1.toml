@@ -1,0 +1,13 @@
+schema = 1
+name = "media-pcm-s16le-v1"
+const_name = "MEDIA_CODEC_PCM_S16LE"
+family = "yas.media"
+id = 1
+version = 1
+direction = "bidirectional"
+layout = "Interleaved signed 16-bit little-endian samples in MediaFormat channel order; payload length is a nonzero multiple of channels*2. One FRAME payload contains complete sample frames and no codec-local header."
+golden_hex = "0000ff7f0080ffff"
+
+[[constant]]
+name = "SAMPLE_BYTES"
+value = 2

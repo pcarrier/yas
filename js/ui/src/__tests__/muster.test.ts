@@ -1,0 +1,547 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  EVENT_CAP,
+  followMuster,
+  groupUnits,
+  instanceCanStart,
+  musterDiagram,
+  MusterMirror,
+  formatMusterHandle,
+  openMuster,
+  unitCanStop,
+  unitHasDetails,
+  unitStartVerb,
+  type MusterUnit,
+} from "../muster";
+
+function unit(name: string, over: Record<string, unknown> = {}) {
+  return {
+    name,
+    instance: null,
+    description: `${name} unit`,
+    phase: "running",
+    pty: "0000000000000007",
+    restarts: 0,
+    lastExit: null,
+    requires: [],
+    autostart: true,
+    stale: false,
+    type: "simple",
+    surfaces: [],
+    runs: [],
+    ...over,
+  };
+}
+
+describe("MusterMirror", () => {
+  it("formats canonical handles as fixed-width lowercase hex without a prefix", () => {
+    expect(formatMusterHandle(1n)).toBe("0000000000000001");
+    expect(formatMusterHandle(0xabcdef0123456789n)).toBe("abcdef0123456789");
+    expect(formatMusterHandle(18_446_744_073_709_551_615n)).toBe(
+      "ffffffffffffffff",
+    );
+    expect(() => formatMusterHandle(0n)).toThrow(RangeError);
+    expect(() => formatMusterHandle(18_446_744_073_709_551_616n)).toThrow(
+      RangeError,
+    );
+  });
+
+  it("takes the directory from the greeting and stays unready", () => {
+    const mirror = new MusterMirror();
+    mirror.apply(
+      JSON.stringify({ type: "hello", version: 1, dir: "/home/p/.config/m" }),
+    );
+    expect(mirror.dir).toBe("/home/p/.config/m");
+    // The greeting says where, not what: until a full frame lands, an empty
+    // table means "not told yet", which is not the same as "no units".
+    expect(mirror.ready).toBe(false);
+  });
+
+  it("replaces the table on a full frame and drops what it omits", () => {
+    const mirror = new MusterMirror();
+    mirror.apply(
+      JSON.stringify({
+        type: "state",
+        full: true,
+        dir: "/d",
+        units: [unit("api"), unit("web")],
+        instances: [{ name: "main", stack: "dev", members: ["main/api"] }],
+        gone: [],
+      }),
+    );
+    expect([...mirror.units.keys()]).toEqual(["api", "web"]);
+    expect(mirror.instances.get("main")?.stack).toBe("dev");
+    expect(mirror.ready).toBe(true);
+
+    mirror.apply(
+      JSON.stringify({
+        type: "state",
+        full: true,
+        units: [unit("api")],
+        instances: [],
+        gone: [],
+      }),
+    );
+    // Not listed in a full frame is gone; a full frame is the whole truth.
+    expect([...mirror.units.keys()]).toEqual(["api"]);
+    expect(mirror.instances.size).toBe(0);
+  });
+
+  it("merges a partial frame and honours its gone list", () => {
+    const mirror = new MusterMirror();
+    mirror.apply(
+      JSON.stringify({
+        type: "state",
+        full: true,
+        units: [unit("api"), unit("web")],
+        instances: [],
+        gone: [],
+      }),
+    );
+    mirror.apply(
+      JSON.stringify({
+        type: "state",
+        units: [unit("api", { phase: "backoff", restarts: 3 })],
+        gone: ["web"],
+      }),
+    );
+    expect(mirror.units.get("api")?.phase).toBe("backoff");
+    expect(mirror.units.get("api")?.restarts).toBe(3);
+    expect(mirror.units.has("web")).toBe(false);
+    // A partial frame names only what changed, so everything else it does not
+    // mention is untouched rather than absent.
+    expect(mirror.units.size).toBe(1);
+  });
+
+  it("keeps a unit whole rather than patching its fields", () => {
+    const mirror = new MusterMirror();
+    mirror.apply(
+      JSON.stringify({
+        type: "state",
+        full: true,
+        units: [
+          unit("web", {
+            surfaces: [
+              { id: "0000000000000004", title: "x", width: 1, height: 2 },
+            ],
+          }),
+        ],
+        instances: [],
+      }),
+    );
+    mirror.apply(
+      JSON.stringify({ type: "state", units: [unit("web")], gone: [] }),
+    );
+    // The replacement carries no surfaces, so the unit has none — a frame is
+    // not a patch, and remembering the old list would show a dead window.
+    expect(mirror.units.get("web")?.surfaces).toEqual([]);
+  });
+
+  it("appends event batches, caps them, and reports each batch", () => {
+    const seen: string[] = [];
+    const mirror = new MusterMirror((events) => {
+      for (const event of events) seen.push(event.event);
+    });
+    mirror.apply(
+      JSON.stringify({
+        type: "events",
+        records: [
+          { seq: 1, ts: 10, unit: "api", event: "started", phase: "running" },
+          { seq: 2, ts: 11, unit: "api", event: "exited", phase: "backoff" },
+        ],
+      }),
+    );
+    expect(seen).toEqual(["started", "exited"]);
+    expect(mirror.events.map((e) => e.seq)).toEqual([1, 2]);
+
+    mirror.apply(
+      JSON.stringify({
+        type: "events",
+        records: Array.from({ length: EVENT_CAP + 10 }, (_, index) => ({
+          seq: index + 3,
+          ts: 12,
+          unit: "api",
+          event: "tick",
+          phase: "running",
+        })),
+      }),
+    );
+    expect(mirror.events.length).toBe(EVENT_CAP);
+    // The cap drops from the front: what is kept is the newest.
+    expect(mirror.events[mirror.events.length - 1]?.seq).toBe(EVENT_CAP + 12);
+  });
+
+  it("ignores malformed payloads and unknown message types", () => {
+    const mirror = new MusterMirror();
+    expect(() => mirror.apply("not json")).not.toThrow();
+    expect(() =>
+      mirror.apply(JSON.stringify({ type: "future" })),
+    ).not.toThrow();
+    expect(() => mirror.apply(JSON.stringify([1, 2]))).not.toThrow();
+    expect(mirror.units.size).toBe(0);
+  });
+
+  it("drops rows it cannot identify rather than inventing a name", () => {
+    const mirror = new MusterMirror();
+    mirror.apply(
+      JSON.stringify({
+        type: "state",
+        full: true,
+        units: [unit("api"), { description: "nameless" }, 7],
+        instances: [{ stack: "dev" }],
+      }),
+    );
+    expect([...mirror.units.keys()]).toEqual(["api"]);
+    expect(mirror.instances.size).toBe(0);
+  });
+});
+
+describe("groupUnits", () => {
+  const build = (rows: MusterUnit[]) =>
+    new Map(rows.map((row) => [row.name, row]));
+
+  it("nests members under their instance and lists the rest after", () => {
+    const units = build([
+      unit("main/api") as unknown as MusterUnit,
+      unit("main/web") as unknown as MusterUnit,
+      unit("standalone") as unknown as MusterUnit,
+    ]);
+    const instances = new Map([
+      [
+        "main",
+        { name: "main", stack: "dev", members: ["main/api", "main/web"] },
+      ],
+    ]);
+    const groups = groupUnits(units, instances);
+    expect(groups.map((g) => g.instance?.name ?? null)).toEqual(["main", null]);
+    expect(groups[0]?.units.map((u) => u.name)).toEqual([
+      "main/api",
+      "main/web",
+    ]);
+    expect(groups[1]?.units.map((u) => u.name)).toEqual(["standalone"]);
+  });
+
+  it("keeps an instance whose expansion produced nothing", () => {
+    const groups = groupUnits(
+      new Map(),
+      new Map([["broken", { name: "broken", stack: "dev", members: [] }]]),
+    );
+    // A stack that failed to expand is declared but empty; dropping the group
+    // would make a broken instance look like one that was never written.
+    expect(groups).toEqual([
+      { instance: { name: "broken", stack: "dev", members: [] }, units: [] },
+    ]);
+  });
+
+  it("omits the loose group when every unit belongs to an instance", () => {
+    const units = build([unit("main/api") as unknown as MusterUnit]);
+    const instances = new Map([
+      ["main", { name: "main", stack: "dev", members: ["main/api"] }],
+    ]);
+    expect(groupUnits(units, instances).length).toBe(1);
+  });
+});
+
+describe("musterDiagram", () => {
+  it("groups units and draws requirements toward their dependents", () => {
+    const units = new Map(
+      [
+        unit("main/build", {
+          instance: "main",
+          phase: "exited",
+          type: "oneshot",
+        }),
+        unit("main/api", {
+          instance: "main",
+          requires: ["main/build"],
+        }),
+        unit("worker", {
+          phase: "failed",
+          requires: ["main/api"],
+        }),
+      ].map((row) => [row.name, row as unknown as MusterUnit]),
+    );
+    const instances = new Map([
+      [
+        "main",
+        {
+          name: "main",
+          stack: "dev",
+          members: ["main/build", "main/api"],
+        },
+      ],
+    ]);
+
+    const diagram = musterDiagram(units, instances);
+    expect(diagram.nodes).toBe(3);
+    expect(diagram.edges).toBe(2);
+    expect(diagram.source).toContain('subgraph group_0["main"]');
+    expect(diagram.source).toContain('unit_0["✓ build"]');
+    expect(diagram.source).toContain('unit_1["● api"]');
+    expect(diagram.source).toContain('subgraph group_1["Standalone"]');
+    expect(diagram.source).toContain('unit_2["! worker"]');
+    expect(diagram.source).toContain("unit_0 --> unit_1");
+    expect(diagram.source).toContain("unit_1 --> unit_2");
+  });
+
+  it("escapes labels and ignores missing or duplicate requirements", () => {
+    const odd = unit('odd <&" name', {
+      phase: "stopped",
+      requires: ["missing", "missing"],
+    }) as unknown as MusterUnit;
+    const diagram = musterDiagram(new Map([[odd.name, odd]]), new Map());
+
+    expect(diagram.source).toContain("○ odd &lt;&amp;&quot; name");
+    expect(diagram.edges).toBe(0);
+  });
+});
+
+describe("unitHasDetails", () => {
+  it("does not disclose a card whose summary is the whole story", () => {
+    expect(unitHasDetails(unit("plain") as unknown as MusterUnit)).toBe(false);
+  });
+
+  it.each([
+    ["failures", { restarts: 2 }],
+    ["last exit", { lastExit: 0 }],
+    ["requirements", { requires: ["build"] }],
+    ["windows", { surfaces: [{ id: 1n, title: "", width: 80, height: 24 }] }],
+    ["retained runs", { runs: [{ pty: 19n, exitCode: -15, seq: 1 }] }],
+  ])("discloses %s", (_label, details) => {
+    expect(
+      unitHasDetails(unit("detailed", details) as unknown as MusterUnit),
+    ).toBe(true);
+  });
+});
+
+describe("unitStartVerb", () => {
+  it("restarts completed oneshots instead of sending a no-op start", () => {
+    expect(unitStartVerb({ phase: "exited" })).toBe("restart");
+  });
+
+  it("restarts live units and starts inactive units", () => {
+    expect(unitStartVerb({ phase: "running" })).toBe("restart");
+    expect(unitStartVerb({ phase: "activating" })).toBe("restart");
+    expect(unitStartVerb({ phase: "stopped" })).toBe("start");
+    expect(unitStartVerb({ phase: "failed" })).toBe("start");
+  });
+});
+
+describe("instanceCanStart", () => {
+  const instance = {
+    name: "main",
+    stack: "dev",
+    members: ["main/api", "main/web"],
+  };
+
+  it("hides Start when every member is already live or complete", () => {
+    const units = new Map([
+      ["main/api", unit("main/api") as unknown as MusterUnit],
+      [
+        "main/web",
+        unit("main/web", {
+          phase: "exited",
+          type: "oneshot",
+        }) as unknown as MusterUnit,
+      ],
+    ]);
+    expect(instanceCanStart(instance, units)).toBe(false);
+  });
+
+  it("shows Start when any full-stack member is inactive", () => {
+    const units = new Map([
+      ["main/api", unit("main/api") as unknown as MusterUnit],
+      [
+        "main/web",
+        unit("main/web", { phase: "stopped" }) as unknown as MusterUnit,
+      ],
+    ]);
+    expect(instanceCanStart(instance, units)).toBe(true);
+  });
+});
+
+describe("unitCanStop", () => {
+  it("hides Stop for a completed oneshot", () => {
+    expect(unitCanStop({ phase: "exited", type: "oneshot" })).toBe(false);
+  });
+
+  it("keeps Stop for live oneshots and ordinary units", () => {
+    expect(unitCanStop({ phase: "activating", type: "oneshot" })).toBe(true);
+    expect(unitCanStop({ phase: "running", type: "simple" })).toBe(true);
+    expect(unitCanStop({ phase: "exited", type: "simple" })).toBe(true);
+  });
+});
+
+describe("openMuster", () => {
+  function fakeChannel() {
+    const sent: string[] = [];
+    let onData: ((payload: Uint8Array) => void) | undefined;
+    const connection = {
+      connectChannel: vi.fn(async (_name: string, options?: any) => {
+        onData = options?.onData;
+        return {
+          channelId: 1,
+          name: "yas.muster.v1",
+          peer: "ext:1:0",
+          metadata: new Uint8Array(),
+          availableCredit: 1_000_000n,
+          send: (payload: Uint8Array | string) => {
+            sent.push(
+              typeof payload === "string"
+                ? payload
+                : new TextDecoder().decode(payload),
+            );
+            return true;
+          },
+          close: () => {},
+        };
+      }),
+    };
+    return {
+      connection,
+      sent,
+      push: (value: unknown) =>
+        onData?.(new TextEncoder().encode(JSON.stringify(value))),
+    };
+  }
+
+  it("sends the CLI's verbs as bare lines", async () => {
+    const { connection, sent } = fakeChannel();
+    const handle = await openMuster(connection);
+    handle.start("main");
+    handle.stop("main/api");
+    handle.restart("web");
+    handle.rewatch();
+    handle.resync();
+    expect(sent).toEqual([
+      "start main",
+      "stop main/api",
+      "restart web",
+      "rewatch",
+      "resync",
+    ]);
+  });
+
+  it("mirrors what arrives on the channel", async () => {
+    const { connection, push } = fakeChannel();
+    const handle = await openMuster(connection);
+    expect(handle.ready).toBe(false);
+    push({ type: "hello", version: 1, dir: "/d" });
+    push({ type: "state", full: true, units: [unit("api")], instances: [] });
+    expect(handle.dir).toBe("/d");
+    expect(handle.ready).toBe(true);
+    expect(handle.units.get("api")?.pty).toBe(7n);
+  });
+
+  it("preserves opaque u64 terminal and surface handles exactly", () => {
+    const mirror = new MusterMirror();
+    mirror.apply(
+      JSON.stringify({
+        type: "state",
+        full: true,
+        units: [
+          unit("api", {
+            pty: "ffffffffffffffff",
+            surfaces: [
+              {
+                id: "8000000000000001",
+                title: "native",
+                width: 80,
+                height: 24,
+              },
+            ],
+            runs: [{ pty: "0020000000000001", exitCode: 0, seq: 1 }],
+          }),
+        ],
+        instances: [],
+      }),
+    );
+    const api = mirror.units.get("api");
+    expect(api?.pty).toBe(18_446_744_073_709_551_615n);
+    expect(api?.surfaces[0]?.id).toBe(9_223_372_036_854_775_809n);
+    expect(api?.runs[0]?.pty).toBe(9_007_199_254_740_993n);
+  });
+
+  it("rejects JSON-number, zero, noncanonical, and overflowing handles", () => {
+    const mirror = new MusterMirror();
+    mirror.apply(
+      JSON.stringify({
+        type: "state",
+        full: true,
+        units: [
+          unit("api", {
+            pty: 7,
+            surfaces: [
+              {
+                id: "0000000000000000",
+                title: "zero",
+                width: 1,
+                height: 1,
+              },
+              { id: "1", title: "short", width: 1, height: 1 },
+              {
+                id: "000000000000000A",
+                title: "uppercase",
+                width: 1,
+                height: 1,
+              },
+              {
+                id: "10000000000000000",
+                title: "too-wide",
+                width: 1,
+                height: 1,
+              },
+            ],
+            runs: [{ pty: 9, exitCode: 0, seq: 1 }],
+          }),
+        ],
+        instances: [],
+      }),
+    );
+    const api = mirror.units.get("api");
+    expect(api?.pty).toBeNull();
+    expect(api?.surfaces).toEqual([]);
+    expect(api?.runs).toEqual([]);
+  });
+});
+
+describe("followMuster", () => {
+  it("opens a fresh handle after the supervisor channel closes", async () => {
+    vi.useFakeTimers();
+    try {
+      const closures: Array<() => void> = [];
+      const connection = {
+        connectChannel: vi.fn(async (_name: string, options?: any) => {
+          closures.push(() => options?.onClosed?.(0, "replaced"));
+          return {
+            channelId: closures.length,
+            name: "yas.muster.v1",
+            peer: "ext:1:0",
+            metadata: new Uint8Array(),
+            availableCredit: 1_000_000n,
+            send: () => true,
+            close: () => {},
+          };
+        }),
+      };
+      const handles: Array<"open" | "closed"> = [];
+      const stop = followMuster(() => connection, {
+        onHandle: (handle) => handles.push(handle ? "open" : "closed"),
+        retryDelayMs: 10,
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(connection.connectChannel).toHaveBeenCalledTimes(1);
+      expect(handles).toEqual(["open"]);
+
+      closures[0]?.();
+      expect(handles).toEqual(["open", "closed"]);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(connection.connectChannel).toHaveBeenCalledTimes(2);
+      expect(handles).toEqual(["open", "closed", "open"]);
+      stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

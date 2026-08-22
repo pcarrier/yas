@@ -1,0 +1,65 @@
+schema = 1
+
+[[constant]]
+name = "WATCH_RESUME"
+value = 1
+
+[[constant]]
+name = "MODE_SNAPSHOT"
+value = 0
+
+[[constant]]
+name = "MODE_REPLAY"
+value = 1
+
+[[constant]]
+name = "PHASE_SNAPSHOT_BEGIN"
+value = 0
+
+[[constant]]
+name = "PHASE_SNAPSHOT_RECORDS"
+value = 1
+
+[[constant]]
+name = "PHASE_SNAPSHOT_END"
+value = 2
+
+[[constant]]
+name = "PHASE_DELTA"
+value = 3
+
+[[constant]]
+name = "PHASE_RESET"
+value = 4
+
+[[constant]]
+name = "RECORD_ADD"
+value = 0
+
+[[constant]]
+name = "RECORD_REPLACE"
+value = 1
+
+[[constant]]
+name = "RECORD_PATCH"
+value = 2
+
+[[constant]]
+name = "RECORD_REMOVE"
+value = 3
+
+[[type]]
+name = "watch"
+layout = "flags:u16,reserved:u16=0,initial_credit:u64,optional resume boot_id:[u8;16],revision:u64,Extensions"
+
+[[type]]
+name = "watch_result"
+layout = "subscription_id:u32,mode:u8,reserved:[u8;3]=0,current_revision:u64,Extensions"
+
+[[type]]
+name = "state_event"
+layout = "subscription_id:u32,phase:u8,flags:u8,reserved:u16=0,from_revision:u64,to_revision:u64,record_count:u16,repeated typed_record; SNAPSHOT_END may carry the final snapshot records, which are applied before completion; SNAPSHOT_BEGIN and RESET require record_count=0"
+
+[[type]]
+name = "state_ack"
+layout = "subscription_id:u32,applied_revision:u64,cumulative_byte_limit:u64"

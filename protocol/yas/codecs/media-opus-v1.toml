@@ -1,0 +1,16 @@
+schema = 1
+name = "media-opus-v1"
+const_name = "MEDIA_CODEC_OPUS"
+family = "yas.media"
+id = 3
+version = 1
+direction = "bidirectional"
+layout = "packet_count:u16,reserved:u16=0,repeated packet_len:u16,packet:packet_len. Packets are complete Opus packets in decode order, nonempty, and together cover one Media FRAME duration; sample rate on the wire is 48000."
+golden_hex = "010000000300f8fffe"
+
+[[constant]]
+name = "WIRE_SAMPLE_RATE"
+value = 48000
+[[constant]]
+name = "MAX_PACKET_BYTES"
+value = 1275

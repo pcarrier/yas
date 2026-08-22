@@ -1,0 +1,74 @@
+name: Build Windows
+
+on:
+  workflow_call:
+    inputs:
+      upload:
+        type: boolean
+        default: false
+
+jobs:
+  build-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@wasm-pack
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - name: Build UI
+        shell: bash
+        run: |
+          cd crates/browser
+          wasm-pack build --target web --release --out-dir pkg
+          cd ../..
+          cd js
+          pnpm install --frozen-lockfile
+          pnpm --filter @yas-run/core run build
+          pnpm --filter @yas-run/solid run build
+          pnpm --filter @yas-run/ui run build
+          pnpm --filter yas-web run build
+      - name: Build release binaries
+        run: cargo build --release -p yas-cli
+      - name: Test the complete cross-platform Yas product graph
+        shell: bash
+        run: |
+          # Linux-only compositor probes are Cargo examples. Exercise every
+          # workspace library, product binary, and integration/unit test here
+          # without asking Windows to compile those live Wayland probes.
+          cargo test --workspace --lib --bins --tests
+          cd js
+          pnpm run typecheck
+          pnpm run test
+      - name: Package zips
+        if: ${{ inputs.upload }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist licenses
+          cp vendor/yas-alacritty-terminal/LICENSE-APACHE \
+            licenses/yas-alacritty-terminal-APACHE-2.0.txt
+          for bin in yas; do
+            cp "target/release/${bin}.exe" "${bin}.exe"
+            7z a "dist/${bin}_${version}_windows_x86_64.zip" \
+              "${bin}.exe" LICENSE licenses
+            rm "${bin}.exe"
+          done
+          ls -lh dist/
+      - uses: actions/upload-artifact@v7
+        if: ${{ inputs.upload }}
+        with:
+          name: windows-x86_64
+          path: dist/*.zip

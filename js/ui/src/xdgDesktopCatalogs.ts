@@ -1,0 +1,344 @@
+/**
+ * Every connected server's XDG desktop application catalog, held open for the page.
+ *
+ * The Manage panel opens a `yas.xdg-desktop.v1` channel when a viewer expands a
+ * remote and closes it when they leave, which is right for a panel: it costs
+ * nothing while nobody is looking. The switcher cannot work that way. It has to
+ * filter a thousand applications from the first keystroke instead of fetching
+ * one when it opens.
+ *
+ * So this holds one channel per connected server for the life of the page. The
+ * standing cost is small and one-sided: the catalog rides the greeting once,
+ * and after that the supervisor only speaks when an application's state
+ * changes. The complete icon shelf is requested as soon as the catalogue
+ * arrives, so launchers consume a warm cache instead of starting I/O when the
+ * user opens them.
+ *
+ * Shaped like {@link ./ide/rootsStore.ts}: a module-scope map plus a version
+ * signal. It is armed from an effect over the connection snapshots, but it
+ * also follows `CHANNEL_WATCH` for `yas.xdg-desktop.v1` so that installing the
+ * XDG desktop extension after connect (or uninstalling and reinstalling it) opens
+ * or closes the catalog without requiring a reconnect.
+ */
+
+import { createSignal } from "solid-js";
+import type { YasWorkspace, ConnectionId } from "@yas-run/core";
+import { followChannelNames } from "./channelPresence";
+import {
+  openXdgDesktop,
+  XDG_DESKTOP_CHANNEL,
+  type XdgDesktopApp,
+  type XdgDesktopCatalogEntry,
+  type XdgDesktopHandle,
+} from "./xdgDesktop";
+
+/** One server's applications: what it manages, and what it could run. */
+export interface RemoteApplications {
+  readonly connectionId: ConnectionId;
+  /** Applications the supervisor is managing, running or not. */
+  readonly apps: readonly XdgDesktopApp[];
+  /** Everything installed there, sorted by display name. */
+  readonly catalog: readonly XdgDesktopCatalogEntry[];
+}
+
+type OpenState = {
+  handle: XdgDesktopHandle | null;
+  stopHandleSubscription: (() => void) | null;
+  generation: number;
+  present: boolean;
+  nextAttempt: number;
+  opening: { id: number; cancelled: boolean; closed: boolean } | null;
+  /** Re-open after an unexpected channel close even when CHANNEL_WATCH keeps
+   *  reporting the name continuously present (extension attempt swaps can do
+   *  exactly that). */
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  retryDelayMs: number;
+  /** Stops the `CHANNEL_WATCH` follow for this connection. */
+  stopChannelWatch: (() => void) | null;
+};
+
+const XDG_DESKTOP_CATALOG_RETRY_MIN_MS = 50;
+const XDG_DESKTOP_CATALOG_RETRY_MAX_MS = 2_000;
+
+const opens = new Map<ConnectionId, OpenState>();
+/** Catalogs are proactive (opened before the switcher is shown), so cap the
+ * standing channels independently of the route protocol's much larger hard
+ * maximum. Route order is stable and the home/primary servers come first. */
+export const XDG_DESKTOP_CATALOG_MAX_CONNECTIONS = 32;
+
+/** Bumped on every message from any supervisor. Readers touch it to become
+ *  reactive, exactly as the file index's consumers touch its version. */
+const [version, setVersion] = createSignal(0);
+const bump = () => setVersion((n) => n + 1);
+
+/** Detach before closing: a synchronous onClosed callback must never mistake
+ * this deliberately closed handle for the current one. */
+const closeInstalled = (state: OpenState): boolean => {
+  const handle = state.handle;
+  if (!handle) return false;
+  state.handle = null;
+  state.stopHandleSubscription?.();
+  state.stopHandleSubscription = null;
+  handle.close();
+  return true;
+};
+
+/**
+ * Idempotently hold one server's supervisor channel open.
+ *
+ * Re-call freely — from an effect over the connection snapshots, passing the
+ * connection generation, which re-arms after a re-establish. The channel itself
+ * is opened only while the server's registry reports `yas.xdg-desktop.v1` as
+ * present, so uninstalling the XDG desktop extension closes the catalog and
+ * reinstalling it reopens it without requiring a reconnect.
+ */
+export function ensureXdgDesktopCatalog(
+  workspace: YasWorkspace,
+  connectionId: ConnectionId,
+  generation: number,
+): void {
+  const existing = opens.get(connectionId);
+  if (existing && existing.generation === generation) return;
+  if (!existing && opens.size >= XDG_DESKTOP_CATALOG_MAX_CONNECTIONS) return;
+  // Superseded by a new generation, or the first call for this connection.
+  if (existing) {
+    existing.stopChannelWatch?.();
+    bump();
+  }
+
+  const connection = workspace.getConnection(connectionId);
+  if (!connection) return;
+  const state: OpenState = {
+    handle: null,
+    stopHandleSubscription: null,
+    generation,
+    present: false,
+    nextAttempt: 0,
+    opening: null,
+    retryTimer: null,
+    retryDelayMs: XDG_DESKTOP_CATALOG_RETRY_MIN_MS,
+    stopChannelWatch: null,
+  };
+  opens.set(connectionId, state);
+
+  let live = true;
+  let stopWatch: (() => void) | null = null;
+  state.stopChannelWatch = () => {
+    live = false;
+    state.present = false;
+    if (state.opening) state.opening.cancelled = true;
+    state.opening = null;
+    if (state.retryTimer !== null) clearTimeout(state.retryTimer);
+    state.retryTimer = null;
+    stopWatch?.();
+    closeInstalled(state);
+    if (opens.get(connectionId) === state) opens.delete(connectionId);
+  };
+
+  const scheduleOpen = (): void => {
+    if (
+      !live ||
+      !state.present ||
+      state.handle !== null ||
+      state.opening !== null ||
+      state.retryTimer !== null ||
+      opens.get(connectionId) !== state
+    ) {
+      return;
+    }
+    const delay = state.retryDelayMs;
+    state.retryDelayMs = Math.min(
+      XDG_DESKTOP_CATALOG_RETRY_MAX_MS,
+      state.retryDelayMs * 2,
+    );
+    state.retryTimer = setTimeout(() => {
+      state.retryTimer = null;
+      beginOpen();
+    }, delay);
+  };
+
+  const beginOpen = (): void => {
+    if (
+      !live ||
+      !state.present ||
+      state.handle !== null ||
+      state.opening !== null ||
+      opens.get(connectionId) !== state
+    ) {
+      return;
+    }
+    const attempt = {
+      id: state.nextAttempt++,
+      cancelled: false,
+      closed: false,
+    };
+    state.opening = attempt;
+    let opened: XdgDesktopHandle | null = null;
+    void openXdgDesktop(connection, {
+      onClosed: () => {
+        attempt.closed = true;
+        if (state.opening === attempt) state.opening = null;
+        // Compare the exact handle. A delayed close from an earlier open must
+        // not clear the replacement installed after a channel flap.
+        if (opened !== null && state.handle === opened) {
+          state.handle = null;
+          state.stopHandleSubscription?.();
+          state.stopHandleSubscription = null;
+          opened.close();
+          bump();
+        }
+        // A replacement extension attempt can inherit the listener name with
+        // no absent/present edge. CHANNEL_WATCH therefore has nothing new to
+        // tell us; the closed data channel itself must re-arm the catalog.
+        scheduleOpen();
+      },
+    })
+      .then((handle) => {
+        opened = handle;
+        if (
+          !live ||
+          !state.present ||
+          attempt.cancelled ||
+          attempt.closed ||
+          state.opening !== attempt ||
+          opens.get(connectionId) !== state
+        ) {
+          if (state.opening === attempt) state.opening = null;
+          handle.close();
+          return;
+        }
+        state.opening = null;
+        state.handle = handle;
+        let requestedCatalog = handle.catalog;
+        const requestCatalogIcons = () => {
+          const catalog = handle.catalog;
+          if (catalog === requestedCatalog) return;
+          requestedCatalog = catalog;
+          handle.requestIcons(catalog.map((entry) => entry.id));
+        };
+        // The greeting may have arrived before openXdgDesktop returned.
+        handle.requestIcons(requestedCatalog.map((entry) => entry.id));
+        state.stopHandleSubscription = handle.subscribe(() => {
+          requestCatalogIcons();
+          bump();
+        });
+        state.retryDelayMs = XDG_DESKTOP_CATALOG_RETRY_MIN_MS;
+        bump();
+      })
+      .catch(() => {
+        if (state.opening === attempt) state.opening = null;
+        // A refused open is transient while the listener is being replaced.
+        // Presence may stay continuously true, so retry it ourselves.
+        scheduleOpen();
+      });
+  };
+
+  void followChannelNames(connection, [XDG_DESKTOP_CHANNEL], (present) => {
+    if (!live) return;
+    if (present.has(XDG_DESKTOP_CHANNEL)) {
+      state.present = true;
+      beginOpen();
+    } else {
+      state.present = false;
+      if (state.opening) state.opening.cancelled = true;
+      state.opening = null;
+      if (state.retryTimer !== null) clearTimeout(state.retryTimer);
+      state.retryTimer = null;
+      state.retryDelayMs = XDG_DESKTOP_CATALOG_RETRY_MIN_MS;
+      if (closeInstalled(state)) bump();
+    }
+  }).then((release) => {
+    if (live) stopWatch = release;
+    else release();
+  });
+}
+
+/** Close a server's channel and stop watching its presence. */
+export function dropXdgDesktopCatalog(connectionId: ConnectionId): void {
+  const state = opens.get(connectionId);
+  if (!state) return;
+  state.stopChannelWatch?.();
+  // stopChannelWatch deletes the state and closes the handle.
+  bump();
+}
+
+const ready = (connectionId: ConnectionId): XdgDesktopHandle | null =>
+  opens.get(connectionId)?.handle ?? null;
+
+/**
+ * The live supervisor channel for one server, for a caller that needs the
+ * verbs and not just the lists.
+ *
+ * The Manage panel used to open a channel of its own. Sharing this one is not
+ * only fewer channels: each mirror carries its own icon cache, and two of them
+ * for the same server means the same artwork fetched and held twice. Callers
+ * must not close it — it belongs to the store, and outlives any one panel.
+ *
+ * Reactive: null until the greeting has been asked for, and again if the
+ * connection drops or the channel is not currently served.
+ */
+export function xdgDesktopHandle(
+  connectionId: ConnectionId,
+): XdgDesktopHandle | null {
+  version();
+  return ready(connectionId);
+}
+
+/** One server's applications, or null while it has no supervisor attached. */
+export function xdgDesktopCatalog(
+  connectionId: ConnectionId,
+): RemoteApplications | null {
+  version();
+  const handle = ready(connectionId);
+  if (!handle) return null;
+  return { connectionId, apps: handle.apps, catalog: handle.catalog };
+}
+
+/** Every attached server's applications, in the order asked for. */
+export function xdgDesktopCatalogs(
+  connectionIds: readonly ConnectionId[],
+): RemoteApplications[] {
+  version();
+  const out: RemoteApplications[] = [];
+  for (const connectionId of connectionIds) {
+    const found = xdgDesktopCatalog(connectionId);
+    if (found) out.push(found);
+  }
+  return out;
+}
+
+/** Artwork for one application: an object URL, `null` for none, `undefined`
+ *  while nobody has asked. Reactive — it lands long after the row is drawn. */
+export function applicationIcon(
+  connectionId: ConnectionId,
+  id: string,
+): string | null | undefined {
+  version();
+  return ready(connectionId)?.icon(id);
+}
+
+/** Ask one server for artwork; ids already known or in flight are dropped. */
+export function requestApplicationIcons(
+  connectionId: ConnectionId,
+  ids: readonly string[],
+): void {
+  ready(connectionId)?.requestIcons(ids);
+}
+
+/**
+ * Run one application now, without adopting it.
+ *
+ * `start`, not `enable`: launching something from the switcher is trying it,
+ * not choosing it for every session from here on. It appears in the Manage
+ * panel as a running row that is not enabled, which is where it can be kept or
+ * discarded.
+ */
+export function startApplication(
+  connectionId: ConnectionId,
+  id: string,
+): boolean {
+  const handle = ready(connectionId);
+  if (!handle) return false;
+  handle.start(id);
+  return true;
+}

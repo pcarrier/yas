@@ -1,0 +1,17 @@
+# Build context is the repo root; keep only what the website image build needs.
+target
+**/target
+e2e
+docs
+**/node_modules
+**/pkg
+**/dist
+.git
+.github
+.claude
+.direnv
+coverage-report
+coverage.json
+coverage-summary.txt
+/react
+/web

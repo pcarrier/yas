@@ -1,0 +1,26 @@
+schema = 1
+name = "surface-av1-v1"
+const_name = "SURFACE_CODEC_AV1_V1"
+family = "yas.surface"
+id = 2
+version = 1
+direction = "server_to_client"
+layout = "metadata_count:u8,reserved:[u8;3]=0,repeated tag:u16,flags:u16,len:u32,body:len; temporal_unit:remaining. Metadata is unique and tag-ordered. COLOR_SPACE body is primaries:u8,transfer:u8,matrix:u8,range:u8. DAMAGE body is rect_count:u16,reserved:u16=0,repeated x:u32,y:u32,width:u32,height:u32. Temporal unit uses AV1 low-overhead OBU format and contains a temporal delimiter."
+golden_hex = "00000000120200"
+
+[[constant]]
+name = "METADATA_COLOR_SPACE"
+value = 1
+[[constant]]
+name = "METADATA_DAMAGE"
+value = 2
+[[constant]]
+name = "METADATA_DIMENSIONS"
+value = 3
+[[constant]]
+name = "MAX_DAMAGE_RECTS"
+value = 256
+
+[[constant]]
+name = "METADATA_LOGICAL_DIMENSIONS"
+value = 4

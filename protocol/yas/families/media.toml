@@ -1,0 +1,554 @@
+schema = 1
+family = "yas.media"
+
+limits = [
+  { name = "MAX_DEVICES", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_LEASES_PER_SESSION", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+  { name = "MAX_STREAMS_PER_SESSION", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_PORTALS_PER_SESSION", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+  { name = "MAX_PLAYERS", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_FORMATS", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+  { name = "MAX_INLINE_METADATA_BYTES", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_INLINE_ASSET_BYTES", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_PORTAL_METADATA_BYTES", tag = 9, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_PORTAL_STRING_BYTES", tag = 10, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_PORTAL_BODY_BYTES", tag = 11, type = "u32", required = true, hard_min = 1, hard_max = 16384 },
+  { name = "MAX_PORTAL_CHOICES", tag = 12, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_PORTAL_CHOICE_OPTIONS", tag = 13, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_SCREENCAST_CANDIDATES", tag = 14, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+]
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+[[request]]
+name = "OPEN_OUTPUT"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "device_handle:u64,format_count:u16,reserved:u16=0,repeated MediaFormat,latency_target_ns:u64,target_bitrate_kbps:u16,reserved:u16=0,Extensions; target_bitrate_kbps is 0 for server default or 1..=MAX_OUTPUT_BITRATE_KBPS; ResultPrefix + stream_handle:u64,selected_format:MediaFormat"
+[[request]]
+name = "ACQUIRE_DEVICE"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "device_handle:u64,operation_id:[u8;16],kind:u8,reserved:[u8;3]=0,lease_duration_ns:u64,format_count:u16,repeated MediaFormat,Extensions; ResultPrefix + lease_handle:u64,stream_handle:u64,expires_server_ns:u64,selected_format:MediaFormat"
+[[request]]
+name = "RELEASE_DEVICE"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "lease_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix"
+[[request]]
+name = "PORTAL_REPLY"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "portal_handle:u64,revision:u64,operation_id:[u8;16],kind:u16,decision:u8,reserved:u8=0,metadata:bytes_u32 containing kind/decision-specific PortalReplyMetadata,Extensions; ResultPrefix; DENY and CANCEL require empty metadata"
+[[request]]
+name = "PLAYER_ACTION"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "player_handle:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix"
+[[request]]
+name = "CLOSE_STREAM"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "stream_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix"
+[[request]]
+name = "FETCH_ASSET"
+kind = 0x0008
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "content_hash:[u8;32],initial_receive_credit:u64,Extensions; ResultPrefix + InlineOrTransfer"
+[[request]]
+name = "PORTAL_CLOSE"
+kind = 0x0009
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "portal_handle:u64,revision:u64,operation_id:[u8;16],Extensions; ResultPrefix; idempotent by operation_id; closes pending or granted portal and releases every granted stream"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<MediaRecord>"
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+[[event]]
+name = "PORTAL_REQUEST"
+kind = 0x0010
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "portal_handle:u64,revision:u64,kind:u16,flags:u16,application_handle:u64,metadata:bytes_u32 containing kind-specific PortalRequestMetadata,Extensions"
+[[event]]
+name = "FRAME"
+kind = 0x0020
+direction = "bidirectional"
+sensitive = "required"
+compression = "forbidden"
+datagram = "media_frame"
+layout = "stream_handle:u64,sequence:u64,capture_time:u64,presentation_time:u64,codec_version:u16,flags:u16,fragment_index:u16,fragment_count:u16,complete_len:u32,payload:remaining; audio capture_time and nonzero presentation_time are sample positions at the selected MediaFormat.sample_rate from the server media-session epoch, while video values are nanoseconds from that same epoch; presentation_time 0 means use capture_time"
+[[event]]
+name = "FRAME_ACK"
+kind = 0x0021
+direction = "bidirectional"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "stream_handle:u64,consumed_sequence:u64,queue_depth:u16,desired_credit_frames:u16"
+[[event]]
+name = "STREAM_STATUS"
+kind = 0x0022
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "stream_handle:u64,revision:u64,status:u16,flags:u16,codec_config:bytes_u32,Extensions"
+[[event]]
+name = "PLAYOUT_REPORT"
+kind = 0x0023
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "stream_handle:u64,consumed_sequence:u64,audio_video_delay_ns:u64; measured client-side difference between audible audio and visible video presentation latency"
+
+[[constant]]
+name = "KIND_AUDIO_OUTPUT"
+value = 0
+[[constant]]
+name = "KIND_MICROPHONE"
+value = 1
+[[constant]]
+name = "KIND_CAMERA"
+value = 2
+[[constant]]
+name = "ENTITY_DEVICE"
+value = 0
+[[constant]]
+name = "ENTITY_LEASE"
+value = 1
+[[constant]]
+name = "ENTITY_PORTAL"
+value = 2
+[[constant]]
+name = "ENTITY_PLAYER"
+value = 3
+[[constant]]
+name = "PLAYER_ALBUM_ART_HASH_EXTENSION"
+value = 1
+[[constant]]
+name = "PLAYER_ACTIVE_EXTENSION"
+value = 2
+[[constant]]
+name = "PLAYER_ALBUM_ART_URL_EXTENSION"
+value = 3
+[[constant]]
+name = "PLAYER_ALBUM_ART_URL_MAX_BYTES"
+value = 4096
+[[constant]]
+name = "PORTAL_ASSET_HASH_EXTENSION"
+value = 1
+[[constant]]
+name = "ASSET_CONTENT_KIND"
+value = 1
+[[constant]]
+name = "MAX_INLINE_METADATA_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_INLINE_ASSET_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_OUTPUT_BITRATE_KBPS"
+value = 512
+
+[[constant]]
+name = "DEVICE_AVAILABLE"
+value = 0
+[[constant]]
+name = "DEVICE_BUSY"
+value = 1
+[[constant]]
+name = "DEVICE_UNAVAILABLE"
+value = 2
+[[constant]]
+name = "DEVICE_PERMISSION_REQUIRED"
+value = 3
+[[constant]]
+name = "DEVICE_DEFAULT"
+value = 1
+[[constant]]
+name = "DEVICE_VIRTUAL"
+value = 2
+[[constant]]
+name = "DEVICE_MONITOR"
+value = 4
+[[constant]]
+name = "DEVICE_FLAGS_MASK"
+value = 7
+
+[[constant]]
+name = "LEASE_PENDING"
+value = 0
+[[constant]]
+name = "LEASE_ACTIVE"
+value = 1
+[[constant]]
+name = "LEASE_REVOKED"
+value = 2
+[[constant]]
+name = "LEASE_EXPIRED"
+value = 3
+[[constant]]
+name = "LEASE_RELEASED"
+value = 4
+
+[[constant]]
+name = "PORTAL_KIND_ACCESS"
+value = 0
+[[constant]]
+name = "PORTAL_KIND_SCREENCAST"
+value = 1
+[[constant]]
+name = "PORTAL_PENDING"
+value = 0
+[[constant]]
+name = "PORTAL_GRANTED"
+value = 1
+[[constant]]
+name = "PORTAL_DENIED"
+value = 2
+[[constant]]
+name = "PORTAL_CANCELLED"
+value = 3
+[[constant]]
+name = "PORTAL_WITHDRAWN"
+value = 4
+[[constant]]
+name = "PORTAL_DECISION_DENY"
+value = 0
+[[constant]]
+name = "PORTAL_DECISION_GRANT"
+value = 1
+[[constant]]
+name = "PORTAL_DECISION_CANCEL"
+value = 2
+[[constant]]
+name = "PORTAL_REQUEST_FLAGS"
+value = 0
+
+[[constant]]
+name = "PLAYER_STOPPED"
+value = 0
+[[constant]]
+name = "PLAYER_PAUSED"
+value = 1
+[[constant]]
+name = "PLAYER_PLAYING"
+value = 2
+[[constant]]
+name = "PLAYER_CAN_CONTROL"
+value = 1
+[[constant]]
+name = "PLAYER_CAN_PLAY"
+value = 2
+[[constant]]
+name = "PLAYER_CAN_PAUSE"
+value = 4
+[[constant]]
+name = "PLAYER_CAN_NEXT"
+value = 8
+[[constant]]
+name = "PLAYER_CAN_PREVIOUS"
+value = 16
+[[constant]]
+name = "PLAYER_CAN_SEEK"
+value = 32
+[[constant]]
+name = "PLAYER_CAN_RAISE"
+value = 64
+[[constant]]
+name = "PLAYER_CAN_SET_VOLUME"
+value = 128
+[[constant]]
+name = "PLAYER_CAN_SET_SHUFFLE"
+value = 256
+[[constant]]
+name = "PLAYER_CAN_SET_LOOP"
+value = 512
+[[constant]]
+name = "PLAYER_CAN_SET_RATE"
+value = 1024
+[[constant]]
+name = "PLAYER_FLAGS_MASK"
+value = 2047
+[[constant]]
+name = "PLAYER_ACTION_PLAY"
+value = 0
+[[constant]]
+name = "PLAYER_ACTION_PAUSE"
+value = 1
+[[constant]]
+name = "PLAYER_ACTION_PLAY_PAUSE"
+value = 2
+[[constant]]
+name = "PLAYER_ACTION_STOP"
+value = 3
+[[constant]]
+name = "PLAYER_ACTION_NEXT"
+value = 4
+[[constant]]
+name = "PLAYER_ACTION_PREVIOUS"
+value = 5
+[[constant]]
+name = "PLAYER_ACTION_SEEK"
+value = 6
+[[constant]]
+name = "PLAYER_ACTION_SET_POSITION"
+value = 7
+[[constant]]
+name = "PLAYER_ACTION_SET_VOLUME"
+value = 8
+[[constant]]
+name = "PLAYER_ACTION_SET_SHUFFLE"
+value = 9
+[[constant]]
+name = "PLAYER_ACTION_SET_LOOP"
+value = 10
+[[constant]]
+name = "PLAYER_ACTION_SET_RATE"
+value = 11
+[[constant]]
+name = "PLAYER_ACTION_RAISE"
+value = 12
+
+[[constant]]
+name = "FRAME_KEYFRAME"
+value = 1
+[[constant]]
+name = "FRAME_DISCONTINUITY"
+value = 2
+[[constant]]
+name = "FRAME_END_OF_STREAM"
+value = 4
+[[constant]]
+name = "FRAME_DISCARDABLE"
+value = 8
+[[constant]]
+name = "FRAME_CODEC_CONFIG"
+value = 16
+[[constant]]
+name = "FRAME_FLAGS_MASK"
+value = 31
+[[constant]]
+name = "STREAM_OPENING"
+value = 0
+[[constant]]
+name = "STREAM_ACTIVE"
+value = 1
+[[constant]]
+name = "STREAM_PAUSED"
+value = 2
+[[constant]]
+name = "STREAM_DRAINING"
+value = 3
+[[constant]]
+name = "STREAM_CLOSED"
+value = 4
+[[constant]]
+name = "STREAM_ERROR"
+value = 5
+[[constant]]
+name = "STREAM_CONFIG_CHANGED"
+value = 1
+[[constant]]
+name = "STREAM_KEYFRAME_REQUIRED"
+value = 2
+[[constant]]
+name = "STREAM_GAP"
+value = 4
+[[constant]]
+name = "STREAM_FLAGS_MASK"
+value = 7
+[[constant]]
+name = "MAX_FORMATS"
+value = 64
+[[constant]]
+name = "MAX_PORTAL_METADATA_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_PORTAL_STRING_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_PORTAL_BODY_BYTES"
+value = 16384
+[[constant]]
+name = "MAX_PORTAL_CHOICES"
+value = 16
+[[constant]]
+name = "MAX_PORTAL_CHOICE_OPTIONS"
+value = 16
+[[constant]]
+name = "MAX_SCREENCAST_CANDIDATES"
+value = 64
+[[constant]]
+name = "MAX_DEVICES"
+value = 256
+[[constant]]
+name = "MAX_LEASES_PER_SESSION"
+value = 64
+[[constant]]
+name = "MAX_STREAMS_PER_SESSION"
+value = 256
+[[constant]]
+name = "MAX_PORTALS_PER_SESSION"
+value = 64
+[[constant]]
+name = "MAX_PLAYERS"
+value = 1024
+[[constant]]
+name = "LIMIT_MAX_DEVICES"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_LEASES_PER_SESSION"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_STREAMS_PER_SESSION"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_PORTALS_PER_SESSION"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_PLAYERS"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_FORMATS"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_INLINE_METADATA_BYTES"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_INLINE_ASSET_BYTES"
+value = 8
+[[constant]]
+name = "LIMIT_MAX_PORTAL_METADATA_BYTES"
+value = 9
+[[constant]]
+name = "LIMIT_MAX_PORTAL_STRING_BYTES"
+value = 10
+[[constant]]
+name = "LIMIT_MAX_PORTAL_BODY_BYTES"
+value = 11
+[[constant]]
+name = "LIMIT_MAX_PORTAL_CHOICES"
+value = 12
+[[constant]]
+name = "LIMIT_MAX_PORTAL_CHOICE_OPTIONS"
+value = 13
+[[constant]]
+name = "LIMIT_MAX_SCREENCAST_CANDIDATES"
+value = 14
+
+[[type]]
+name = "media_format"
+layout = "codec:u16,channels:u16,sample_rate:u32,width:u32,height:u32,frame_rate_milli:u32,Extensions"
+[[type]]
+name = "device_record"
+layout = "device_handle:u64,revision:u64,kind:u8,state:u8,flags:u16,name:string_u16,format_count:u16,repeated MediaFormat,Extensions"
+[[type]]
+name = "lease_record"
+layout = "lease_handle:u64,revision:u64,device_handle:u64,owner_session:[u8;16],lifecycle:u8,reserved:[u8;7]=0,expires_server_ns:u64,Extensions"
+[[type]]
+name = "portal_record"
+layout = "portal_handle:u64,revision:u64,kind:u16,state:u16,owner_session:[u8;16],metadata:bytes_u32 containing PortalRecordMetadata,Extensions; PENDING contains request metadata, GRANTED contains PortalGrantedMetadata, DENIED/CANCELLED/WITHDRAWN require empty metadata"
+[[type]]
+name = "portal_choice_value"
+layout = "id:string_u16,value:string_u16; IDs and values are nonempty UTF-8 without NUL"
+[[type]]
+name = "portal_choice"
+layout = "id:string_u16,label:string_u16,initial:string_u16,option_count:u16,reserved:u16=0,repeated option:bytes_u32 containing PortalChoiceValue; option IDs are unique and nonempty initial names one option"
+[[type]]
+name = "portal_access_request_metadata"
+layout = "deadline_server_ns:u64,parent_surface_handle:u64 (zero means absent),app_id:string_u16,title:string_u16,subtitle:string_u16,body:string_u32,deny_label:string_u16,grant_label:string_u16,icon_name:string_u16,choice_count:u16,reserved:u16=0,repeated choice:bytes_u32 containing PortalChoice"
+[[type]]
+name = "portal_screencast_candidate"
+layout = "surface_handle:u64,width:u32,height:u32,title:string_u16,app_id:string_u16,thumbnail_hash_present:u8,reserved:[u8;3]=0,optional thumbnail_hash:[u8;32]; thumbnail bytes are fetched through FETCH_ASSET"
+[[type]]
+name = "portal_screencast_request_metadata"
+layout = "deadline_server_ns:u64,parent_surface_handle:u64 (zero means absent),app_id:string_u16,multiple:u8,reserved:[u8;3]=0,candidate_count:u16,reserved:u16=0,repeated candidate:bytes_u32 containing PortalScreenCastCandidate"
+[[type]]
+name = "portal_access_grant_metadata"
+layout = "choice_count:u16,reserved:u16=0,repeated chosen:bytes_u32 containing PortalChoiceValue; IDs are unique"
+[[type]]
+name = "portal_screencast_grant_metadata"
+layout = "surface_count:u16,reserved:u16=0,repeated surface_handle:u64; handles are nonzero and unique"
+[[type]]
+name = "portal_screencast_granted_stream"
+layout = "surface_handle:u64,stream_handle:u64; both nonzero; surface and stream handles are unique within one grant"
+[[type]]
+name = "portal_screencast_granted_metadata"
+layout = "stream_count:u16,reserved:u16=0,repeated PortalScreenCastGrantedStream; these are the live streams released by PORTAL_CLOSE"
+[[type]]
+name = "portal_reply_metadata"
+layout = "GRANT ACCESS uses PortalAccessGrantMetadata; GRANT SCREENCAST uses PortalScreenCastGrantMetadata; DENY and CANCEL are exactly zero bytes"
+[[type]]
+name = "portal_granted_metadata"
+layout = "GRANTED ACCESS uses PortalAccessGrantMetadata; GRANTED SCREENCAST uses PortalScreenCastGrantedMetadata with allocated stream handles"
+[[type]]
+name = "portal_record_metadata"
+layout = "PENDING uses kind-specific request metadata; GRANTED uses PortalGrantedMetadata; DENIED, CANCELLED, and WITHDRAWN are exactly zero bytes"
+[[type]]
+name = "player_record"
+layout = "player_handle:u64,revision:u64,state:u16,flags:u16,position_us:i64,duration_us:i64,identity:string_u16,desktop_entry:string_u16,title:string_u16,artist:string_u16,album:string_u16,Extensions"
+[[type]]
+name = "state_entity_body"
+layout = "entity_kind:u16,reserved:u16=0; ADD/REPLACE complete device_record,lease_record,portal_record,or player_record; PATCH entity handle:u64,revision:u64,Extensions; REMOVE entity handle:u64,revision:u64"
+[[type]]
+name = "asset_delivery"
+layout = "InlineOrTransfer with Desktop-like content-addressed asset; inline at most 32768, Transfer family Media kind 1 version 1"
+[[type]]
+name = "family_limits"
+layout = "ordered optional extensions: tags 1..14 encode max devices:u32,leases/session:u32,streams/session:u32,portals/session:u32,players:u32,formats:u32,inline metadata bytes:u32,inline asset bytes:u32,portal metadata bytes:u32,portal string bytes:u32,portal body bytes:u32,portal choices:u32,portal choice options:u32,screencast candidates:u32; all tags are present in a selected family descriptor"

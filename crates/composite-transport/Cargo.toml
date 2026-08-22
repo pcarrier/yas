@@ -1,0 +1,15 @@
+[package]
+name = "yas-composite-transport"
+version = "0.1.0"
+edition.workspace = true
+description = "Bounded local pairing for YAS reliable streams and optional datagrams"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+yas-wire = { workspace = true }
+tokio = { version = "1", features = ["io-util", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt", "time"] }

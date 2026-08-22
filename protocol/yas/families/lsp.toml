@@ -1,0 +1,803 @@
+schema = 1
+family = "yas.lsp"
+
+limits = [
+  { name = "MAX_WORKSPACES_PER_SESSION", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+  { name = "MAX_WATCHES_PER_WORKSPACE", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 32 },
+  { name = "MAX_QUERY_RECORDS", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_QUERY_BYTES", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 4194304 },
+  { name = "MAX_CURSOR_BYTES", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_INLINE_BUFFER_BYTES", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 32768 },
+  { name = "MAX_BUFFER_BYTES", tag = 7, type = "u64", required = true, hard_min = 1, hard_max = 67108864 },
+  { name = "MAX_BUFFERS_PER_WORKSPACE", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_STAGES_PER_SESSION", tag = 9, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_DIAGNOSTICS_PER_FILE", tag = 10, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_SERVERS", tag = 11, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_CONCURRENT_QUERIES", tag = 12, type = "u32", required = true, hard_min = 1, hard_max = 8 },
+]
+
+[[request]]
+name = "OPEN"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "source:bytes_u32 containing WorkspaceSource,open_mode:u8,reserved:u8=0,diagnostics_settle_ms:u16,language:string_u16,profile:string_u16,initialization_options:bytes_u32,Extensions; EXPLICIT requires nonempty language/profile and permits initialization options; AUTO_DISCOVER requires all three empty and may start multiple backends; ResultPrefix + workspace_handle:u64,workspace_revision:u64,position_encoding:u8,reserved:u8=0,backend_count:u16,capabilities:u64,canonical_root:bytes_u32 raw platform bytes,Extensions; backend_count zero requires OPEN_NO_BACKEND_DETAIL_EXTENSION"
+[[request]]
+name = "CLOSE"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "workspace_handle:u64,Extensions; ResultPrefix; idempotent and releases workspace-scoped watches"
+[[request]]
+name = "WATCH"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "workspace_handle:u64,datasets:u16,reserved:u16=0,state:bytes_u32 containing StateWatch; ResultPrefix + StateWatchResult"
+[[request]]
+name = "UNWATCH"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+[[request]]
+name = "QUERY"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "workspace_handle:u64,max_records:u16,reserved:u16=0,cursor:bytes_u16,initial_receive_credit:u64,body:bytes_u32 containing QueryBody,Extensions; ResultPrefix + QueryPage"
+[[request]]
+name = "BUFFER_PUT"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "workspace_handle:u64,operation_id:[u8;16],expected_revision:u64,path:bytes_u32 containing FS WirePath,content:bytes_u32 containing valid UTF-8 document text,Extensions; expected revision zero requires absent overlay; ResultPrefix + BufferIdentity"
+[[request]]
+name = "BUFFER_BEGIN"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "workspace_handle:u64,expected_revision:u64,path:bytes_u32 containing FS WirePath,byte_len:u64,content_hash:[u8;32],initial_send_credit:u64,Extensions; ResultPrefix + staging_handle:u64,descriptor:bytes_u32 containing sensitive receiver-to-sender BYTE TransferDescriptor with required upload-stage extension naming that handle,Extensions; staged bytes must be valid UTF-8 document text when BUFFER_COMMIT validates them; before BUFFER_COMMIT succeeds, RESET of the returned descriptor discards the stage"
+[[request]]
+name = "BUFFER_COMMIT"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "staging_handle:u64,operation_id:[u8;16],Extensions; validates exact size, hash, and UTF-8 before publishing; ResultPrefix + BufferIdentity"
+[[request]]
+name = "BUFFER_CLOSE"
+kind = 0x0008
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "buffer_handle:u64,expected_revision:u64,operation_id:[u8;16],Extensions; ResultPrefix"
+[[request]]
+name = "LIST_SERVERS"
+kind = 0x0009
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+# Semantic clarification without a wire-layout change: zero is daemon-wide;
+# foreign roots use workspace_handle zero only in the returned ServerList.
+layout = "workspace_handle:u64,Extensions; zero workspace lists all session-visible servers; ResultPrefix + ServerList"
+[[request]]
+name = "STOP_SERVER"
+kind = 0x000a
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+# Handles/generations are opaque nonzero boot-scoped values. An unknown handle
+# is NOT_FOUND; a generation mismatch for a live handle is STALE.
+layout = "server_handle:u64,generation:u64,operation_id:[u8;16],Extensions; ResultPrefix; idempotent by operation ID"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<StateEntity|EntityPatch|RemovedEntity>; entities are BACKEND, DIAGNOSTICS, and BUFFER"
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+[[event]]
+name = "CLOSED"
+kind = 0x0002
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "workspace_handle:u64,reason:u8,reserved:[u8;3]=0,detail:string_u32; reason is CLIENT_REQUEST,ROOT_GONE,PERMISSION_LOST,BACKEND_FAILED,or RESOURCE_LIMIT; connection loss is a local client lifecycle reason, not a wire Event"
+
+[[type]]
+name = "workspace_source"
+layout = "kind:u8,reserved:[u8;3]=0; FS root_handle:u64,root_path:bytes_u32 containing FS WirePath; PLATFORM_PATH path:bytes_u32 raw nonempty platform bytes; TERMINAL_CWD terminal_handle:u64,suffix:bytes_u32 containing relative FS WirePath resolved atomically from that terminal's live cwd"
+[[type]]
+name = "open_no_backend_detail_extension"
+layout = "OPEN Result extension tag 1; required value is detail:string_u32, nonempty UTF-8 explaining why auto-discovery found no backend; present iff backend_count is zero"
+
+[[type]]
+name = "position"
+layout = "line:u32,byte_column:u32; zero-based UTF-8 byte column, never UTF-16 code units"
+[[type]]
+name = "text_range"
+layout = "start:Position,end_exclusive:Position; lexicographically ordered"
+[[type]]
+name = "document_target"
+layout = "path:bytes_u32 containing non-root FS WirePath,document_revision:u64,content_hash:[u8;32] BLAKE3-256; zero revision selects disk, where an all-zero request hash means snapshot current bytes atomically at admission and a nonzero hash is an exact precondition; nonzero revision selects that overlay revision and requires a nonzero exact hash; every result record carries the actual selected hash"
+[[type]]
+name = "query_body"
+# WORKSPACE_SYMBOLS deliberately permits an empty query, meaning list all.
+layout = "kind:u16,flags:u16=0,variant body; DEFINITION target+position; REFERENCES target+position+query_flags:u16+reserved:u16; HOVER target+position; DOCUMENT_SYMBOLS target; WORKSPACE_SYMBOLS query:string_u16; COMPLETION target+position+trigger_kind:u8+reserved:[u8;3]+trigger:string_u16; CODE_ACTIONS target+range+diagnostic_count:u16+reserved:u16+ids:u64; FORMATTING target+range_present:u8+reserved:[u8;3]+optional range+tab_width:u16+format_flags:u16; RENAME target+position+new_name:string_u16; SIGNATURE_HELP target+position"
+[[type]]
+name = "typed_query_record"
+layout = "record_len:u32,record_kind:u16,record_flags:u16,body; length includes kind and flags; flag bit0 REQUIRED; known records are LOCATION,HOVER,SYMBOL,COMPLETION,ACTION,EDIT,SIGNATURE; unknown optional records are skipped and unknown required records fail"
+[[type]]
+name = "query_page"
+layout = "query_status:u16,page_flags:u16,detail:string_u32,next_cursor:bytes_u16,total_hint:u64,delivery:u8,reserved:[u8;3]=0; query_status uses Core status codes, non-OK requires INCOMPLETE and nonempty detail, OK requires empty detail; TRUNCATED iff next_cursor is nonempty; INLINE record_count:u16,reserved:u16=0,record_stream:bytes_u32; TRANSFER descriptor:bytes_u32 containing sensitive server-to-client MESSAGE TransferDescriptor; Extensions; a Core non-OK Result still has no body"
+[[type]]
+name = "location_record"
+layout = "path:bytes_u32 containing non-root FS WirePath,document_revision:u64,content_hash:[u8;32] BLAKE3-256,range:TextRange,flags:u16,reserved:u16=0"
+[[type]]
+name = "hover_record"
+layout = "target:bytes_u32 containing LocationRecord,markup_kind:u8,reserved:[u8;3]=0,content:bytes_u32; target supplies exact path/hash/revision/range"
+[[type]]
+name = "symbol_record"
+layout = "symbol_kind:u16,flags:u16,depth:u16,reserved:u16=0,name:string_u16,detail:string_u16,path:bytes_u32 empty or FS WirePath,content_hash_present:u8,reserved:[u8;3]=0,optional content_hash:[u8;32] required exactly when path is present,range:TextRange,selection_range:TextRange"
+[[type]]
+name = "completion_record"
+layout = "item_kind:u16,flags:u16,label:string_u16,detail:string_u16,filter_text:string_u16,insert_text:bytes_u32,replacement_range_present:u8,reserved:[u8;3]=0,optional replacement_range:TextRange"
+[[type]]
+name = "edit_record"
+layout = "path:bytes_u32 containing non-root FS WirePath,expected_revision:u64,expected_content_hash:[u8;32] BLAKE3-256,range:TextRange,replacement:bytes_u32; both revision and hash are checked atomically"
+[[type]]
+name = "action_record"
+layout = "title:string_u16,kind:string_u16,flags:u16,edit_count:u16,repeated edit:bytes_u32 containing EditRecord,disabled_reason:string_u32; v1 actions carry edits and never an opaque server command"
+[[type]]
+name = "signature_record"
+layout = "flags:u16,active_parameter:u16,param_start:u32,param_end:u32,label:string_u16,documentation:string_u32; active_parameter 0xffff means none and requires zero parameter bounds, otherwise bounds are UTF-8 byte offsets within label; ACTIVE marks the selected overload"
+[[type]]
+name = "buffer_identity"
+layout = "buffer_handle:u64,buffer_revision:u64,workspace_revision:u64,byte_len:u64,content_hash:[u8;32],Extensions"
+[[type]]
+name = "server_record"
+# workspace_handle may be zero only in a daemon-wide ServerList record whose
+# root is foreign to the session; BACKEND StateEntity requires it nonzero.
+layout = "server_handle:u64,generation:u64,server_revision:u64,workspace_handle:u64,phase:u8,progress_pct:u8,reserved:u16=0,epoch:u32,refused_edits:u32,reserved:u32=0,rss_bytes:u64,capabilities:u64,language:string_u16,profile:string_u16,backend_id:string_u16,last_message:string_u32,Extensions; progress is 0..100 or 255 UNKNOWN; phases are SPAWNING,INITIALIZING,INDEXING,READY,FAILED and stopped servers are removed"
+[[type]]
+name = "server_list"
+layout = "server_count:u16,reserved:u16=0,repeated server:bytes_u32 containing ServerRecord"
+[[type]]
+name = "diagnostic"
+layout = "diagnostic_id:u64,severity:u8,reserved:u8=0,tags:u16,range:TextRange,code:string_u16,source:string_u16,message:string_u32"
+[[type]]
+name = "diagnostic_record"
+layout = "path:bytes_u32 containing non-root FS WirePath,document_revision:u64,content_hash:[u8;32] BLAKE3-256,diagnostics_revision:u64,count:u16,reserved:u16=0,repeated diagnostic:bytes_u32,Extensions; a zero count explicitly clears the path and the hash still identifies the diagnosed bytes"
+[[type]]
+name = "buffer_record"
+layout = "workspace_handle:u64,buffer_handle:u64,buffer_revision:u64,path:bytes_u32 containing FS WirePath,byte_len:u64,content_hash:[u8;32],Extensions"
+[[type]]
+name = "state_entity"
+layout = "entity_kind:u16,reserved:u16=0,body:bytes_u32 containing complete ServerRecord,DiagnosticRecord,or BufferRecord; ADD and REPLACE carry the complete entity"
+[[type]]
+name = "entity_patch"
+layout = "entity_kind:u16,reserved:u16=0,observed_revision:u64,replacement:bytes_u32 containing complete StateEntity,Extensions"
+[[type]]
+name = "removed_entity"
+layout = "entity_kind:u16,reserved:u16=0,key:bytes_u32 containing exact kind-specific key,removed_revision:u64; BACKEND key is BackendRemoveKey, DIAGNOSTICS key is DiagnosticsRemoveKey, BUFFER key is BufferRemoveKey"
+[[type]]
+name = "backend_remove_key"
+layout = "server_handle:u64; nonzero"
+[[type]]
+name = "diagnostics_remove_key"
+layout = "the raw encoding of one non-root FS WirePath (component_count:u16,repeated component:bytes_u16), wrapped once by RemovedEntity key:bytes_u32"
+[[type]]
+name = "buffer_remove_key"
+layout = "buffer_handle:u64; nonzero"
+[[type]]
+name = "family_limits"
+layout = "ordered optional extensions: tags 1..12 encode max workspaces/session:u32,watches/workspace:u32,query records:u32,query bytes:u32,cursor bytes:u32,inline buffer bytes:u32,buffer bytes:u64,buffers/workspace:u32,stages/session:u32,diagnostics/file:u32,servers:u32,concurrent queries:u32"
+
+[[constant]]
+name = "POSITION_UTF8"
+value = 0
+
+[[constant]]
+name = "SOURCE_FS"
+value = 0
+[[constant]]
+name = "SOURCE_PLATFORM_PATH"
+value = 1
+[[constant]]
+name = "SOURCE_TERMINAL_CWD"
+value = 2
+[[constant]]
+name = "OPEN_EXPLICIT"
+value = 0
+[[constant]]
+name = "OPEN_AUTO_DISCOVER"
+value = 1
+[[constant]]
+name = "OPEN_NO_BACKEND_DETAIL_EXTENSION"
+value = 1
+
+[[constant]]
+name = "CLOSED_CLIENT_REQUEST"
+value = 0
+[[constant]]
+name = "CLOSED_ROOT_GONE"
+value = 1
+[[constant]]
+name = "CLOSED_PERMISSION_LOST"
+value = 2
+[[constant]]
+name = "CLOSED_BACKEND_FAILED"
+value = 3
+[[constant]]
+name = "CLOSED_RESOURCE_LIMIT"
+value = 4
+
+[[constant]]
+name = "CAPABILITY_DEFINITION"
+value = 1
+[[constant]]
+name = "CAPABILITY_REFERENCES"
+value = 2
+[[constant]]
+name = "CAPABILITY_HOVER"
+value = 4
+[[constant]]
+name = "CAPABILITY_DOCUMENT_SYMBOLS"
+value = 8
+[[constant]]
+name = "CAPABILITY_WORKSPACE_SYMBOLS"
+value = 16
+[[constant]]
+name = "CAPABILITY_COMPLETION"
+value = 32
+[[constant]]
+name = "CAPABILITY_CODE_ACTIONS"
+value = 64
+[[constant]]
+name = "CAPABILITY_FORMATTING"
+value = 128
+[[constant]]
+name = "CAPABILITY_RENAME"
+value = 256
+[[constant]]
+name = "CAPABILITY_SIGNATURE_HELP"
+value = 512
+[[constant]]
+name = "CAPABILITIES"
+value = 1023
+
+[[constant]]
+name = "WATCH_BACKEND"
+value = 1
+[[constant]]
+name = "WATCH_DIAGNOSTICS"
+value = 2
+[[constant]]
+name = "WATCH_BUFFERS"
+value = 4
+[[constant]]
+name = "WATCH_DATASETS"
+value = 7
+
+[[constant]]
+name = "QUERY_DEFINITION"
+value = 0
+[[constant]]
+name = "QUERY_REFERENCES"
+value = 1
+[[constant]]
+name = "QUERY_HOVER"
+value = 2
+[[constant]]
+name = "QUERY_DOCUMENT_SYMBOLS"
+value = 3
+[[constant]]
+name = "QUERY_WORKSPACE_SYMBOLS"
+value = 4
+[[constant]]
+name = "QUERY_COMPLETION"
+value = 5
+[[constant]]
+name = "QUERY_CODE_ACTIONS"
+value = 6
+[[constant]]
+name = "QUERY_FORMATTING"
+value = 7
+[[constant]]
+name = "QUERY_RENAME"
+value = 8
+[[constant]]
+name = "QUERY_SIGNATURE_HELP"
+value = 9
+
+[[constant]]
+name = "REFERENCES_INCLUDE_DECLARATION"
+value = 1
+[[constant]]
+name = "REFERENCES_FLAGS"
+value = 1
+[[constant]]
+name = "COMPLETION_TRIGGER_INVOKED"
+value = 0
+[[constant]]
+name = "COMPLETION_TRIGGER_INCOMPLETE"
+value = 1
+[[constant]]
+name = "COMPLETION_TRIGGER_CHARACTER"
+value = 2
+[[constant]]
+name = "FORMATTING_INSERT_SPACES"
+value = 1
+[[constant]]
+name = "FORMATTING_TRIM_TRAILING_WHITESPACE"
+value = 2
+[[constant]]
+name = "FORMATTING_INSERT_FINAL_NEWLINE"
+value = 4
+[[constant]]
+name = "FORMATTING_TRIM_FINAL_NEWLINES"
+value = 8
+[[constant]]
+name = "FORMATTING_FLAGS"
+value = 15
+
+[[constant]]
+name = "RESULT_LOCATION"
+value = 0
+[[constant]]
+name = "RESULT_HOVER"
+value = 1
+[[constant]]
+name = "RESULT_SYMBOL"
+value = 2
+[[constant]]
+name = "RESULT_COMPLETION"
+value = 3
+[[constant]]
+name = "RESULT_ACTION"
+value = 4
+[[constant]]
+name = "RESULT_EDIT"
+value = 5
+[[constant]]
+name = "RESULT_SIGNATURE"
+value = 6
+[[constant]]
+name = "PAGE_INLINE"
+value = 0
+[[constant]]
+name = "PAGE_TRANSFER"
+value = 1
+[[constant]]
+name = "PAGE_TRUNCATED"
+value = 1
+[[constant]]
+name = "PAGE_INCOMPLETE"
+value = 2
+[[constant]]
+name = "PAGE_FLAGS"
+value = 3
+[[constant]]
+name = "LOCATION_DECLARATION"
+value = 1
+[[constant]]
+name = "LOCATION_FLAGS"
+value = 1
+[[constant]]
+name = "MARKUP_PLAIN_TEXT"
+value = 0
+[[constant]]
+name = "MARKUP_MARKDOWN"
+value = 1
+
+[[constant]]
+name = "SYMBOL_FILE"
+value = 0
+[[constant]]
+name = "SYMBOL_MODULE"
+value = 1
+[[constant]]
+name = "SYMBOL_NAMESPACE"
+value = 2
+[[constant]]
+name = "SYMBOL_PACKAGE"
+value = 3
+[[constant]]
+name = "SYMBOL_CLASS"
+value = 4
+[[constant]]
+name = "SYMBOL_METHOD"
+value = 5
+[[constant]]
+name = "SYMBOL_PROPERTY"
+value = 6
+[[constant]]
+name = "SYMBOL_FIELD"
+value = 7
+[[constant]]
+name = "SYMBOL_CONSTRUCTOR"
+value = 8
+[[constant]]
+name = "SYMBOL_ENUM"
+value = 9
+[[constant]]
+name = "SYMBOL_INTERFACE"
+value = 10
+[[constant]]
+name = "SYMBOL_FUNCTION"
+value = 11
+[[constant]]
+name = "SYMBOL_VARIABLE"
+value = 12
+[[constant]]
+name = "SYMBOL_CONSTANT"
+value = 13
+[[constant]]
+name = "SYMBOL_STRING"
+value = 14
+[[constant]]
+name = "SYMBOL_NUMBER"
+value = 15
+[[constant]]
+name = "SYMBOL_BOOLEAN"
+value = 16
+[[constant]]
+name = "SYMBOL_ARRAY"
+value = 17
+[[constant]]
+name = "SYMBOL_OBJECT"
+value = 18
+[[constant]]
+name = "SYMBOL_KEY"
+value = 19
+[[constant]]
+name = "SYMBOL_NULL"
+value = 20
+[[constant]]
+name = "SYMBOL_ENUM_MEMBER"
+value = 21
+[[constant]]
+name = "SYMBOL_STRUCT"
+value = 22
+[[constant]]
+name = "SYMBOL_EVENT"
+value = 23
+[[constant]]
+name = "SYMBOL_OPERATOR"
+value = 24
+[[constant]]
+name = "SYMBOL_TYPE_PARAMETER"
+value = 25
+[[constant]]
+name = "SYMBOL_DEPRECATED"
+value = 1
+[[constant]]
+name = "SYMBOL_FLAGS"
+value = 1
+
+[[constant]]
+name = "COMPLETION_TEXT"
+value = 0
+[[constant]]
+name = "COMPLETION_METHOD"
+value = 1
+[[constant]]
+name = "COMPLETION_FUNCTION"
+value = 2
+[[constant]]
+name = "COMPLETION_CONSTRUCTOR"
+value = 3
+[[constant]]
+name = "COMPLETION_FIELD"
+value = 4
+[[constant]]
+name = "COMPLETION_VARIABLE"
+value = 5
+[[constant]]
+name = "COMPLETION_CLASS"
+value = 6
+[[constant]]
+name = "COMPLETION_INTERFACE"
+value = 7
+[[constant]]
+name = "COMPLETION_MODULE"
+value = 8
+[[constant]]
+name = "COMPLETION_PROPERTY"
+value = 9
+[[constant]]
+name = "COMPLETION_UNIT"
+value = 10
+[[constant]]
+name = "COMPLETION_VALUE"
+value = 11
+[[constant]]
+name = "COMPLETION_ENUM"
+value = 12
+[[constant]]
+name = "COMPLETION_KEYWORD"
+value = 13
+[[constant]]
+name = "COMPLETION_SNIPPET"
+value = 14
+[[constant]]
+name = "COMPLETION_COLOR"
+value = 15
+[[constant]]
+name = "COMPLETION_FILE"
+value = 16
+[[constant]]
+name = "COMPLETION_REFERENCE"
+value = 17
+[[constant]]
+name = "COMPLETION_FOLDER"
+value = 18
+[[constant]]
+name = "COMPLETION_ENUM_MEMBER"
+value = 19
+[[constant]]
+name = "COMPLETION_CONSTANT"
+value = 20
+[[constant]]
+name = "COMPLETION_STRUCT"
+value = 21
+[[constant]]
+name = "COMPLETION_EVENT"
+value = 22
+[[constant]]
+name = "COMPLETION_OPERATOR"
+value = 23
+[[constant]]
+name = "COMPLETION_TYPE_PARAMETER"
+value = 24
+[[constant]]
+name = "COMPLETION_DEPRECATED"
+value = 1
+[[constant]]
+name = "COMPLETION_PRESELECT"
+value = 2
+[[constant]]
+name = "COMPLETION_SNIPPET_TEXT"
+value = 4
+[[constant]]
+name = "COMPLETION_FLAGS"
+value = 7
+
+[[constant]]
+name = "ACTION_PREFERRED"
+value = 1
+[[constant]]
+name = "ACTION_DISABLED"
+value = 2
+[[constant]]
+name = "ACTION_FLAGS"
+value = 3
+
+[[constant]]
+name = "SIGNATURE_ACTIVE"
+value = 1
+[[constant]]
+name = "SIGNATURE_DEPRECATED"
+value = 2
+[[constant]]
+name = "SIGNATURE_FLAGS"
+value = 3
+[[constant]]
+name = "SIGNATURE_NO_ACTIVE_PARAMETER"
+value = 65535
+
+[[constant]]
+name = "SERVER_SPAWNING"
+value = 0
+[[constant]]
+name = "SERVER_INITIALIZING"
+value = 1
+[[constant]]
+name = "SERVER_INDEXING"
+value = 2
+[[constant]]
+name = "SERVER_READY"
+value = 3
+[[constant]]
+name = "SERVER_FAILED"
+value = 4
+[[constant]]
+name = "SERVER_PROGRESS_UNKNOWN"
+value = 255
+
+[[constant]]
+name = "DIAGNOSTIC_ERROR"
+value = 0
+[[constant]]
+name = "DIAGNOSTIC_WARNING"
+value = 1
+[[constant]]
+name = "DIAGNOSTIC_INFORMATION"
+value = 2
+[[constant]]
+name = "DIAGNOSTIC_HINT"
+value = 3
+[[constant]]
+name = "DIAGNOSTIC_UNNECESSARY"
+value = 1
+[[constant]]
+name = "DIAGNOSTIC_DEPRECATED"
+value = 2
+[[constant]]
+name = "DIAGNOSTIC_TAGS"
+value = 3
+
+[[constant]]
+name = "ENTITY_BACKEND"
+value = 0
+[[constant]]
+name = "ENTITY_DIAGNOSTICS"
+value = 1
+[[constant]]
+name = "ENTITY_BUFFER"
+value = 2
+
+[[constant]]
+name = "QUERY_CONTENT_KIND"
+value = 0
+[[constant]]
+name = "BUFFER_CONTENT_KIND"
+value = 1
+
+[[constant]]
+name = "MAX_WORKSPACES_PER_SESSION"
+value = 64
+[[constant]]
+name = "MAX_ROOT_BYTES"
+value = 65535
+[[constant]]
+name = "MAX_DIAGNOSTICS_SETTLE_MS"
+value = 10000
+[[constant]]
+name = "MAX_WATCHES_PER_WORKSPACE"
+value = 32
+[[constant]]
+name = "MAX_QUERY_RECORDS"
+value = 4096
+[[constant]]
+name = "MAX_QUERY_BYTES"
+value = 4194304
+[[constant]]
+name = "MAX_CURSOR_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_INLINE_BUFFER_BYTES"
+value = 32768
+[[constant]]
+name = "MAX_BUFFER_BYTES"
+value = 67108864
+[[constant]]
+name = "MAX_BUFFERS_PER_WORKSPACE"
+value = 1024
+[[constant]]
+name = "MAX_STAGES_PER_SESSION"
+value = 16
+[[constant]]
+name = "MAX_LANGUAGE_BYTES"
+value = 255
+[[constant]]
+name = "MAX_PROFILE_BYTES"
+value = 255
+[[constant]]
+name = "MAX_INITIALIZATION_BYTES"
+value = 1048576
+[[constant]]
+name = "MAX_QUERY_TEXT_BYTES"
+value = 65535
+[[constant]]
+name = "MAX_TRIGGER_BYTES"
+value = 16
+[[constant]]
+name = "MAX_DIAGNOSTIC_IDS"
+value = 256
+[[constant]]
+name = "MAX_SYMBOL_NAME_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_MARKUP_BYTES"
+value = 1048576
+[[constant]]
+name = "MAX_DETAIL_BYTES"
+value = 65535
+[[constant]]
+name = "MAX_BACKEND_ID_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_EDIT_BYTES"
+value = 1048576
+[[constant]]
+name = "MAX_ACTION_KIND_BYTES"
+value = 255
+[[constant]]
+name = "MAX_EDITS_PER_ACTION"
+value = 1024
+[[constant]]
+name = "MAX_SERVERS"
+value = 256
+[[constant]]
+name = "MAX_DIAGNOSTICS_PER_FILE"
+value = 4096
+[[constant]]
+name = "MAX_DIAGNOSTIC_CODE_BYTES"
+value = 255
+[[constant]]
+name = "MAX_DIAGNOSTIC_MESSAGE_BYTES"
+value = 1048576
+[[constant]]
+name = "MAX_ENTITY_KEY_BYTES"
+value = 65535
+[[constant]]
+name = "MAX_CONCURRENT_QUERIES"
+value = 8
+
+[[constant]]
+name = "LIMIT_MAX_WORKSPACES_PER_SESSION"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_WATCHES_PER_WORKSPACE"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_QUERY_RECORDS"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_QUERY_BYTES"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_CURSOR_BYTES"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_INLINE_BUFFER_BYTES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_BUFFER_BYTES"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_BUFFERS_PER_WORKSPACE"
+value = 8
+[[constant]]
+name = "LIMIT_MAX_STAGES_PER_SESSION"
+value = 9
+[[constant]]
+name = "LIMIT_MAX_DIAGNOSTICS_PER_FILE"
+value = 10
+[[constant]]
+name = "LIMIT_MAX_SERVERS"
+value = 11
+[[constant]]
+name = "LIMIT_MAX_CONCURRENT_QUERIES"
+value = 12

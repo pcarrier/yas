@@ -1,0 +1,13 @@
+[package]
+name = "yas-terminal-driver"
+version = "0.1.0"
+edition.workspace = true
+description = "YAS driver for the vendored Alacritty terminal engine"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+yas-terminal-model = { workspace = true }
+alacritty_terminal = { package = "yas-alacritty-terminal", version = "=0.26.0-yas.1", path = "../../vendor/yas-alacritty-terminal" }
+regex = "1"

@@ -1,0 +1,173 @@
+schema = 1
+family = "yas.channel"
+
+limits = [
+  { name = "MAX_NAME_BYTES", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 255 },
+  { name = "MAX_METADATA_BYTES", tag = 2, type = "u32", required = true, hard_min = 0, hard_max = 65536 },
+  { name = "MAX_LISTENERS_PER_SESSION", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 32 },
+  { name = "MAX_CHANNELS_PER_SESSION", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 128 },
+  { name = "MAX_PENDING_CONNECTS", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 32 },
+  { name = "MAX_MESSAGE_BYTES", tag = 6, type = "u64", required = true, hard_min = 1, hard_max = 16777216 },
+  { name = "MAX_OPEN_MESSAGES", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "CONNECT_TIMEOUT_NS", tag = 8, type = "u64", required = true, hard_min = 1, hard_max = 30000000000 },
+  { name = "MAX_MUTATION_REPLAYS", tag = 9, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+]
+
+[[constant]]
+name = "OWNER_SESSION"
+value = 0
+[[constant]]
+name = "OWNER_EXTENSION"
+value = 1
+
+[[constant]]
+name = "CHANNEL_CONTENT_KIND"
+value = 0
+
+[[constant]]
+name = "MAX_NAME_BYTES"
+value = 255
+[[constant]]
+name = "MAX_METADATA_BYTES"
+value = 65536
+[[constant]]
+name = "MAX_LISTENERS_PER_SESSION"
+value = 32
+[[constant]]
+name = "MAX_CHANNELS_PER_SESSION"
+value = 128
+[[constant]]
+name = "MAX_PENDING_CONNECTS"
+value = 32
+[[constant]]
+name = "MAX_MESSAGE_BYTES"
+value = 16777216
+[[constant]]
+name = "MAX_OPEN_MESSAGES"
+value = 16
+[[constant]]
+name = "CONNECT_TIMEOUT_NS"
+value = 30000000000
+
+[[constant]]
+name = "LIMIT_MAX_NAME_BYTES"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_METADATA_BYTES"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_LISTENERS_PER_SESSION"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_CHANNELS_PER_SESSION"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_PENDING_CONNECTS"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_MESSAGE_BYTES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_OPEN_MESSAGES"
+value = 7
+[[constant]]
+name = "LIMIT_CONNECT_TIMEOUT_NS"
+value = 8
+[[constant]]
+name = "MAX_MUTATION_REPLAYS"
+value = 65536
+[[constant]]
+name = "LIMIT_MAX_MUTATION_REPLAYS"
+value = 9
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+
+[[request]]
+name = "LISTEN"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],name:string_u16,metadata:bytes_u32,Extensions; ResultPrefix + listener_handle:u64,generation:u64,Extensions"
+
+[[request]]
+name = "CLOSE_LISTENER"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "listener_handle:u64,generation:u64,Extensions; ResultPrefix"
+
+[[request]]
+name = "CONNECT"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "listener_handle:u64,generation:u64,initial_receive_credit:u64,metadata:bytes_u32,Extensions; ResultPrefix + ChannelEndpoint"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<ListenerRecord>"
+
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[event]]
+name = "ACCEPT"
+kind = 0x0002
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "listener_handle:u64,generation:u64,ChannelEndpoint"
+
+[[type]]
+name = "listener_record"
+layout = "listener_handle:u64,generation:u64,owner_kind:u8,reserved:u8=0,flags:u16=0,owner_session:[u8;16],name:string_u16,metadata:bytes_u32,Extensions"
+
+[[type]]
+name = "remove_record"
+layout = "listener_handle:u64,generation:u64"
+
+[[type]]
+name = "channel_endpoint"
+layout = "channel_handle:u64,peer_channel_handle:u64,peer_session:[u8;16],listener_metadata:bytes_u32,connector_metadata:bytes_u32,descriptor:bytes_u32 containing bidirectional sensitive MESSAGE TransferDescriptor,Extensions"
+
+[[type]]
+name = "state_entity_body"
+layout = "ADD/REPLACE complete ListenerRecord; PATCH listener_handle:u64,generation:u64,Extensions; REMOVE RemoveRecord"
+
+[[type]]
+name = "family_limits"
+layout = "extension tags 1 max_name_bytes:u32,2 max_metadata_bytes:u32,3 max_listeners_per_session:u32,4 max_channels_per_session:u32,5 max_pending_connects:u32,6 max_message_bytes:u64,7 max_open_messages:u32,8 connect_timeout_ns:u64"

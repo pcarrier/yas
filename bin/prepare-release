@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir/.."
+
+usage() {
+    cat <<'EOF'
+Usage: ./bin/prepare-release <version>
+
+Bumps the repo release version, prints the changes since the latest v* tag,
+runs the server verification suite, and commits the result as:
+
+  release <version>
+EOF
+}
+
+die() {
+    echo "prepare-release: $*" >&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+read_toml_version() {
+    perl -ne 'if (/^version = "([^"]+)"/) { print "$1\n"; exit 0 }' "$1"
+}
+
+read_flake_version() {
+    perl -ne 'if (/^\s*version = "([^"]+)";$/) { print "$1\n"; exit 0 }' "$1"
+}
+
+# `name` always precedes `version` in a Cargo.lock package block, so one
+# anchored match per crate is exact even when unrelated crates share a version.
+lock_entry_is() {
+    local lockfile=$1 crate=$2 expected=$3
+    CRATE="$crate" EXPECTED="$expected" \
+        perl -0ne 'exit(!/name = "\Q$ENV{CRATE}\E"\nversion = "\Q$ENV{EXPECTED}\E"/)' \
+        "$lockfile"
+}
+
+bump_lock_entry() {
+    local lockfile=$1 crate=$2 from=$3 to=$4
+    CRATE="$crate" FROM="$from" TO="$to" \
+        perl -0pi -e 's/(name = "\Q$ENV{CRATE}\E"\nversion = ")\Q$ENV{FROM}\E(")/$1$ENV{TO}$2/g' \
+        "$lockfile"
+}
+
+ensure_clean_tree() {
+    local status
+    status="$(git status --porcelain)"
+    if [[ -n "$status" ]]; then
+        printf '%s\n' "$status" >&2
+        die "working tree must be clean"
+    fi
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+[[ $# -eq 1 ]] || {
+    usage >&2
+    exit 1
+}
+
+target_version="$1"
+[[ "$target_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "version must look like 0.8.0"
+
+require_cmd git
+require_cmd perl
+require_cmd node
+require_cmd cargo
+require_cmd jq
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "must be run inside the git repository"
+ensure_clean_tree
+
+current_version="$(read_toml_version crates/yas/Cargo.toml)"
+[[ -n "$current_version" ]] || die "could not read current version from crates/yas/Cargo.toml"
+[[ "$target_version" != "$current_version" ]] || die "version is already $target_version"
+
+if git rev-parse -q --verify "refs/tags/v$target_version" >/dev/null 2>&1; then
+    die "tag v$target_version already exists"
+fi
+
+# Cargo owns workspace membership. Parsing quoted strings out of Cargo.toml
+# also finds `exclude` entries, while walking directories pulls in nested
+# workspaces such as extensions/. Version every root-workspace package except
+# the explicitly fixed-version xtask tool. This includes yas-browser: it is not
+# published to crates.io, but its Cargo version is the source for the published
+# @yas-run/browser package. `--locked` keeps discovery read-only in the clean
+# tree required above. Crates.io publish ordering remains owned by
+# bin/publish-crates.
+workspace_metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+# shellcheck disable=SC2016 # jq variables must remain literal here.
+versioned_packages='
+  .workspace_members as $members
+  | .packages[]
+  | select(.id as $id | $members | index($id))
+  | select(.name != "xtask")'
+
+mapfile -t cargo_manifests < <(
+    jq -r "$versioned_packages | .manifest_path" <<<"$workspace_metadata"
+)
+[[ ${#cargo_manifests[@]} -gt 0 ]] \
+    || die "no versioned root-workspace packages found"
+
+mapfile -t workspace_crates < <(
+    jq -r "$versioned_packages | .name" <<<"$workspace_metadata"
+)
+[[ ${#workspace_crates[@]} -gt 0 ]] \
+    || die "no versioned root-workspace crate names found"
+[[ ${#cargo_manifests[@]} -eq ${#workspace_crates[@]} ]] \
+    || die "cargo metadata returned mismatched release manifests and crate names"
+
+# The extensions workspace is `exclude`d from the root one — its members only
+# ever build for wasm32 — so the metadata above cannot see it. It still shares
+# the release version: `extensions/dist/manifest.json` publishes this number,
+# and the objects a `#digest` pin outlives live under
+# `releases/download/v<version>/`. Members inherit it from
+# `[workspace.package]`, so the workspace manifest plus its lock is the whole
+# bump.
+extensions_manifest=extensions/Cargo.toml
+extensions_metadata="$(
+    cargo metadata --locked --no-deps --format-version 1 \
+        --manifest-path "$extensions_manifest"
+)"
+mapfile -t extension_crates < <(jq -r '.packages[].name' <<<"$extensions_metadata")
+[[ ${#extension_crates[@]} -gt 0 ]] \
+    || die "no extension crates found in $extensions_manifest"
+
+# The JS side of the release version is every pnpm workspace member that
+# declares one. Discovering them means adding a member cannot silently skip the
+# bump; js/web declares no version and is left alone.
+mapfile -t js_manifests < <(
+    node - <<'NODE'
+const fs = require("fs");
+
+const lines = fs.readFileSync("js/pnpm-workspace.yaml", "utf8").split("\n");
+const directories = [];
+let inPackages = false;
+for (const line of lines) {
+  if (/^packages:\s*$/.test(line)) {
+    inPackages = true;
+    continue;
+  }
+  if (!inPackages) continue;
+  const entry = /^\s+-\s*["']?([^"'\s]+)["']?\s*$/.exec(line);
+  if (!entry) {
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    break;
+  }
+  if (entry[1].includes("*")) {
+    console.error(`release: pnpm workspace glob '${entry[1]}' is not supported`);
+    process.exit(1);
+  }
+  directories.push(entry[1]);
+}
+
+if (directories.length === 0) {
+  console.error("release: js/pnpm-workspace.yaml lists no packages");
+  process.exit(1);
+}
+
+for (const directory of directories) {
+  const manifest = `js/${directory}/package.json`;
+  if (!fs.existsSync(manifest)) {
+    console.error(`release: js/pnpm-workspace.yaml names missing ${manifest}`);
+    process.exit(1);
+  }
+  if (JSON.parse(fs.readFileSync(manifest, "utf8")).version === undefined) continue;
+  console.log(manifest);
+}
+NODE
+)
+[[ ${#js_manifests[@]} -gt 0 ]] \
+    || die "no versioned JS workspace packages found"
+
+for file in "${cargo_manifests[@]}"; do
+    [[ "$(read_toml_version "$file")" == "$current_version" ]] \
+        || die "expected $file to be at version $current_version"
+done
+
+[[ "$(read_flake_version nix/common.nix)" == "$current_version" ]] \
+    || die "expected nix/common.nix to be at version $current_version"
+
+[[ "$(read_toml_version "$extensions_manifest")" == "$current_version" ]] \
+    || die "expected $extensions_manifest to be at version $current_version"
+
+for crate in "${extension_crates[@]}"; do
+    lock_entry_is extensions/Cargo.lock "$crate" "$current_version" \
+        || die "expected extensions/Cargo.lock entry for $crate to be at version $current_version"
+done
+
+# Validate workspace dependency versions in root Cargo.toml
+ws_dep_versions=$(perl -ne 'print "$1\n" if /version = "([^"]+)", path/' Cargo.toml)
+for v in $ws_dep_versions; do
+    [[ "$v" == "$current_version" ]] \
+        || die "expected workspace dependency version $v in Cargo.toml to be $current_version"
+done
+
+# Validate JS package versions
+node - "$current_version" "${js_manifests[@]}" <<'NODE'
+const fs = require("fs");
+const [expected, ...manifests] = process.argv.slice(2);
+
+for (const manifest of manifests) {
+  const pkg = JSON.parse(fs.readFileSync(manifest, "utf8"));
+  if (pkg.version !== expected) {
+    console.error(`release: expected ${manifest} to be at version ${expected}`);
+    process.exit(1);
+  }
+}
+NODE
+
+previous_tag="$(git tag --list 'v*' --sort=-v:refname | head -1)"
+if [[ -n "$previous_tag" ]]; then
+    echo "Changes since $previous_tag:"
+    git log --oneline "$previous_tag"..HEAD
+    echo
+else
+    echo "No previous v* tag found."
+    echo
+fi
+
+for file in "${cargo_manifests[@]}"; do
+    FROM="$current_version" TO="$target_version" \
+        perl -0pi -e 's/^version = "\Q$ENV{FROM}\E"$/version = "$ENV{TO}"/m' "$file"
+done
+
+FROM="$current_version" TO="$target_version" \
+    perl -0pi -e 's/version = "\Q$ENV{FROM}\E";/version = "$ENV{TO}";/' nix/common.nix
+
+FROM="$current_version" TO="$target_version" \
+    perl -0pi -e 's/^version = "\Q$ENV{FROM}\E"$/version = "$ENV{TO}"/m' "$extensions_manifest"
+
+for crate in "${extension_crates[@]}"; do
+    bump_lock_entry extensions/Cargo.lock "$crate" "$current_version" "$target_version"
+done
+
+# Bump workspace dependency versions in root Cargo.toml
+FROM="$current_version" TO="$target_version" \
+    perl -pi -e 's/version = "\Q$ENV{FROM}\E", path/version = "$ENV{TO}", path/g' Cargo.toml
+
+# Bump JS package versions
+node - "$target_version" "${js_manifests[@]}" <<'NODE'
+const fs = require("fs");
+const [version, ...manifests] = process.argv.slice(2);
+
+for (const manifest of manifests) {
+  const pkg = JSON.parse(fs.readFileSync(manifest, "utf8"));
+  pkg.version = version;
+  fs.writeFileSync(manifest, `${JSON.stringify(pkg, null, 2)}\n`);
+}
+NODE
+
+for crate in "${workspace_crates[@]}"; do
+    bump_lock_entry Cargo.lock "$crate" "$current_version" "$target_version"
+done
+
+for file in "${cargo_manifests[@]}"; do
+    [[ "$(read_toml_version "$file")" == "$target_version" ]] \
+        || die "failed to update $file to version $target_version"
+done
+
+[[ "$(read_flake_version nix/common.nix)" == "$target_version" ]] \
+    || die "failed to update nix/common.nix to version $target_version"
+
+[[ "$(read_toml_version "$extensions_manifest")" == "$target_version" ]] \
+    || die "failed to update $extensions_manifest to version $target_version"
+
+for crate in "${extension_crates[@]}"; do
+    lock_entry_is extensions/Cargo.lock "$crate" "$target_version" \
+        || die "failed to update extensions/Cargo.lock entry for $crate to version $target_version"
+done
+
+# Verify workspace dependency versions in root Cargo.toml
+ws_dep_versions=$(perl -ne 'print "$1\n" if /version = "([^"]+)", path/' Cargo.toml)
+for v in $ws_dep_versions; do
+    [[ "$v" == "$target_version" ]] \
+        || die "failed to update workspace dependency version in Cargo.toml to $target_version"
+done
+
+# Verify JS versions
+node - "$target_version" "${js_manifests[@]}" <<'NODE'
+const fs = require("fs");
+const [expected, ...manifests] = process.argv.slice(2);
+
+for (const manifest of manifests) {
+  const pkg = JSON.parse(fs.readFileSync(manifest, "utf8"));
+  if (pkg.version !== expected) {
+    console.error(`release: failed to update ${manifest} to version ${expected}`);
+    process.exit(1);
+  }
+}
+NODE
+
+for crate in "${workspace_crates[@]}"; do
+    lock_entry_is Cargo.lock "$crate" "$target_version" \
+        || die "failed to update Cargo.lock entry for $crate to version $target_version"
+done
+
+cargo test -p yas-server -- --nocapture
+
+# Stage all changed versioned files
+git add Cargo.toml Cargo.lock nix/common.nix js/pnpm-lock.yaml
+git add "$extensions_manifest" extensions/Cargo.lock
+git add "${js_manifests[@]}"
+for file in "${cargo_manifests[@]}"; do
+    git add "$file"
+done
+
+git commit -m "release $target_version"
+
+echo
+echo "Created release commit:"
+git log -1 --oneline --decorate

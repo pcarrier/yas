@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# pnpm resolves @yas-run/browser out of crates/browser/pkg, so the first WASM
+# build has to finish before the install, and the install before any Vite
+# server starts. That ordering was two extra units and two `requires` edges
+# for what is three lines of a script.
+build='cd crates/browser && wasm-pack build --target web --release --out-dir pkg && echo "browser WASM ready"'
+
+bash -c "$build"
+(cd js && pnpm install --frozen-lockfile)
+# Readiness is the install, not the first WASM build: a Vite server started
+# between the two resolves a workspace link whose target does not exist yet.
+echo "js ready"
+
+# --postpone because the build above already was the first run; without it
+# cargo-watch repeats a full release wasm-pack build at startup.
+exec cargo watch --postpone -w crates/browser/src -s "$build"

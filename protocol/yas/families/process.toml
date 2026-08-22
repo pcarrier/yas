@@ -1,0 +1,349 @@
+schema = 1
+family = "yas.process"
+
+limits = [
+  { name = "MAX_ARGC", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_ARG_BYTES", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 1048576 },
+  { name = "MAX_ENVC", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 256 },
+  { name = "MAX_ENV_BYTES", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 1048576 },
+  { name = "MAX_PROCESSES_PER_SESSION", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_PROCESSES", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+  { name = "MAX_PENDING_SPAWNS", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 8 },
+  { name = "MAX_STREAM_BUFFER_BYTES", tag = 8, type = "u64", required = true, hard_min = 1, hard_max = 8388608 },
+  { name = "MAX_DETACHED_RETENTION_NS", tag = 9, type = "u64", required = true, hard_min = 1, hard_max = 300000000000 },
+  { name = "MAX_MUTATION_REPLAYS", tag = 10, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+]
+
+[[constant]]
+name = "SPAWN_MERGE_STDERR"
+value = 1
+[[constant]]
+name = "SPAWN_DETACHABLE"
+value = 2
+[[constant]]
+name = "SPAWN_FLAGS"
+value = 3
+
+[[constant]]
+name = "ENV_EMPTY"
+value = 0
+[[constant]]
+name = "ENV_SESSION"
+value = 1
+
+[[constant]]
+name = "CWD_SERVER_DEFAULT"
+value = 0
+[[constant]]
+name = "CWD_PATH"
+value = 1
+[[constant]]
+name = "CWD_TERMINAL"
+value = 2
+[[constant]]
+name = "CWD_FS"
+value = 3
+
+[[constant]]
+name = "ATTACH_STDIN"
+value = 1
+
+[[constant]]
+name = "CONTROL_SIGNAL"
+value = 0
+[[constant]]
+name = "CONTROL_TERMINATE"
+value = 1
+[[constant]]
+name = "CONTROL_KILL"
+value = 2
+[[constant]]
+name = "CONTROL_DETACH"
+value = 3
+
+[[constant]]
+name = "SIGNAL_INTERRUPT"
+value = 1
+[[constant]]
+name = "SIGNAL_TERMINATE"
+value = 2
+[[constant]]
+name = "SIGNAL_KILL"
+value = 3
+[[constant]]
+name = "SIGNAL_HANGUP"
+value = 4
+
+[[constant]]
+name = "LIFECYCLE_RUNNING"
+value = 0
+[[constant]]
+name = "LIFECYCLE_EXITED"
+value = 1
+
+[[constant]]
+name = "STREAM_STDIN_OPEN"
+value = 1
+[[constant]]
+name = "STREAM_STDOUT_OPEN"
+value = 2
+[[constant]]
+name = "STREAM_STDERR_OPEN"
+value = 4
+[[constant]]
+name = "STREAM_STDIN_CLAIMED"
+value = 8
+[[constant]]
+name = "STREAM_STATE_FLAGS"
+value = 15
+
+[[constant]]
+name = "BUNDLE_STDIN"
+value = 1
+[[constant]]
+name = "BUNDLE_STDOUT"
+value = 2
+[[constant]]
+name = "BUNDLE_STDERR"
+value = 4
+[[constant]]
+name = "BUNDLE_MERGED_STDERR"
+value = 8
+[[constant]]
+name = "BUNDLE_FLAGS"
+value = 15
+
+[[constant]]
+name = "EXIT_KIND_CODE"
+value = 0
+[[constant]]
+name = "EXIT_KIND_SIGNAL"
+value = 1
+[[constant]]
+name = "EXIT_KIND_KILLED"
+value = 2
+[[constant]]
+name = "EXIT_KIND_OTHER"
+value = 3
+
+[[constant]]
+name = "EXIT_REASON_UNKNOWN"
+value = 0
+[[constant]]
+name = "EXIT_REASON_INTERRUPT"
+value = 1
+[[constant]]
+name = "EXIT_REASON_TERMINATE"
+value = 2
+[[constant]]
+name = "EXIT_REASON_KILL"
+value = 3
+[[constant]]
+name = "EXIT_REASON_HANGUP"
+value = 4
+[[constant]]
+name = "EXIT_REASON_CLIENT"
+value = 5
+[[constant]]
+name = "EXIT_REASON_OWNER_LOST"
+value = 6
+[[constant]]
+name = "EXIT_REASON_TERMINATE_TIMEOUT"
+value = 7
+[[constant]]
+name = "EXIT_REASON_SERVER_SHUTDOWN"
+value = 8
+
+[[constant]]
+name = "STREAM_STDIN_CONTENT_KIND"
+value = 0
+[[constant]]
+name = "STREAM_STDOUT_CONTENT_KIND"
+value = 1
+[[constant]]
+name = "STREAM_STDERR_CONTENT_KIND"
+value = 2
+
+[[constant]]
+name = "SPAWN_SURFACE_APP_EXTENSION"
+value = 1
+[[constant]]
+name = "SPAWN_RESOURCE_TAG_EXTENSION"
+value = 2
+
+[[constant]]
+name = "MAX_ARGC"
+value = 1024
+[[constant]]
+name = "MAX_ARG_BYTES"
+value = 1048576
+[[constant]]
+name = "MAX_ARG_LEN"
+value = 65536
+[[constant]]
+name = "MAX_ENVC"
+value = 256
+[[constant]]
+name = "MAX_ENV_BYTES"
+value = 1048576
+[[constant]]
+name = "MAX_ENV_KEY_BYTES"
+value = 255
+[[constant]]
+name = "MAX_ENV_VALUE_BYTES"
+value = 65536
+[[constant]]
+name = "MAX_CWD_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_PATH_COMPONENTS"
+value = 1024
+[[constant]]
+name = "MAX_PROCESSES_PER_SESSION"
+value = 16
+[[constant]]
+name = "MAX_PROCESSES"
+value = 64
+[[constant]]
+name = "MAX_PENDING_SPAWNS"
+value = 8
+[[constant]]
+name = "MAX_STREAM_BUFFER_BYTES"
+value = 8388608
+[[constant]]
+name = "MAX_DETACHED_RETENTION_NS"
+value = 300000000000
+
+[[constant]]
+name = "LIMIT_MAX_ARGC"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_ARG_BYTES"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_ENVC"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_ENV_BYTES"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_PROCESSES_PER_SESSION"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_PROCESSES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_PENDING_SPAWNS"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_STREAM_BUFFER_BYTES"
+value = 8
+[[constant]]
+name = "LIMIT_MAX_DETACHED_RETENTION_NS"
+value = 9
+[[constant]]
+name = "MAX_MUTATION_REPLAYS"
+value = 65536
+[[constant]]
+name = "LIMIT_MAX_MUTATION_REPLAYS"
+value = 10
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+
+[[request]]
+name = "SPAWN"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],flags:u16,environment_kind:u8,reserved:u8=0,cwd:bytes_u32 containing Cwd,argv_count:u16,repeated arg:bytes_u32,env_count:u16,repeated key:bytes_u16,value:bytes_u32,stdout_receive_credit:u64,stderr_receive_credit:u64,Extensions; ResultPrefix + StreamBundle"
+
+[[request]]
+name = "ATTACH"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "process_handle:u64,flags:u16,reserved:u16=0,stdout_receive_credit:u64,stderr_receive_credit:u64,Extensions; ResultPrefix + StreamBundle"
+
+[[request]]
+name = "CONTROL"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "process_handle:u64,operation_id:[u8;16],action:u8,reserved:u8=0,value:u16,Extensions; ResultPrefix + state_revision:u64"
+
+[[request]]
+name = "WAIT"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "process_handle:u64,timeout_ns:u64,Extensions; ResultPrefix + ExitRecord"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<ProcessRecord>"
+
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[type]]
+name = "cwd"
+layout = "kind:u8,reserved:[u8;3]=0; SERVER_DEFAULT empty, PATH path:bytes_u32, TERMINAL terminal_handle:u64, FS root_handle:u64,component_count:u16,repeated component:bytes_u16"
+
+[[type]]
+name = "process_record"
+layout = "process_handle:u64,lifecycle:u8,stream_state:u8,flags:u16,native_pid:u64,owner_session:[u8;16],argv0:bytes_u32,stdin_received:u64,stdout_produced:u64,stderr_produced:u64,retention_deadline_server_ns:u64,exit_present:u8,reserved:[u8;7]=0,optional exit:bytes_u32 containing ExitRecord,Extensions"
+
+[[type]]
+name = "remove_record"
+layout = "process_handle:u64"
+
+[[type]]
+name = "exit_record"
+layout = "kind:u8,reason:u8,reserved:u16=0,code:i32,exited_server_ns:u64,detail:bytes_u32"
+
+[[type]]
+name = "stream_bundle"
+layout = "process_handle:u64,flags:u16,reserved:u16=0,stdout_lifetime_offset:u64,stderr_lifetime_offset:u64,optional stdin/stdout/stderr descriptor:bytes_u32 containing sensitive BYTE TransferDescriptor,Extensions"
+
+[[type]]
+name = "state_entity_body"
+layout = "ADD/REPLACE complete ProcessRecord; REMOVE process_handle:u64"
+
+[[type]]
+name = "family_limits"
+layout = "extension tags 1 max_argc:u32,2 max_arg_bytes:u32,3 max_envc:u32,4 max_env_bytes:u32,5 max_processes_per_session:u32,6 max_processes:u32,7 max_pending_spawns:u32,8 max_stream_buffer_bytes:u64,9 max_detached_retention_ns:u64"

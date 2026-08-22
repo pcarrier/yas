@@ -1,0 +1,66 @@
+[package]
+name = "yas-cli"
+version = "0.1.0"
+edition.workspace = true
+description = "yas terminal client"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "yas"
+path = "src/main.rs"
+
+[features]
+# Software H.264 encoders compiled into the binary — forwarded to
+# yas-server, and reflected in `yas --license`. Any combination works:
+# none (AV1-only software fallback), one, or both. x264 (GPL-2.0-or-later)
+# is a deliberate opt-in; default builds stay MIT-clean.
+default = ["openh264"]
+x264 = ["yas-server/x264"]
+openh264 = ["yas-server/openh264"]
+
+[dependencies]
+yas-wire = { workspace = true }
+yas-webserver = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+rand = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+clap_mangen = "0.3"
+clap_complete = "4"
+regex = "1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+time = { version = "0.3", features = ["formatting"] }
+yas-server = { workspace = true }
+yas-edge = { workspace = true }
+yas-proxy = { workspace = true }
+yas-webrtc-forwarder = { workspace = true }
+yas-composite-transport = { workspace = true }
+yas-ssh = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs"] }
+web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
+url = "2"
+rustls-native-certs = "0.8"
+ring = "0.17"
+mimalloc = "0.1"
+blake3 = { version = "1", default-features = false, features = ["std"] }
+bytes = "1"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+[dev-dependencies]
+tempfile = "3"

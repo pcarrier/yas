@@ -1,0 +1,426 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  clampZoom,
+  driveSurfaceResize as createResizeDriver,
+} from "../surfaceResize";
+import type { SurfaceResizeTarget, SurfaceZoom } from "../surfaceResize";
+
+/** Records what a `YasSurfaceCanvas` would have been told. */
+function fakeTarget() {
+  const displaySizes: (number | null)[][] = [];
+  const resizes: number[][] = [];
+  const target: SurfaceResizeTarget = {
+    setDisplaySize(width, height, scale120, cssScale120) {
+      displaySizes.push([
+        width,
+        height ?? null,
+        scale120 ?? null,
+        cssScale120 ?? null,
+      ]);
+    },
+    requestResize(width, height, scale120) {
+      resizes.push([width, height, scale120]);
+    },
+  };
+  return { target, displaySizes, resizes };
+}
+
+function container(width: number, height: number): HTMLElement {
+  const el = document.createElement("div");
+  el.getBoundingClientRect = () =>
+    ({
+      width,
+      height,
+      left: 0,
+      top: 0,
+      right: width,
+      bottom: height,
+    }) as DOMRect;
+  return el;
+}
+
+describe("clampZoom", () => {
+  it("falls back to 1 for anything that is not a usable factor", () => {
+    for (const bad of [undefined, NaN, Infinity, 0, -2]) {
+      expect(clampZoom(bad as number | undefined)).toBe(1);
+    }
+  });
+
+  it("clamps to a range both ends of the stack can lay out", () => {
+    expect(clampZoom(0.1)).toBe(0.25);
+    expect(clampZoom(9)).toBe(4);
+    expect(clampZoom(1.25)).toBe(1.25);
+  });
+});
+
+describe("driveSurfaceResize", () => {
+  let callbacks: ResizeObserverCallback[] = [];
+  const disconnect = vi.fn();
+  const drivers: ReturnType<typeof createResizeDriver>[] = [];
+  let queries: { ratio: number; matches: boolean; events: EventTarget }[] = [];
+
+  function driveSurfaceResize(...args: Parameters<typeof createResizeDriver>) {
+    const driver = createResizeDriver(...args);
+    drivers.push(driver);
+    return driver;
+  }
+
+  function changeDpr(ratio: number) {
+    vi.stubGlobal("devicePixelRatio", ratio);
+    for (const query of [...queries]) {
+      const matches = query.ratio === ratio;
+      if (matches === query.matches) continue;
+      query.matches = matches;
+      query.events.dispatchEvent(new Event("change"));
+    }
+  }
+
+  /** Deliver a box to every live observer, in CSS pixels only — the shape a
+   *  browser without `devicePixelContentBoxSize` reports. */
+  function resizeTo(width: number, height: number): void {
+    const entry = { contentRect: { width, height } } as ResizeObserverEntry;
+    for (const cb of callbacks) cb([entry], null as never);
+  }
+
+  beforeEach(() => {
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    callbacks = [];
+    queries = [];
+    disconnect.mockClear();
+    vi.stubGlobal("devicePixelRatio", 1);
+    vi.stubGlobal("matchMedia", (media: string) => {
+      const query = {
+        ratio: Number(media.match(/resolution: ([\d.]+)dppx/)?.[1]),
+        matches: true,
+        events: new EventTarget(),
+      };
+      queries.push(query);
+      return query.events;
+    });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: ResizeObserverCallback) {
+          callbacks.push(cb);
+        }
+        observe = vi.fn();
+        disconnect = disconnect;
+      },
+    );
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    for (const driver of drivers.splice(0)) driver.dispose();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("reports the container's box as a display size on the way up", () => {
+    const { target, displaySizes } = fakeTarget();
+    driveSurfaceResize(target, container(800, 600));
+    // A view that never reports one takes no input at all and is served a
+    // thumbnail-grade stream, so this is the whole point of the driver.
+    expect(displaySizes).toEqual([[800, 600, 120, 120]]);
+  });
+
+  it("rounds each extent down to even", () => {
+    const { target, displaySizes } = fakeTarget();
+    // The encoder rounds down to even on its own; asking for an odd extent
+    // returns a frame a pixel short on that axis and letterboxes the rest.
+    driveSurfaceResize(target, container(801, 603));
+    expect(displaySizes[0]?.slice(0, 2)).toEqual([800, 602]);
+  });
+
+  it("scales by devicePixelRatio and reports the ratio it measured", () => {
+    vi.stubGlobal("devicePixelRatio", 2);
+    const { target, displaySizes } = fakeTarget();
+    driveSurfaceResize(target, container(400, 300));
+    expect(displaySizes).toEqual([[800, 600, 240, 240]]);
+  });
+
+  it("does not let a CSS-sized device-pixel box overwrite HiDPI", () => {
+    vi.stubGlobal("devicePixelRatio", 2);
+    const { target, displaySizes } = fakeTarget();
+    driveSurfaceResize(target, container(400, 300));
+    displaySizes.length = 0;
+
+    const entry = {
+      contentRect: { width: 400, height: 300 },
+      // Seen in Chromium configurations that expose the field without
+      // applying the emulated/native device scale to its values.
+      devicePixelContentBoxSize: [{ inlineSize: 400, blockSize: 300 }],
+    } as ResizeObserverEntry;
+    for (const callback of callbacks) callback([entry], null as never);
+
+    expect(displaySizes).toEqual([[800, 600, 240, 240]]);
+  });
+
+  it("raises Wayland DPI when browser zoom preserves the physical pane size", () => {
+    const { target, displaySizes, resizes } = fakeTarget();
+    const pane = container(800, 600);
+    driveSurfaceResize(target, pane);
+    resizeTo(800, 600);
+
+    // The viewport now fits half as many CSS pixels into the same physical
+    // box. A device-pixel ResizeObserver has no size change to report.
+    pane.getBoundingClientRect = () => ({ width: 400, height: 300 }) as DOMRect;
+    vi.stubGlobal("devicePixelRatio", 2);
+    window.dispatchEvent(new Event("resize"));
+    expect(displaySizes.at(-1)).toEqual([800, 600, 240, 240]);
+    vi.advanceTimersByTime(30);
+    expect(resizes.at(-1)).toEqual([800, 600, 240]);
+  });
+
+  it("remeasures window resizes even when DPR is unchanged and no observer fires", () => {
+    const { target, displaySizes, resizes } = fakeTarget();
+    const pane = container(800, 600);
+    driveSurfaceResize(target, pane);
+    pane.getBoundingClientRect = () => ({ width: 600, height: 800 }) as DOMRect;
+    window.dispatchEvent(new Event("resize"));
+    expect(displaySizes.at(-1)).toEqual([600, 800, 120, 120]);
+    vi.advanceTimersByTime(30);
+    expect(resizes.at(-1)).toEqual([600, 800, 120]);
+  });
+
+  it("withdraws a hidden pane's claim and reclaims an unchanged box on restore", () => {
+    const { target, displaySizes, resizes } = fakeTarget();
+    const driver = driveSurfaceResize(target, container(800, 600));
+    resizeTo(700, 500); // A trailing resize must not survive hiding the pane.
+    resizeTo(0, 0);
+    expect(displaySizes.at(-1)?.[0]).toBeNull();
+    vi.advanceTimersByTime(100);
+    driver.reapply(); // A zoom change must not reclaim the hidden box either.
+    expect(resizes).toEqual([[800, 600, 120]]);
+    expect(displaySizes.at(-1)?.[0]).toBeNull();
+    resizeTo(800, 600);
+    expect(resizes).toEqual([
+      [800, 600, 120],
+      [800, 600, 120],
+    ]);
+    expect(displaySizes.at(-1)).toEqual([800, 600, 120, 120]);
+  });
+
+  it("withdraws background-page claims and restores the current box on wake", () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    const { target, displaySizes, resizes } = fakeTarget();
+    const pane = container(800, 600);
+    const driver = driveSurfaceResize(target, pane);
+    resizeTo(700, 500); // A queued resize must not reclaim a background page.
+
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    resizeTo(900, 700);
+    driver.remeasure();
+    driver.reapply();
+    vi.advanceTimersByTime(100);
+    expect(displaySizes.at(-1)?.[0]).toBeNull();
+    expect(resizes).toEqual([[800, 600, 120]]);
+
+    // Returning to the same box must reclaim it despite resize deduplication.
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(resizes).toEqual([
+      [800, 600, 120],
+      [800, 600, 120],
+    ]);
+
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    pane.getBoundingClientRect = () => ({ width: 600, height: 800 }) as DOMRect;
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(resizes.at(-1)).toEqual([600, 800, 120]);
+
+    driver.dispose();
+    const count = resizes.length;
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(resizes).toHaveLength(count);
+  });
+
+  it("does not claim a nonzero box when mounted in a background page", () => {
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("hidden");
+    const { target, displaySizes, resizes } = fakeTarget();
+    driveSurfaceResize(target, container(800, 600));
+    resizeTo(800, 600);
+    vi.advanceTimersByTime(100);
+    expect(resizes).toEqual([]);
+    expect(displaySizes).toEqual([]);
+
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(resizes).toEqual([[800, 600, 120]]);
+  });
+
+  it.each(["relative", "exact"] as const)(
+    "tracks repeated DPI changes without a resize in %s zoom mode",
+    (mode) => {
+      const { target, displaySizes, resizes } = fakeTarget();
+      driveSurfaceResize(target, container(400, 300), () => ({
+        zoom: 1.25,
+        mode,
+      }));
+      resizeTo(400, 300);
+      changeDpr(1.5);
+      const firstScale = mode === "relative" ? 225 : 150;
+      expect(displaySizes.at(-1)).toEqual([600, 450, firstScale, 180]);
+      vi.advanceTimersByTime(30);
+      expect(resizes.at(-1)).toEqual([600, 450, firstScale]);
+
+      changeDpr(2);
+      const secondScale = mode === "relative" ? 300 : 150;
+      expect(displaySizes.at(-1)).toEqual([800, 600, secondScale, 240]);
+      vi.advanceTimersByTime(30);
+      expect(resizes.at(-1)).toEqual([800, 600, secondScale]);
+      changeDpr(1);
+      expect(displaySizes.at(-1)).toEqual([400, 300, 150, 120]);
+    },
+  );
+
+  it("reapplies an observed CSS box using the current DPR", () => {
+    const { target, displaySizes } = fakeTarget();
+    const driver = driveSurfaceResize(target, container(400, 300));
+    resizeTo(400, 300);
+    vi.stubGlobal("devicePixelRatio", 2);
+    driver.reapply();
+    expect(displaySizes.at(-1)).toEqual([800, 600, 240, 240]);
+  });
+
+  it("sends the first size at wire speed and settles on the latest", () => {
+    const { target, resizes } = fakeTarget();
+    driveSurfaceResize(target, container(800, 600));
+    // Leading edge: a new interaction must not wait out the throttle interval.
+    expect(resizes).toEqual([[800, 600, 120]]);
+
+    resizeTo(820, 600);
+    resizeTo(840, 600);
+    // Sizes inside one throttle interval are held back...
+    expect(resizes).toHaveLength(1);
+    vi.advanceTimersByTime(30);
+    // ...and only the latest one lands.
+    expect(resizes).toEqual([
+      [800, 600, 120],
+      [840, 600, 120],
+    ]);
+  });
+
+  it("keeps forwarding the latest size during a sustained drag", () => {
+    const { target, resizes } = fakeTarget();
+    driveSurfaceResize(target, container(800, 600));
+
+    resizeTo(820, 600);
+    vi.advanceTimersByTime(10);
+    resizeTo(840, 600);
+    vi.advanceTimersByTime(10);
+    resizeTo(860, 600);
+    vi.advanceTimersByTime(10);
+    // Continuous events no longer postpone delivery until the drag ends.
+    expect(resizes).toEqual([
+      [800, 600, 120],
+      [860, 600, 120],
+    ]);
+
+    resizeTo(880, 600);
+    vi.advanceTimersByTime(10);
+    resizeTo(900, 600);
+    vi.advanceTimersByTime(19);
+    expect(resizes).toHaveLength(2);
+    vi.advanceTimersByTime(1);
+    // The next interval also carries its newest value, which doubles as the
+    // trailing-edge delivery when no more events arrive.
+    expect(resizes).toEqual([
+      [800, 600, 120],
+      [860, 600, 120],
+      [900, 600, 120],
+    ]);
+  });
+
+  it("does not re-ask for a size the server already has", () => {
+    const { target, resizes } = fakeTarget();
+    driveSurfaceResize(target, container(800, 600));
+    resizes.length = 0;
+    resizeTo(800, 600);
+    vi.advanceTimersByTime(30);
+    expect(resizes).toEqual([]);
+  });
+
+  it("treats a gap since the last box as the start of a fresh drag", () => {
+    const { target, resizes } = fakeTarget();
+    driveSurfaceResize(target, container(800, 600));
+    vi.advanceTimersByTime(300);
+    resizes.length = 0;
+    resizeTo(900, 600);
+    // No throttle wait: each user-visible drag gets a leading-edge dispatch.
+    expect(resizes).toEqual([[900, 600, 120]]);
+  });
+
+  it("multiplies the display's DPI in relative mode", () => {
+    const { target, displaySizes } = fakeTarget();
+    let zoom: SurfaceZoom = { zoom: 1.5, mode: "relative" };
+    driveSurfaceResize(target, container(800, 600), () => zoom);
+    // The pane still holds 800x600 device pixels; only the scale moves.
+    expect(displaySizes).toEqual([[800, 600, 180, 120]]);
+  });
+
+  it("names the surface scale directly in exact mode", () => {
+    vi.stubGlobal("devicePixelRatio", 2);
+    const { target, displaySizes } = fakeTarget();
+    const zoom: SurfaceZoom = { zoom: 1.5, mode: "exact" };
+    driveSurfaceResize(target, container(400, 300), () => zoom);
+    // 120 * 1.5, independent of the 2x display.
+    expect(displaySizes).toEqual([[800, 600, 180, 240]]);
+  });
+
+  it("re-applies the last box when the zoom changes under it", () => {
+    const { target, displaySizes } = fakeTarget();
+    let zoom: SurfaceZoom = { zoom: 1, mode: "relative" };
+    const driver = driveSurfaceResize(target, container(800, 600), () => zoom);
+    displaySizes.length = 0;
+
+    // The box has not moved, so the observer will never fire on its own.
+    zoom = { zoom: 2, mode: "relative" };
+    driver.reapply();
+    expect(displaySizes).toEqual([[800, 600, 240, 120]]);
+  });
+
+  it("hands the surface back on dispose and goes quiet", () => {
+    const { target, displaySizes, resizes } = fakeTarget();
+    const driver = driveSurfaceResize(target, container(800, 600));
+    displaySizes.length = 0;
+    resizes.length = 0;
+
+    resizeTo(900, 600);
+    displaySizes.length = 0;
+    driver.dispose();
+    // Null returns the view to frame-tracking mode and withdraws it from the
+    // server's size mediation.
+    expect(displaySizes).toEqual([[null, null, null, null]]);
+    expect(disconnect).toHaveBeenCalledTimes(1);
+
+    // A pending latest/trailing-edge send must not outlive the mount.
+    vi.advanceTimersByTime(1000);
+    expect(resizes).toEqual([]);
+    // And a late reapply is inert rather than resurrecting the stream.
+    driver.reapply();
+    expect(displaySizes).toHaveLength(1);
+    changeDpr(2);
+    window.dispatchEvent(new Event("resize"));
+    vi.advanceTimersByTime(1000);
+    expect(displaySizes).toHaveLength(1);
+    expect(resizes).toEqual([]);
+  });
+
+  it("ignores a zero-sized box rather than reporting a degenerate one", () => {
+    const { target, displaySizes } = fakeTarget();
+    driveSurfaceResize(target, container(0, 0));
+    expect(displaySizes).toEqual([]);
+    resizeTo(0, 0);
+    expect(displaySizes).toEqual([]);
+    // A real box still lands once layout runs.
+    resizeTo(640, 480);
+    expect(displaySizes).toEqual([[640, 480, 120, 120]]);
+  });
+});

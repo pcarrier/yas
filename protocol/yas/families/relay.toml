@@ -1,0 +1,177 @@
+schema = 1
+family = "yas.relay"
+
+limits = [
+  { name = "MAX_ROUTES", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+  { name = "MAX_LINKS_PER_SESSION", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_PENDING_CONNECTS", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_EARLY_DATA", tag = 4, type = "u32", required = true, hard_min = 0, hard_max = 65536 },
+  { name = "CONNECT_TIMEOUT_NS", tag = 5, type = "u64", required = true, hard_min = 1, hard_max = 300000000000 },
+  { name = "MAX_BUFFERED_PER_LINK", tag = 6, type = "u64", required = true, hard_min = 1, hard_max = 1073741824 },
+]
+
+[[constant]]
+name = "AVAILABILITY_UNKNOWN"
+value = 0
+
+[[constant]]
+name = "AVAILABILITY_AVAILABLE"
+value = 1
+
+[[constant]]
+name = "AVAILABILITY_DEGRADED"
+value = 2
+
+[[constant]]
+name = "AVAILABILITY_UNAVAILABLE"
+value = 3
+
+[[constant]]
+name = "TRANSPORT_OTHER"
+value = 0
+
+[[constant]]
+name = "TRANSPORT_LOCAL"
+value = 1
+
+[[constant]]
+name = "TRANSPORT_SSH"
+value = 2
+
+[[constant]]
+name = "TRANSPORT_TCP"
+value = 3
+
+[[constant]]
+name = "TRANSPORT_WEBRTC"
+value = 4
+
+[[constant]]
+name = "TRANSPORT_UPLINK"
+value = 5
+
+[[constant]]
+name = "TRANSPORT_RELAY"
+value = 6
+
+[[constant]]
+name = "ROUTE_DEFAULT"
+value = 1
+
+[[constant]]
+name = "TUNNEL_CONTENT_KIND"
+value = 0
+
+[[constant]]
+name = "EARLY_DATA_EXTENSION"
+value = 1
+
+[[constant]]
+name = "MAX_ROUTES"
+value = 65536
+
+[[constant]]
+name = "MAX_LINKS_PER_SESSION"
+value = 4096
+
+[[constant]]
+name = "MAX_PENDING_CONNECTS"
+value = 1024
+
+[[constant]]
+name = "MAX_EARLY_DATA"
+value = 65536
+
+[[constant]]
+name = "CONNECT_TIMEOUT_NS"
+value = 300000000000
+
+[[constant]]
+name = "MAX_BUFFERED_PER_LINK"
+value = 1073741824
+
+[[constant]]
+name = "LIMIT_MAX_ROUTES"
+value = 1
+
+[[constant]]
+name = "LIMIT_MAX_LINKS_PER_SESSION"
+value = 2
+
+[[constant]]
+name = "LIMIT_MAX_PENDING_CONNECTS"
+value = 3
+
+[[constant]]
+name = "LIMIT_MAX_EARLY_DATA"
+value = 4
+
+[[constant]]
+name = "LIMIT_CONNECT_TIMEOUT_NS"
+value = 5
+
+[[constant]]
+name = "LIMIT_MAX_BUFFERED_PER_LINK"
+value = 6
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+
+[[request]]
+name = "CONNECT"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "route_handle:u64,generation:u64,initial_receive_credit:u64,flags:u16,reserved:u16=0,Extensions; ResultPrefix + relay_handle:u64,route_handle:u64,generation:u64,sensitive TransferDescriptor"
+
+[[request]]
+name = "DISCONNECT"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "relay_handle:u64,reason:bytes_u32; ResultPrefix"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<RouteRecord>"
+
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[type]]
+name = "route_record"
+layout = "route_handle:u64,generation:u64,availability:u8,transport_hint:u8,flags:u16,name:string_u16,label:string_u16,description:string_u32,Extensions"
+
+[[type]]
+name = "family_limits"
+layout = "extension tags 1 max_routes:u32,2 max_links_per_session:u32,3 max_pending_connects:u32,4 max_early_data:u32,5 connect_timeout_ns:u64,6 max_buffered_per_link:u64"

@@ -1,0 +1,59 @@
+name: Build packages
+
+on:
+  workflow_call:
+    inputs:
+      upload:
+        type: boolean
+        default: false
+      macos:
+        type: boolean
+        default: true
+
+jobs:
+  build-packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        # A matrix cannot be filtered by an input, so each variant is spelled out
+        # as a JSON literal. Callers that only need a compile check can leave
+        # out the slower macOS package build.
+        include: ${{ fromJSON(inputs.macos && '[{"runner":"ubuntu-24.04","label":"linux-x86_64"},{"runner":"ubuntu-24.04-arm","label":"linux-aarch64"},{"runner":"macos-15","label":"macos-aarch64"}]' || '[{"runner":"ubuntu-24.04","label":"linux-x86_64"},{"runner":"ubuntu-24.04-arm","label":"linux-aarch64"}]') }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Build release tarballs
+        run: ./bin/build-tarballs dist
+        env:
+          # Bound aggregate Cargo parallelism to the runner's memory. The ARM
+          # runner has terminated two max-jobs=2 builds with SIGTERM as the
+          # final release variants started linking, so serialize its Nix jobs.
+          NIX_CONFIG: |
+            max-jobs = ${{ matrix.label == 'linux-aarch64' && '1' || '2' }}
+            cores = ${{ matrix.label == 'linux-aarch64' && '2' || '4' }}
+      - name: Test the complete cross-platform Yas product graph on macOS
+        if: ${{ matrix.label == 'macos-aarch64' }}
+        run: |
+          # Linux-only compositor probes are Cargo examples. Exercise every
+          # workspace library, product binary, and integration/unit test here
+          # without asking macOS to compile those live Wayland probes.
+          nix develop --command bash -lc '
+            cd crates/browser &&
+            wasm-pack build --target web --release --out-dir pkg &&
+            cd ../../js &&
+            pnpm install --frozen-lockfile &&
+            pnpm --filter @yas-run/core run build &&
+            pnpm --filter @yas-run/solid run build &&
+            pnpm --filter @yas-run/ui run build &&
+            pnpm --filter yas-web run build
+          '
+          nix develop --command cargo test --workspace --lib --bins --tests
+          nix develop --command bash -lc \
+            'cd js && pnpm install --frozen-lockfile && pnpm run typecheck && pnpm run test'
+      - uses: actions/upload-artifact@v7
+        if: ${{ inputs.upload }}
+        with:
+          name: tarballs-${{ matrix.label }}
+          path: dist/*.tar.gz

@@ -1,0 +1,25 @@
+[package]
+name = "yas-website"
+version = "0.1.0"
+edition.workspace = true
+description = "yas.run website and WebRTC signaling service"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[[bin]]
+name = "yas-website"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+ed25519-dalek = "2"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs"] }
+redis = { version = "0.32", default-features = false, features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }

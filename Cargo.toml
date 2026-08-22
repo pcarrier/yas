@@ -1,0 +1,83 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/xtask",
+    "crates/yas",
+    "crates/guest",
+    "crates/fssync",
+    "crates/git",
+    "crates/lsp",
+    "crates/composite-transport",
+    "crates/terminal-model",
+    "crates/alacritty-driver",
+    "crates/server",
+    "crates/edge",
+    "crates/browser",
+    "crates/cli",
+    "crates/fonts",
+    "crates/webserver",
+    "crates/webrtc-forwarder",
+    "crates/compositor",
+    "crates/proxy",
+    "crates/sd-notify",
+    "crates/ssh",
+    "crates/desktop",
+    "crates/website",
+]
+# A path dependency living under the workspace root would otherwise become an
+# implicit member, so `--workspace` clippy/test/fmt runs would lint, test, and
+# reformat third-party code we only consume.
+exclude = [
+    "vendor/cros-codecs",
+    "vendor/wayland-backend",
+    "vendor/yas-alacritty-terminal",
+    "extensions",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/pcarrier/yas"
+homepage = "https://yas.run"
+
+[workspace.dependencies]
+yas-wire = { version = "0.1.0", path = "crates/yas" }
+yas-guest = { version = "0.1.0", path = "crates/guest" }
+yas-fssync = { version = "0.1.0", path = "crates/fssync" }
+yas-git = { version = "0.1.0", path = "crates/git" }
+yas-lsp = { version = "0.1.0", path = "crates/lsp" }
+yas-composite-transport = { version = "0.1.0", path = "crates/composite-transport" }
+yas-terminal-model = { version = "0.1.0", path = "crates/terminal-model" }
+yas-terminal-driver = { version = "0.1.0", path = "crates/alacritty-driver" }
+yas-fonts = { version = "0.1.0", path = "crates/fonts" }
+yas-webserver = { version = "0.1.0", path = "crates/webserver" }
+yas-server = { version = "0.1.0", path = "crates/server", default-features = false }
+yas-edge = { version = "0.1.0", path = "crates/edge" }
+yas-proxy = { version = "0.1.0", path = "crates/proxy" }
+yas-webrtc-forwarder = { version = "0.1.0", path = "crates/webrtc-forwarder" }
+yas-compositor = { version = "0.1.0", path = "crates/compositor" }
+yas-sd-notify = { version = "0.1.0", path = "crates/sd-notify" }
+yas-ssh = { version = "0.1.0", path = "crates/ssh" }
+yas-desktop = { version = "0.1.0", path = "crates/desktop" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+lto = false
+codegen-units = 16
+
+# wayland-backend broadcasts wl_registry.global_remove to every client, without
+# consulting the global's `can_view` filter -- unlike all three paths that send
+# wl_registry.global.  yas publishes one owner-filtered wl_output per toplevel,
+# so closing any window told every *other* client to remove a global it had
+# never been shown.  xwayland-satellite unwraps that lookup and panics, taking
+# X11 down with it.  Still present in 0.3.17; see vendor/wayland-backend.
+[patch.crates-io]
+wayland-backend = { path = "vendor/wayland-backend" }

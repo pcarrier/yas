@@ -1,0 +1,5 @@
+{
+  "name": "@yas-run/browser",
+  "version": "0.0.0",
+  "main": "yas_browser.js"
+}
