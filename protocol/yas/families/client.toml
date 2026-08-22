@@ -1,0 +1,117 @@
+schema = 1
+family = "yas.client"
+
+limits = [
+  { name = "MAX_PUBLISHED_CLIENTS", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_ACTIVE_SUBSCRIPTIONS", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+]
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+[[request]]
+name = "DISCONNECT"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "session_id:[u8;16],operation_id:[u8;16],reason:string_u32; ResultPrefix"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<ClientRecord>"
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[constant]]
+name = "ORIGIN_UNIX"
+value = 0
+[[constant]]
+name = "ORIGIN_SSH"
+value = 1
+[[constant]]
+name = "ORIGIN_EDGE"
+value = 2
+[[constant]]
+name = "ORIGIN_RELAY"
+value = 3
+[[constant]]
+name = "ORIGIN_WEBRTC"
+value = 4
+[[constant]]
+name = "ORIGIN_EXTENSION"
+value = 5
+[[constant]]
+name = "ACTIVE_SUBSCRIPTIONS_EXTENSION"
+value = 1
+[[constant]]
+name = "BANDWIDTH_RATES_EXTENSION"
+value = 2
+[[constant]]
+name = "MAX_ACTIVE_SUBSCRIPTIONS"
+value = 4096
+[[constant]]
+name = "MAX_PUBLISHED_CLIENTS"
+value = 4096
+[[constant]]
+name = "LIMIT_MAX_PUBLISHED_CLIENTS"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_ACTIVE_SUBSCRIPTIONS"
+value = 2
+
+[[type]]
+name = "client_record"
+layout = "session_id:[u8;16],client_instance:[u8;16],connected_server_ns:u64,idle_ns:u64,bytes_received:u64,bytes_sent:u64,name:string_u16,release:string_u16,label:string_u16,origin:typed_record,Extensions"
+[[type]]
+name = "origin_unix"
+layout = "peer_pid:u32,peer_uid:u32,peer_gid:u32,socket_path:bytes_u32"
+[[type]]
+name = "origin_ssh"
+layout = "remote_address:string_u16,username:string_u16"
+[[type]]
+name = "origin_edge"
+layout = "subject:string_u16,issuer:string_u16"
+[[type]]
+name = "origin_relay"
+layout = "route_handle:u64,generation:u64,depth:u16,reserved:u16=0"
+[[type]]
+name = "origin_webrtc"
+layout = "peer_id:string_u16"
+[[type]]
+name = "origin_extension"
+layout = "extension_id:u64,definition_revision:u64,attempt:u64,task_id:u32,name:string_u16"
+[[type]]
+name = "active_subscriptions"
+layout = "terminal_count:u16,surface_count:u16,aux_count:u16,reserved:u16=0; repeated terminal_handle:u64,view_id:u32,rows:u16,cols:u16; repeated surface_handle:u64,view_id:u32,width:u32,height:u32,scale_120:u16,reserved:u16=0; repeated family:u16,reserved:u16=0,subscription_id:u32,resource_handle:u64; each section strictly key-sorted"
+[[type]]
+name = "bandwidth_rates"
+layout = "ClientRecord/ClientPatch extension tag 2 exact value received_bytes_per_second:u64,sent_bytes_per_second:u64,sample_window_ns:u64; sample_window_ns is nonzero; cumulative bytes_received/bytes_sent remain required in ClientRecord"
+[[type]]
+name = "family_limits"
+layout = "ordered optional extensions: tag 1 max published client records:u32, tag 2 max active subscriptions represented per client:u32; both tags are present in a selected family descriptor"

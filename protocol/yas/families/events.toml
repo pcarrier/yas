@@ -1,0 +1,374 @@
+schema = 1
+family = "yas.events"
+
+limits = [
+  { name = "MIN_RING_BYTES", tag = 1, type = "u64", required = true, hard_min = 4096, hard_max = 67104768 },
+  { name = "MAX_RING_BYTES", tag = 2, type = "u64", required = true, hard_min = 4096, hard_max = 67104768 },
+  { name = "MAX_STREAMS_PER_SESSION", tag = 3, type = "u32", required = true, hard_min = 1, hard_max = 16 },
+  { name = "MAX_RECORDINGS", tag = 4, type = "u32", required = true, hard_min = 1, hard_max = 64 },
+  { name = "MAX_RECORDING_PATH_BYTES", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 4096 },
+  { name = "MAX_LIVE_BATCH_BYTES", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+  { name = "MAX_PENDING_DUMPS", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 4 },
+  { name = "MAX_MUTATION_REPLAYS", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+]
+
+[[constant]]
+name = "ACTIVATION_WORDS"
+value = 4
+[[constant]]
+name = "REVISION_ANY"
+value = 0
+
+[[constant]]
+name = "STREAM_HISTORY"
+value = 1
+[[constant]]
+name = "STREAM_FLAGS"
+value = 1
+[[constant]]
+name = "RECORDING_HISTORY"
+value = 1
+[[constant]]
+name = "RECORDING_APPEND"
+value = 2
+[[constant]]
+name = "RECORDING_FLAGS"
+value = 3
+
+[[constant]]
+name = "RECORDING_RUNNING"
+value = 0
+[[constant]]
+name = "RECORDING_STOPPED"
+value = 1
+[[constant]]
+name = "RECORDING_FAILED"
+value = 2
+
+[[constant]]
+name = "DUMP_CONTENT_KIND"
+value = 0
+
+[[constant]]
+name = "EVENT_SERVER_START"
+value = 0
+[[constant]]
+name = "EVENT_SERVER_STOP"
+value = 1
+[[constant]]
+name = "EVENT_TASK_START"
+value = 2
+[[constant]]
+name = "EVENT_TASK_STOP"
+value = 3
+[[constant]]
+name = "EVENT_CLIENT_CONNECT"
+value = 4
+[[constant]]
+name = "EVENT_CLIENT_DISCONNECT"
+value = 5
+[[constant]]
+name = "EVENT_CLIENT_REJECT"
+value = 6
+[[constant]]
+name = "EVENT_CONFIG_CHANGE"
+value = 7
+[[constant]]
+name = "EVENT_STREAM_START"
+value = 8
+[[constant]]
+name = "EVENT_STREAM_STOP"
+value = 9
+[[constant]]
+name = "EVENT_PROTOCOL_ERROR"
+value = 10
+[[constant]]
+name = "EVENT_PTY_CREATE"
+value = 11
+[[constant]]
+name = "EVENT_PTY_EXIT"
+value = 12
+[[constant]]
+name = "EVENT_PTY_REMOVE"
+value = 13
+[[constant]]
+name = "EVENT_PTY_DEADLINE"
+value = 14
+[[constant]]
+name = "EVENT_SERVER_CAPACITY"
+value = 15
+[[constant]]
+name = "EVENT_FRAME_READ"
+value = 16
+[[constant]]
+name = "EVENT_FRAME_WRITE"
+value = 17
+[[constant]]
+name = "EVENT_MESSAGE_READ"
+value = 18
+[[constant]]
+name = "EVENT_MESSAGE_WRITE"
+value = 19
+[[constant]]
+name = "EVENT_TICK_START"
+value = 20
+[[constant]]
+name = "EVENT_TICK_STOP"
+value = 21
+[[constant]]
+name = "EVENT_TICK_NUDGE"
+value = 22
+[[constant]]
+name = "EVENT_SESSION_LOCK"
+value = 23
+[[constant]]
+name = "EVENT_PTY_READ"
+value = 24
+[[constant]]
+name = "EVENT_PTY_WRITE"
+value = 25
+[[constant]]
+name = "EVENT_PTY_PARSE"
+value = 26
+[[constant]]
+name = "EVENT_PTY_SNAPSHOT"
+value = 27
+[[constant]]
+name = "EVENT_PTY_RESIZE"
+value = 28
+[[constant]]
+name = "EVENT_PTY_INPUT"
+value = 29
+[[constant]]
+name = "EVENT_COMPOSITOR_EVENT"
+value = 30
+[[constant]]
+name = "EVENT_COMPOSITOR_COMMAND"
+value = 31
+[[constant]]
+name = "EVENT_SURFACE_ENCODE"
+value = 32
+[[constant]]
+name = "EVENT_SURFACE_FRAME"
+value = 33
+[[constant]]
+name = "EVENT_AUDIO_FRAME"
+value = 34
+[[constant]]
+name = "EVENT_FS_REQUEST"
+value = 35
+[[constant]]
+name = "EVENT_GIT_REQUEST"
+value = 36
+[[constant]]
+name = "EVENT_LSP_REQUEST"
+value = 37
+[[constant]]
+name = "EVENT_KV_REQUEST"
+value = 38
+[[constant]]
+name = "EVENT_NET_REQUEST"
+value = 39
+[[constant]]
+name = "EVENT_PROCESS_REQUEST"
+value = 40
+[[constant]]
+name = "EVENT_EXTENSION_REQUEST"
+value = 41
+[[constant]]
+name = "EVENT_CHANNEL_REQUEST"
+value = 42
+[[constant]]
+name = "EVENT_CLIENT_CONTROL"
+value = 43
+[[constant]]
+name = "EVENT_OUTBOX_QUEUE"
+value = 44
+[[constant]]
+name = "EVENT_SUPERVISOR"
+value = 45
+[[constant]]
+name = "EVENT_CONNECTION_ACCEPT"
+value = 46
+[[constant]]
+name = "EVENT_SERVER_ERROR"
+value = 47
+
+[[constant]]
+name = "MIN_RING_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_RING_BYTES"
+value = 67104768
+[[constant]]
+name = "DEFAULT_RING_BYTES"
+value = 1048576
+[[constant]]
+name = "MAX_STREAMS_PER_SESSION"
+value = 16
+[[constant]]
+name = "MAX_RECORDINGS"
+value = 64
+[[constant]]
+name = "MAX_RECORDING_PATH_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_RECORD_ERROR_BYTES"
+value = 4096
+[[constant]]
+name = "MAX_LIVE_BATCH_BYTES"
+value = 65536
+[[constant]]
+name = "MAX_PENDING_DUMPS"
+value = 4
+
+[[constant]]
+name = "LIMIT_MIN_RING_BYTES"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_RING_BYTES"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_STREAMS_PER_SESSION"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_RECORDINGS"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_RECORDING_PATH_BYTES"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_LIVE_BATCH_BYTES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_PENDING_DUMPS"
+value = 7
+[[constant]]
+name = "MAX_MUTATION_REPLAYS"
+value = 65536
+[[constant]]
+name = "LIMIT_MAX_MUTATION_REPLAYS"
+value = 8
+
+[[request]]
+name = "GET_CONFIG"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "Extensions; ResultPrefix + EventConfig"
+
+[[request]]
+name = "SET_CONFIG"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],expected_revision:u64,capacity:u64,activations:[u64;4],Extensions; ResultPrefix + EventConfig"
+
+[[request]]
+name = "DUMP"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "initial_receive_credit:u64,Extensions; ResultPrefix + DumpResult"
+
+[[request]]
+name = "START_STREAM"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],flags:u16,reserved:u16=0,start_sequence:u64,max_batch_bytes:u32,reserved:u32=0,Extensions; ResultPrefix + StreamStarted"
+
+[[request]]
+name = "STOP_STREAM"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "stream_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix"
+
+[[request]]
+name = "START_RECORDING"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],flags:u16,reserved:u16=0,path:bytes_u32,Extensions; ResultPrefix + RecordingInfo"
+
+[[request]]
+name = "STOP_RECORDING"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "recording_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix + RecordingInfo"
+
+[[request]]
+name = "LIST_RECORDINGS"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "Extensions; ResultPrefix + count:u16,reserved:u16=0,repeated RecordingInfo"
+
+[[event]]
+name = "RECORD"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "forbidden"
+datagram = "forbidden"
+layout = "stream_handle:u64,codec_id:u16,codec_version:u16,payload:remaining containing events-v1"
+
+[[event]]
+name = "GAP"
+kind = 0x0001
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "stream_handle:u64,lost:u64,first_available_sequence:u64"
+
+[[event]]
+name = "STREAM_STOPPED"
+kind = 0x0002
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "stream_handle:u64,status:u16,reserved:u16=0,detail:string_u32,Extensions"
+
+[[type]]
+name = "event_config"
+layout = "revision:u64,capacity:u64,used:u64,record_count:u64,dropped:u64,next_sequence:u64,activations:[u64;4],Extensions"
+
+[[type]]
+name = "dump_result"
+layout = "byte_len:u64,content_hash:[u8;32],descriptor:bytes_u32 containing sensitive server-to-client BYTE TransferDescriptor,Extensions"
+
+[[type]]
+name = "stream_started"
+layout = "stream_handle:u64,first_sequence:u64,max_batch_bytes:u32,reserved:u32=0,Extensions"
+
+[[type]]
+name = "recording_info"
+layout = "recording_handle:u64,state:u8,reserved:u8=0,flags:u16,records:u64,bytes:u64,lost:u64,path:bytes_u32,error:string_u32,Extensions"
+
+[[type]]
+name = "events_v1_batch"
+layout = "first_sequence:u64,record_count:u16,reserved:u16=0,repeated record_len:u32,sequence:u64,monotonic_ns:u64,event_id:u32,flags:u16,reserved:u16=0,payload:remaining-within-record"
+
+[[type]]
+name = "family_limits"
+layout = "extension tags 1 min_ring_bytes:u64,2 max_ring_bytes:u64,3 max_streams_per_session:u32,4 max_recordings:u32,5 max_recording_path_bytes:u32,6 max_live_batch_bytes:u32,7 max_pending_dumps:u32"

@@ -1,0 +1,237 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify tag signature via GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          repo="${GITHUB_REPOSITORY}"
+          state=$(gh api "repos/${repo}/git/ref/tags/${tag}" \
+            --jq '.object.sha' \
+            | xargs -I{} gh api "repos/${repo}/git/tags/{}" \
+              --jq '.verification.verified')
+          if [ "$state" != "true" ]; then
+            echo "::error::Tag ${tag} is not signed by a verified identity"
+            exit 1
+          fi
+
+  lint:
+    needs: [verify-tag]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/lint --check
+      - run: ./bin/publish-crates --plan
+
+  test:
+    needs: [verify-tag]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/tests
+
+  e2e:
+    needs: [verify-tag]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/e2e
+
+  coverage:
+    needs: [verify-tag]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/coverage
+
+  build-packages:
+    needs: [verify-tag]
+    uses: ./.github/workflows/_build-packages.yml
+    with:
+      upload: true
+
+  build-windows:
+    needs: [verify-tag]
+    uses: ./.github/workflows/_build-windows.yml
+    with:
+      upload: true
+
+  # Wasm and bundled QuickJS modules are architecture-independent, so one leg
+  # builds the extension objects every platform's release points at.
+  build-extensions:
+    needs: [verify-tag]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/extensions
+      - uses: actions/upload-artifact@v7
+        with:
+          name: extensions
+          path: |
+            extensions/dist/*.wasm
+            extensions/dist/*.js
+            extensions/dist/manifest.json
+
+  protocol-fuzz:
+    needs: [verify-tag]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame, families, packed]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Sustained Yas wire fuzz campaign (${{ matrix.target }})
+        run: ./bin/fuzz
+        env:
+          YAS_FUZZ_SECONDS: "3600"
+          YAS_FUZZ_TARGET: ${{ matrix.target }}
+
+  release:
+    needs:
+      [
+        lint,
+        test,
+        e2e,
+        coverage,
+        build-packages,
+        build-windows,
+        build-extensions,
+        protocol-fuzz,
+      ]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: tarballs-*
+          merge-multiple: true
+          path: tarballs
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x86_64
+          path: windows
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: extensions
+          path: extensions
+
+      - name: List artifacts
+        run: |
+          ls -lh tarballs/
+          ls -lh windows/
+          ls -lh extensions/
+
+      - name: Add stable latest-release asset names
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for file in tarballs/*.tar.gz windows/*.zip; do
+            name=$(basename "$file")
+            stable=${name/_${version}_/_}
+            cp "$file" "$(dirname "$file")/$stable"
+          done
+
+      # Release assets are the durable home for binaries and modules.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            tarballs/*.tar.gz
+            windows/*.zip
+            extensions/*.wasm
+            extensions/*.js
+            extensions/manifest.json
+          generate_release_notes: true
+
+  publish-crates:
+    needs: [release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/publish-crates
+        env:
+          # Required only to bootstrap crates which do not exist on crates.io yet.
+          # Once their trusted publishers are configured, OIDC is used instead.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-npm:
+    needs: [release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/publish-npm-packages --provenance --access public
+
+  publish-bin-npm:
+    needs: [release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # npm >= 11.5 is required for OIDC trusted publishing; Node 22 ships npm 10.
+      - run: npm install -g npm@latest
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: tarballs-*
+          merge-multiple: true
+          path: artifacts
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x86_64
+          path: artifacts
+
+      - name: Build Yas binary npm packages
+        run: ./bin/build-npm-bin-packages artifacts dist/npm-bin "${GITHUB_REF_NAME#v}"
+
+      - name: Publish Yas binary npm packages
+        run: ./bin/publish-npm-bin-packages dist/npm-bin --provenance --access public
+
+  update-homebrew:
+    needs: [release]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Update Homebrew tap
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: pcarrier/homebrew-tap
+          event-type: update
+          client-payload: '{"version": "${{ github.ref_name }}"}'

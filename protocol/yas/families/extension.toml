@@ -1,0 +1,433 @@
+schema = 1
+family = "yas.extension"
+
+limits = [
+  { name = "MAX_NAME_BYTES", tag = 1, type = "u32", required = true, hard_min = 1, hard_max = 255 },
+  { name = "MAX_ARGS", tag = 2, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_ARGUMENT_BYTES", tag = 3, type = "u64", required = true, hard_min = 1, hard_max = 1048576 },
+  { name = "MAX_OBJECT_BYTES", tag = 4, type = "u64", required = true, hard_min = 1, hard_max = 67108864 },
+  { name = "MAX_OUTPUT_RECORD_BYTES", tag = 5, type = "u32", required = true, hard_min = 1, hard_max = 1048576 },
+  { name = "MAX_COMMAND_DESCRIPTOR_BYTES", tag = 6, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+  { name = "MAX_COMMAND_RECORDS", tag = 7, type = "u32", required = true, hard_min = 1, hard_max = 32 },
+  { name = "MAX_DEFINITIONS", tag = 8, type = "u32", required = true, hard_min = 1, hard_max = 1024 },
+  { name = "MAX_OBJECT_STAGES_PER_SESSION", tag = 9, type = "u32", required = true, hard_min = 1, hard_max = 8 },
+  { name = "MAX_FOLLOWS_PER_SESSION", tag = 10, type = "u32", required = true, hard_min = 1, hard_max = 128 },
+  { name = "MAX_RUNNING_ATTEMPTS", tag = 11, type = "u32", required = true, hard_min = 1, hard_max = 32 },
+  { name = "MAX_MEMORY_BYTES", tag = 12, type = "u64", required = true, hard_min = 1, hard_max = 134217728 },
+  { name = "MAX_JOB_BYTES", tag = 13, type = "u64", required = true, hard_min = 1, hard_max = 67108864 },
+  { name = "MAX_MUTATION_REPLAYS", tag = 14, type = "u32", required = true, hard_min = 1, hard_max = 65536 },
+]
+
+[[constant]]
+name = "OBJECT_ALREADY_PRESENT"
+value = 0
+[[constant]]
+name = "OBJECT_UPLOAD"
+value = 1
+
+[[constant]]
+name = "RUNTIME_AUTO"
+value = 0
+[[constant]]
+name = "RUNTIME_WASMI"
+value = 1
+[[constant]]
+name = "RUNTIME_QUICKJS"
+value = 2
+
+[[constant]]
+name = "RESTART_NEVER"
+value = 0
+[[constant]]
+name = "RESTART_ON_FAILURE"
+value = 1
+[[constant]]
+name = "RESTART_ALWAYS"
+value = 2
+
+[[constant]]
+name = "DEFINITION_PERSISTENT"
+value = 1
+[[constant]]
+name = "DEFINITION_ENABLED"
+value = 2
+[[constant]]
+name = "DEFINITION_DESIRED_RUNNING"
+value = 4
+[[constant]]
+name = "DEFINITION_DETACHED"
+value = 8
+[[constant]]
+name = "DEFINITION_FLAGS"
+value = 15
+
+[[constant]]
+name = "PHASE_NEED_OBJECT"
+value = 0
+[[constant]]
+name = "PHASE_VALIDATING"
+value = 1
+[[constant]]
+name = "PHASE_QUEUED"
+value = 2
+[[constant]]
+name = "PHASE_RUNNING"
+value = 3
+[[constant]]
+name = "PHASE_BACKOFF"
+value = 4
+[[constant]]
+name = "PHASE_STOPPED"
+value = 5
+[[constant]]
+name = "PHASE_BLOCKED"
+value = 6
+[[constant]]
+name = "PHASE_STOPPING"
+value = 7
+
+[[constant]]
+name = "CONTROL_STOP"
+value = 0
+[[constant]]
+name = "CONTROL_START"
+value = 1
+[[constant]]
+name = "CONTROL_RESTART"
+value = 2
+[[constant]]
+name = "CONTROL_ENABLE"
+value = 3
+[[constant]]
+name = "CONTROL_DISABLE"
+value = 4
+[[constant]]
+name = "CONTROL_REMOVE"
+value = 5
+
+[[constant]]
+name = "EXIT_RETURNED"
+value = 0
+[[constant]]
+name = "EXIT_TRAPPED"
+value = 1
+[[constant]]
+name = "EXIT_CANCELLED"
+value = 2
+[[constant]]
+name = "EXIT_UPDATED"
+value = 3
+[[constant]]
+name = "EXIT_SLOW_CONSUMER"
+value = 4
+[[constant]]
+name = "EXIT_PROTOCOL_VIOLATION"
+value = 5
+[[constant]]
+name = "EXIT_HOST_FAILURE"
+value = 6
+[[constant]]
+name = "EXIT_SERVER_SHUTDOWN"
+value = 7
+[[constant]]
+name = "EXIT_RESOURCE_LIMIT"
+value = 8
+
+[[constant]]
+name = "OUTPUT_STDOUT"
+value = 0
+[[constant]]
+name = "OUTPUT_STDERR"
+value = 1
+[[constant]]
+name = "OUTPUT_LOG"
+value = 2
+[[constant]]
+name = "OUTPUT_GAP"
+value = 3
+
+[[constant]]
+name = "OBJECT_CONTENT_KIND"
+value = 0
+[[constant]]
+name = "FOLLOW_CONTENT_KIND"
+value = 1
+
+[[constant]]
+name = "MAX_NAME_BYTES"
+value = 255
+[[constant]]
+name = "MAX_ARGS"
+value = 1024
+[[constant]]
+name = "MAX_ARG_BYTES"
+value = 65536
+[[constant]]
+name = "MAX_ARGUMENT_BYTES"
+value = 1048576
+[[constant]]
+name = "MAX_OBJECT_BYTES"
+value = 67108864
+[[constant]]
+name = "MAX_OUTPUT_RECORD_BYTES"
+value = 1048576
+[[constant]]
+name = "MAX_OUTPUT_BATCH_BYTES"
+value = 4194304
+[[constant]]
+name = "MAX_COMMAND_DESCRIPTOR_BYTES"
+value = 65536
+[[constant]]
+name = "MAX_COMMAND_RECORDS"
+value = 32
+[[constant]]
+name = "MAX_COMMAND_PAGE_BYTES"
+value = 4194304
+[[constant]]
+name = "MAX_DEFINITIONS"
+value = 1024
+[[constant]]
+name = "MAX_OBJECT_STAGES_PER_SESSION"
+value = 8
+[[constant]]
+name = "MAX_FOLLOWS_PER_SESSION"
+value = 128
+[[constant]]
+name = "MAX_RUNNING_ATTEMPTS"
+value = 32
+[[constant]]
+name = "MAX_MEMORY_BYTES"
+value = 134217728
+[[constant]]
+name = "MAX_STACK_BYTES"
+value = 8388608
+[[constant]]
+name = "MAX_ACTIVE_JOBS"
+value = 32
+[[constant]]
+name = "MAX_PENDING_JOBS"
+value = 32
+[[constant]]
+name = "MAX_JOB_BYTES"
+value = 67108864
+[[constant]]
+name = "MAX_MUTATION_REPLAYS"
+value = 65536
+[[constant]]
+name = "DEFAULT_SLOW_CONSUMER_TIMEOUT_NS"
+value = 30000000000
+[[constant]]
+name = "MAX_NEXT_START_UNIX_MS"
+value = 8640000000000000
+
+[[constant]]
+name = "LIMIT_MAX_NAME_BYTES"
+value = 1
+[[constant]]
+name = "LIMIT_MAX_ARGS"
+value = 2
+[[constant]]
+name = "LIMIT_MAX_ARGUMENT_BYTES"
+value = 3
+[[constant]]
+name = "LIMIT_MAX_OBJECT_BYTES"
+value = 4
+[[constant]]
+name = "LIMIT_MAX_OUTPUT_RECORD_BYTES"
+value = 5
+[[constant]]
+name = "LIMIT_MAX_COMMAND_DESCRIPTOR_BYTES"
+value = 6
+[[constant]]
+name = "LIMIT_MAX_COMMAND_RECORDS"
+value = 7
+[[constant]]
+name = "LIMIT_MAX_DEFINITIONS"
+value = 8
+[[constant]]
+name = "LIMIT_MAX_OBJECT_STAGES_PER_SESSION"
+value = 9
+[[constant]]
+name = "LIMIT_MAX_FOLLOWS_PER_SESSION"
+value = 10
+[[constant]]
+name = "LIMIT_MAX_RUNNING_ATTEMPTS"
+value = 11
+[[constant]]
+name = "LIMIT_MAX_MEMORY_BYTES"
+value = 12
+[[constant]]
+name = "LIMIT_MAX_JOB_BYTES"
+value = 13
+[[constant]]
+name = "LIMIT_MAX_MUTATION_REPLAYS"
+value = 14
+
+[[request]]
+name = "WATCH"
+kind = 0x0000
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateWatch; ResultPrefix + StateWatchResult"
+
+[[request]]
+name = "UNWATCH"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "subscription_id:u32; ResultPrefix"
+
+[[request]]
+name = "OBJECT_BEGIN"
+kind = 0x0002
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],content_hash:[u8;32],byte_len:u64,Extensions; ResultPrefix + ObjectBeginResult"
+
+[[request]]
+name = "OBJECT_COMMIT"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "staging_handle:u64,operation_id:[u8;16],content_hash:[u8;32],byte_len:u64,Extensions; ResultPrefix"
+
+[[request]]
+name = "DEPLOY"
+kind = 0x0004
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "operation_id:[u8;16],expected_extension_handle:u64,expected_generation:u64,expected_definition_revision:u64,flags:u16,runtime:u8,restart_policy:u8,name:string_u16,content_hash:[u8;32],argv_count:u16,repeated arg:bytes_u32,runtime_limits:bytes_u32 containing RuntimeLimits,Extensions; creation requires all three expected identity fields zero and the name absent; replacement requires all three nonzero and matching the same current name, handle, generation, and definition revision atomically; ResultPrefix + DefinitionIdentity"
+
+[[request]]
+name = "CONTROL"
+kind = 0x0005
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "extension_handle:u64,generation:u64,expected_definition_revision:u64,operation_id:[u8;16],action:u8,reserved:[u8;7]=0,Extensions; ResultPrefix + DefinitionIdentity"
+
+[[request]]
+name = "FOLLOW"
+kind = 0x0006
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "extension_handle:u64,generation:u64,attempt:u64,from_sequence:u64,initial_receive_credit:u64,Extensions; ResultPrefix + FollowResult; success establishes this session's native attachment until either endpoint CLOSEs or RESETs the returned Transfer, the follow/subscription is dropped, or the session ends, each of which must detach/unfollow and discard queued output"
+
+[[request]]
+name = "DISCOVER_COMMANDS"
+kind = 0x0007
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "directory_revision:u64,cursor:u64,max_records:u16,reserved:u16=0,Extensions; ResultPrefix + CommandPage"
+
+[[request]]
+name = "REGISTER_COMMAND"
+kind = 0x0008
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "listener_handle:u64,listener_generation:u64,descriptor:string_u32,Extensions; available only to an authenticated Extension attempt; listener_handle/listener_generation/descriptor must either all identify one live Channel listener on this session, or all be zero/empty to unregister; ResultPrefix + RegisterCommandResult"
+
+[[event]]
+name = "STATE"
+kind = 0x0000
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateEvent<ExtensionRecord>"
+
+[[event]]
+name = "STATE_ACK"
+kind = 0x0001
+direction = "client_to_server"
+sensitive = "allowed"
+compression = "allowed"
+datagram = "forbidden"
+layout = "StateAck"
+
+[[event]]
+name = "ATTEMPT_CONTEXT"
+kind = 0x0002
+direction = "server_to_client"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "extension_handle:u64,generation:u64,definition_revision:u64,attempt:u64,task_id:u32,flags:u16,runtime:u8,reserved:u8=0,content_hash:[u8;32],name:string_u16,argv_count:u16,repeated arg:bytes_u32,Extensions"
+
+[[event]]
+name = "ATTEMPT_OUTPUT"
+kind = 0x0003
+direction = "client_to_server"
+sensitive = "required"
+compression = "allowed"
+datagram = "forbidden"
+layout = "kind:u8 STDOUT/STDERR/LOG,reserved:[u8;3]=0,data:bytes_u32 at most MAX_OUTPUT_RECORD_BYTES,Extensions; accepted only from the authenticated active Extension attempt carried by this session's ATTEMPT_CONTEXT; LOG data is UTF-8"
+
+[[type]]
+name = "object_begin_result"
+layout = "disposition:u8,reserved:[u8;7]=0,staging_handle:u64,descriptor:bytes_u32 containing zero or sensitive receiver-to-sender BYTE TransferDescriptor with required upload-stage extension naming that handle,Extensions; before OBJECT_COMMIT succeeds, RESET of the returned descriptor discards the stage"
+
+[[type]]
+name = "runtime_limits"
+layout = "memory_bytes:u64,stack_bytes:u64,max_active_jobs:u32,max_pending_jobs:u32,max_job_bytes:u64,slow_consumer_timeout_ns:u64,Extensions"
+
+[[type]]
+name = "definition_identity"
+layout = "extension_handle:u64,generation:u64,definition_revision:u64,Extensions"
+
+[[type]]
+name = "extension_record"
+layout = "extension_handle:u64,generation:u64,definition_revision:u64,phase:u8,runtime:u8,restart_policy:u8,reserved:u8=0,flags:u16,reserved:u16=0,attempt:u64,last_running_attempt:u64,task_id:u32,reserved:u32=0,next_start_unix_ms:u64,directory_revision:u64,content_hash:[u8;32],name:string_u16,last_exit:bytes_u32 containing zero or ExitRecord,runtime_limits:bytes_u32 containing RuntimeLimits,Extensions; next_start_unix_ms is zero outside BACKOFF and otherwise 1..MAX_NEXT_START_UNIX_MS"
+
+[[type]]
+name = "remove_record"
+layout = "extension_handle:u64,generation:u64"
+
+[[type]]
+name = "exit_record"
+layout = "kind:u8,reserved:[u8;3]=0,code:i32,attempt:u64,server_ns:u64,detail:string_u32,Extensions"
+
+[[type]]
+name = "follow_result"
+layout = "attempt:u64,first_sequence:u64,through_sequence:u64,descriptor:bytes_u32 containing sensitive server-to-client MESSAGE TransferDescriptor,Extensions"
+
+[[type]]
+name = "output_batch"
+layout = "first_sequence:u64,record_count:u16,reserved:u16=0,repeated kind:u8,reserved:[u8;3]=0,sequence:u64,server_ns:u64,data:bytes_u32"
+
+[[type]]
+name = "command_record"
+layout = "extension_handle:u64,generation:u64,definition_revision:u64,content_hash:[u8;32],listener_handle:u64,listener_generation:u64,name:string_u16,listener_name:string_u16,descriptor:string_u32,Extensions"
+
+[[type]]
+name = "command_page"
+layout = "directory_revision:u64,next_cursor:u64,record_count:u16,reserved:u16=0,repeated CommandRecord"
+
+[[type]]
+name = "register_command_result"
+layout = "extension_handle:u64,generation:u64,definition_revision:u64,directory_revision:u64,changed:u8,reserved:[u8;7]=0,Extensions"
+
+[[type]]
+name = "state_entity_body"
+layout = "ADD/REPLACE complete ExtensionRecord; REMOVE RemoveRecord"
+
+[[type]]
+name = "family_limits"
+layout = "extension tags 1 max_name_bytes:u32,2 max_args:u32,3 max_argument_bytes:u64,4 max_object_bytes:u64,5 max_output_record_bytes:u32,6 max_command_descriptor_bytes:u32,7 max_command_records:u32,8 max_definitions:u32,9 max_object_stages_per_session:u32,10 max_follows_per_session:u32,11 max_running_attempts:u32,12 max_memory_bytes:u64,13 max_job_bytes:u64"

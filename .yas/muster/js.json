@@ -1,0 +1,20 @@
+{
+  "//": [
+    "One unit for the JS side: the first wasm-pack build, the pnpm install",
+    "that resolves @yas-run/browser out of its pkg output, and the watcher",
+    "that rebuilds it. Three units and two `requires` edges expressed an",
+    "ordering that the script states in three lines.",
+    "",
+    "Ready is the install rather than the first WASM build, because a Vite",
+    "server started between the two resolves a workspace link whose target",
+    "does not exist yet.",
+    "",
+    "restartOnSuccess because cargo-watch returning at all means the watcher",
+    "is gone; the rebuilt WASM and the installed deps are both idempotent."
+  ],
+  "description": "Yas browser WASM watch and JS dependencies (${INSTANCE})",
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-js"],
+  "readyWhen": { "log": "js ready" },
+  "timeoutStart": "10m",
+  "restartOnSuccess": true
+}

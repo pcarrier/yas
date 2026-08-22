@@ -1,0 +1,13 @@
+[Unit]
+Description=Yas terminal multiplexer for %i
+Requires=yas-server@%i.socket
+
+[Service]
+Type=notify
+User=%i
+WorkingDirectory=~
+ExecStart=yas server
+Environment=YAS_SOCK=/run/yas/%i-default.sock
+RuntimeDirectory=yas
+RuntimeDirectoryMode=0700
+Restart=no

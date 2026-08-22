@@ -1,0 +1,37 @@
+[package]
+name = "yas-edge"
+version = "0.1.0"
+edition.workspace = true
+description = "YAS browser edge service"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "yas_edge"
+path = "src/lib.rs"
+
+[dependencies]
+yas-wire = { workspace = true }
+yas-webserver = { workspace = true }
+yas-webrtc-forwarder = { workspace = true }
+yas-ssh = { workspace = true }
+yas-proxy = { workspace = true }
+yas-sd-notify = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+ring = "0.17"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+socket2 = { version = "0.6", features = ["all"] }
+time = "0.3"
+url = "2"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

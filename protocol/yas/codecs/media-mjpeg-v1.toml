@@ -1,0 +1,9 @@
+schema = 1
+name = "media-mjpeg-v1"
+const_name = "MEDIA_CODEC_MJPEG"
+family = "yas.media"
+id = 259
+version = 1
+direction = "bidirectional"
+layout = "One complete JPEG interchange datastream from SOI through EOI. Every frame is independently decodable and sets FRAME_KEYFRAME."
+golden_hex = "ffd8ffd9"

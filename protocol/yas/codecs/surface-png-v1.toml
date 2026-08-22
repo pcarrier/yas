@@ -1,0 +1,19 @@
+schema = 1
+name = "surface-png-v1"
+const_name = "SURFACE_CODEC_PNG_V1"
+family = "yas.surface"
+id = 3
+version = 1
+direction = "server_to_client"
+layout = "metadata_count:u8,reserved:[u8;3]=0,repeated tag:u16,flags:u16,len:u32,body:len; png_datastream:remaining. Metadata is unique and tag-ordered. COLOR_SPACE body is primaries:u8,transfer:u8,matrix:u8,range:u8. DAMAGE body is rect_count:u16,reserved:u16=0,repeated x:u32,y:u32,width:u32,height:u32. Payload after metadata is one complete PNG datastream."
+golden_hex = "0000000089504e470d0a1a0a"
+
+[[constant]]
+name = "METADATA_COLOR_SPACE"
+value = 1
+[[constant]]
+name = "METADATA_DAMAGE"
+value = 2
+[[constant]]
+name = "MAX_DAMAGE_RECTS"
+value = 256

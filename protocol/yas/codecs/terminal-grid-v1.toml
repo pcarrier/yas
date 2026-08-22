@@ -1,0 +1,49 @@
+schema = 1
+name = "terminal-grid-v1"
+const_name = "TERMINAL_GRID_CODEC_V1"
+family = "yas.terminal"
+id = 1
+version = 1
+direction = "server_to_client"
+layout = "Fields selected by Terminal FRAME flags in ascending flag-bit order; operation_count:canonical_uleb32,repeated opcode:u8 + typed operation body; when COMPONENTS component_count:canonical_uleb32,repeated kind:u8,flags:u8,len:canonical_uleb32,body. PATCH cell data is byte-plane-transposed 12-byte cells. CODEC_COMPRESSED wraps the complete decoded grid as decoded_len:u32,lz4_block:remaining."
+golden_hex = "01000100000000000000000000000000000000000000000000"
+
+[[constant]]
+name = "GRID_PATCH_RUN"
+value = 0
+[[constant]]
+name = "GRID_PATCH_LIST"
+value = 1
+[[constant]]
+name = "GRID_PATCH_BITMAP"
+value = 2
+[[constant]]
+name = "GRID_COPY_RECT"
+value = 3
+[[constant]]
+name = "GRID_FILL_RECT"
+value = 4
+[[constant]]
+name = "COMPONENT_LINE_FLAGS"
+value = 0
+[[constant]]
+name = "COMPONENT_OVERFLOW_STRINGS"
+value = 1
+[[constant]]
+name = "COMPONENT_HYPERLINKS"
+value = 2
+[[constant]]
+name = "COMPONENT_REQUIRED"
+value = 1
+[[constant]]
+name = "CELL_BYTES"
+value = 12
+[[constant]]
+name = "MAX_ULEB32_BYTES"
+value = 5
+[[constant]]
+name = "MAX_HYPERLINK_URI_BYTES"
+value = 4096
+[[constant]]
+name = "GOLDEN_FRAME_FLAGS"
+value = 253

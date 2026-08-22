@@ -1,0 +1,32 @@
+name: Deploy website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/website/**"
+      - "crates/browser/**"
+      - "js/web/**"
+      - "js/core/**"
+      - "js/solid/**"
+      - "js/ui/**"
+      - "install.sh"
+      - "install.ps1"
+      - "SKILL.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "js/pnpm-lock.yaml"
+      - "js/pnpm-workspace.yaml"
+      - ".dockerignore"
+      - ".github/workflows/deploy-website.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: nix run .#deploy-website
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+: "${YAS_SERVER_NAME:?YAS_SERVER_NAME is required}"
+
+# The name is the only thing that locates the socket. `--name` runs the same
+# automatic resolver a packaged server runs, so pointing XDG_RUNTIME_DIR at
+# the owner-private /run/user/$(id -u) — and clearing TMPDIR so a sticky
+# directory cannot win ahead of it — lands the socket exactly where
+# `yas --on local:$YAS_SERVER_NAME` looks for it. Passing an explicit
+# YAS_SOCK only restated that path.
+unset YAS_SOCK TMPDIR
+runtime="/run/user/$(id -u)"
+if [[ -d "$runtime" ]]; then
+  export XDG_RUNTIME_DIR="$runtime"
+else
+  unset XDG_RUNTIME_DIR
+fi
+
+# The binary is this unit's own artifact, so build it here rather than as a
+# oneshot another unit waits on: one log and one restart for "the development
+# server" instead of a dependency edge that reads like a service.
+./bin/dev-build
+
+exec ./target/profiling/yas server --verbose --name "$YAS_SERVER_NAME"

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta name="theme-color" content="#000" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <title>YAS</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'><circle cx='128' cy='128' r='120' fill='none' stroke='%23000' stroke-width='16'/><g fill='%23000'><rect x='120' y='128' width='16' height='120'/><rect x='120' y='128' width='16' height='120' transform='rotate(120 128 128)'/><rect x='120' y='128' width='16' height='120' transform='rotate(240 128 128)'/></g></svg>"
+    />
+    <link
+      rel="apple-touch-icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'><circle cx='128' cy='128' r='120' fill='none' stroke='%23000' stroke-width='16'/><g fill='%23000'><rect x='120' y='128' width='16' height='120'/><rect x='120' y='128' width='16' height='120' transform='rotate(120 128 128)'/><rect x='120' y='128' width='16' height='120' transform='rotate(240 128 128)'/></g></svg>"
+    />
+    <style>
+      *,
+      *::before,
+      *::after {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        font-family: inherit;
+      }
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        overscroll-behavior: none;
+        /* Single spacing everywhere by default. yas is a terminal first:
+           code panes, lists and chrome should all sit on the same tight
+           rhythm, and the browser's ~1.2 default was quietly adding
+           leading to everything that never set its own. Prose opts back
+           out explicitly (the commit message header, diagnostic text,
+           switcher subtitles). */
+        line-height: 1;
+        -webkit-tap-highlight-color: transparent;
+      }
+      #root {
+        /* Keep the root out of the unsafe top/side areas, but let the bottom
+           chrome own the bottom inset so it can paint behind the home area. */
+        padding: env(safe-area-inset-top) env(safe-area-inset-right) 0
+          env(safe-area-inset-left);
+      }
+      @supports (height: 100dvh) {
+        html,
+        body,
+        #root {
+          height: 100dvh;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

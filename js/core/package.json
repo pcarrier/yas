@@ -1,0 +1,126 @@
+{
+  "name": "@yas-run/core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./transports": {
+      "browser": {
+        "types": "./src/transports/browser.ts",
+        "default": "./src/transports/browser.ts"
+      },
+      "types": "./src/transports/index.ts",
+      "default": "./src/transports/index.ts"
+    },
+    "./node": {
+      "types": "./src/node.ts",
+      "default": "./src/node.ts"
+    },
+    "./palettes": {
+      "types": "./src/palettes.ts",
+      "default": "./src/palettes.ts"
+    },
+    "./layout": {
+      "types": "./src/layout/index.ts",
+      "default": "./src/layout/index.ts"
+    },
+    "./http1": {
+      "types": "./src/http1.ts",
+      "default": "./src/http1.ts"
+    },
+    "./preview": {
+      "types": "./src/preview.ts",
+      "default": "./src/preview.ts"
+    }
+  },
+  "publishConfig": {
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./transports": {
+        "browser": {
+          "types": "./dist/transports/browser.d.ts",
+          "default": "./dist/transports/browser.js"
+        },
+        "types": "./dist/transports/index.d.ts",
+        "default": "./dist/transports/index.js"
+      },
+      "./node": {
+        "types": "./dist/node.d.ts",
+        "default": "./dist/node.js"
+      },
+      "./palettes": {
+        "types": "./dist/palettes.d.ts",
+        "default": "./dist/palettes.js"
+      },
+      "./layout": {
+        "types": "./dist/layout/index.d.ts",
+        "default": "./dist/layout/index.js"
+      },
+      "./http1": {
+        "types": "./dist/http1.d.ts",
+        "default": "./dist/http1.js"
+      },
+      "./preview": {
+        "types": "./dist/preview.d.ts",
+        "default": "./dist/preview.js"
+      }
+    }
+  },
+  "description": "Low-latency terminal streaming — framework-agnostic core",
+  "homepage": "https://yas.run",
+  "author": "Indent <oss@indent.com> (https://indent.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pcarrier/yas.git",
+    "directory": "js/core"
+  },
+  "bugs": {
+    "url": "https://github.com/pcarrier/yas/issues"
+  },
+  "keywords": [
+    "terminal",
+    "tty",
+    "streaming",
+    "webgl",
+    "tiling"
+  ],
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:fuzz": "vitest run src/__tests__/yasFuzz.test.ts",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@yas-run/browser": ">=0.9.0"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@yas-run/browser": "file:../../crates/browser/pkg",
+    "@types/bun": "^1.3.14",
+    "@types/node": "^25.8.0",
+    "@vitest/coverage-v8": "^4.1.6",
+    "jsdom": "^29.1.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  },
+  "license": "MIT"
+}
