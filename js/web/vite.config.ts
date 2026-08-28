@@ -59,6 +59,7 @@ export default bytes.buffer;
   },
   build: {
     target: "es2020",
+    modulePreload: { polyfill: false },
     rollupOptions: {
       input: [resolve(root, "index.html"), resolve(root, "s/index.html")],
     },

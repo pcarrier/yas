@@ -405,6 +405,9 @@ export class YasNativeWorkspaceConnection {
   private generation = 0;
   private focusedSessionId: SessionId | null = null;
   private snapshot: YasConnectionSnapshot;
+  private latencyTimer: ReturnType<typeof setInterval> | null = null;
+  private latencyProbePending = false;
+  private latencyRttMs: number | null = null;
 
   constructor(
     readonly id: ConnectionId,
@@ -440,6 +443,9 @@ export class YasNativeWorkspaceConnection {
     });
     this.workspaceKv = new YasNativeWorkspaceKv(session);
     this.surfaceStore.setConnectionId(id);
+    this.surfaceStore.onPresentationClock(({ sourceMs, clientMs }) =>
+      this.audioPlayer.noteVideoPresentation(sourceMs, clientMs),
+    );
     this.surfaceStore.setAckSender((surfaceId, queueDepth) =>
       this.acknowledgeSurface(surfaceId, queueDepth),
     );
@@ -633,6 +639,7 @@ export class YasNativeWorkspaceConnection {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.stopLatencyProbe();
     this.removeCatalog?.();
     this.removeSelectionCatalog?.();
     this.removeSurfaceCatalog?.();
@@ -1385,6 +1392,8 @@ export class YasNativeWorkspaceConnection {
     surfaceId: SurfaceId,
     type: number,
     button: number,
+    /** Fractions of the presented frame, expanded by the server against its
+     * authoritative current compositor geometry. */
     x: number,
     y: number,
     timeMs = 0,
@@ -1811,13 +1820,77 @@ export class YasNativeWorkspaceConnection {
   }
 
   private readonly onTransportStatus = (_status: ConnectionStatus): void => {
+    if (this.connectionStatus !== "connected") this.stopLatencyProbe();
     this.store.handleStatusChange(this.connectionStatus);
     this.refreshSnapshot();
   };
 
   private onSessionReady(): void {
+    this.startLatencyProbe();
     this.familyReconfigurationNeeded = false;
     this.scheduleFamilyInitialization(true);
+  }
+
+  private startLatencyProbe(): void {
+    if (this.disposed || this.latencyTimer !== null) return;
+    void this.probeLatency();
+    this.latencyTimer = setInterval(() => void this.probeLatency(), 1_000);
+  }
+
+  private stopLatencyProbe(): void {
+    if (this.latencyTimer !== null) clearInterval(this.latencyTimer);
+    this.latencyTimer = null;
+    this.latencyProbePending = false;
+    if (this.latencyRttMs === null || this.latencyRttMs === undefined) return;
+    this.latencyRttMs = null;
+    this.snapshot = { ...this.snapshot, rttMs: null };
+    this.emit();
+  }
+
+  private async probeLatency(): Promise<void> {
+    if (
+      this.disposed ||
+      this.latencyProbePending ||
+      !this.session.ready ||
+      this.connectionStatus !== "connected"
+    )
+      return;
+    this.latencyProbePending = true;
+    const clientSendMs = performance.now();
+    try {
+      const timing = await this.session.ping(
+        BigInt(Math.round(clientSendMs * 1_000_000)),
+      );
+      const clientReceiveMs = performance.now();
+      if (
+        this.disposed ||
+        !this.session.ready ||
+        this.connectionStatus !== "connected"
+      )
+        return;
+      const rttMs = Math.max(0, clientReceiveMs - clientSendMs);
+      if (!Number.isFinite(rttMs)) return;
+      this.latencyRttMs = rttMs;
+      this.snapshot = { ...this.snapshot, rttMs };
+
+      // Surface capture timestamps are wrapping CLOCK_MONOTONIC milliseconds.
+      // Pair their clock with this same ping rather than running a second
+      // calibration loop whose requests can queue behind the first.
+      const serverMidNs =
+        (timing.receiverReceiveNs + timing.receiverSendNs) / 2n;
+      const serverMidMs = Number((serverMidNs / 1_000_000n) & 0xffff_ffffn);
+      this.surfaceStore.noteServerClock(
+        serverMidMs,
+        clientSendMs,
+        clientReceiveMs,
+      );
+      this.emit();
+    } catch {
+      // Connection lifecycle owns retries and errors. A missed sample leaves
+      // the last useful measurement visible until the connection drops.
+    } finally {
+      this.latencyProbePending = false;
+    }
   }
 
   private onSessionCatalogChange(): void {
@@ -2187,9 +2260,10 @@ export class YasNativeWorkspaceConnection {
         1,
         fixed32Integer(record.logicalHeight32_32),
       );
-      // PointerMotion is encoded in exact physical composite pixels and the
-      // compositor converts it back to logical coordinates. Rounded HiDPI
-      // buffers cannot be reconstructed from an integer scale.
+      // The composite dimensions are still authoritative for presentation,
+      // cursor artwork, and mirrored remote-pointer pixels. Local pointer
+      // input itself is frame-relative so catalogue updates cannot race the
+      // pixels currently visible in the canvas.
       const width = record.compositeWidth;
       const height = record.compositeHeight;
       if (!previous) {
@@ -2213,6 +2287,14 @@ export class YasNativeWorkspaceConnection {
           logicalWidth,
           logicalHeight,
         );
+        // A canvas can mount from restored layout state before the Surface
+        // catalogue's initial snapshot arrives. sendSurfaceSubscribe keeps
+        // that desired mount, but OPEN_VIEW cannot run until this record
+        // exists. Reconcile it here, at the exact transition that makes the
+        // request admissible. Otherwise the canvas believes it subscribed,
+        // no later event retries the dropped OPEN_VIEW, and it stays black.
+        if (this.surfaceMounts.has(record.surfaceHandle))
+          void this.refreshNativeSurfaceView(record.surfaceHandle);
       } else {
         if (previous.title !== record.title)
           this.surfaceStore.handleSurfaceTitle(
@@ -2460,7 +2542,10 @@ export class YasNativeWorkspaceConnection {
     // EOS carries only the packed-codec metadata envelope. It is a reliable
     // lifetime boundary, not an empty access unit for WebCodecs to validate.
     if (frame.flags & YAS_SURFACE_FRAME_END_OF_STREAM) return;
-    const timestampNs = frame.presentationNs || frame.captureNs;
+    // Audio and video capture times share the compositor epoch. The server's
+    // presentation timestamp is stamped after encoding on a different clock
+    // and cannot participate in end-to-end A/V latency measurement.
+    const timestampNs = frame.captureNs || frame.presentationNs;
     const timestampMs = Number((timestampNs / 1_000_000n) & 0xffff_ffffn);
     const timestampSubUs = Number((timestampNs / 1_000n) % 1_000n);
     const codec =
@@ -3080,6 +3165,7 @@ export class YasNativeWorkspaceConnection {
     this.snapshot = {
       ...this.snapshot,
       status,
+      rttMs: this.latencyRttMs,
       ready:
         this.session.ready &&
         !this.familyInitializationPending &&
@@ -3125,6 +3211,7 @@ export class YasNativeWorkspaceConnection {
       id: this.id,
       status: this.transport.status,
       ready: false,
+      rttMs: null,
       supportsRestart: true,
       supportsCopyRange: false,
       supportsCompositor: false,

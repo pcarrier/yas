@@ -804,6 +804,14 @@ pub enum CompositorCommand {
         /// Browser event `timeStamp` in whole ms; `0` for unknown.
         time_ms: u32,
     },
+    /// Pointer coordinates normalized to the visible frame. Expanded only
+    /// when consumed, against the exact mapping the compositor will invert.
+    NormalizedPointerMotion {
+        surface_id: u16,
+        x: f64,
+        y: f64,
+        time_ms: u32,
+    },
     PointerButton {
         surface_id: u16,
         button: u32,
@@ -814,6 +822,14 @@ pub enum CompositorCommand {
     /// queue item. Remote clicks must not lose the button after their motion
     /// filled the bounded compositor command queue.
     PointerButtonAt {
+        surface_id: u16,
+        x: f64,
+        y: f64,
+        button: u32,
+        pressed: bool,
+        time_ms: u32,
+    },
+    NormalizedPointerButtonAt {
         surface_id: u16,
         x: f64,
         y: f64,
@@ -2387,6 +2403,11 @@ struct Compositor {
     /// coordinate mapping stays consistent regardless of how many
     /// clients are subscribed at what sizes.
     pending_native_sizes: FxHashMap<u16, (u32, u32, u32, u32)>,
+    /// Xdg crop origin sampled by the render submission that produced each
+    /// pending native composite. Keeping it paired with that submission
+    /// prevents a newer live SetWindowGeometry from being applied to older
+    /// pixels.
+    pending_composited_origins: FxHashMap<u16, (i32, i32)>,
     /// Toplevels that need a re-composite the next time the GPU
     /// pipeline is idle.  Populated when a per-client encoder target
     /// is installed (`SetExternalOutputBuffers` /
@@ -2442,6 +2463,9 @@ struct Compositor {
     /// Per-toplevel: (composited_w, composited_h, logical_w, logical_h).
     /// Used for pointer coordinate mapping (browser→Wayland).
     last_reported_size: FxHashMap<u16, (u32, u32, u32, u32)>,
+    /// Crop origin paired with the last render submission, rather than the
+    /// mutable geometry currently being assembled by the Wayland client.
+    last_composited_origins: FxHashMap<u16, (i32, i32)>,
     /// Per-toplevel configured size.  Each surface can live in a
     /// differently-sized BSP pane, so we need to track sizes individually
     /// rather than relying on the single `output_width`/`output_height`.
@@ -2570,29 +2594,113 @@ fn next_surface_id_after(id: u16) -> u16 {
     if id == u16::MAX { 1 } else { id + 1 }
 }
 
+/// The relationship between the encoded composite and the surface tree it
+/// shows. The renderer converts every logical layer through the configured
+/// output scale and crops by the current xdg window-geometry origin. It does
+/// not stretch a stale committed geometry to the requested target: any extent
+/// it has not painted yet remains blank. Input must invert that same scale or
+/// it drifts throughout a live floating resize.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CompositedMapping {
+    physical_width: f64,
+    physical_height: f64,
+    logical_x: f64,
+    logical_y: f64,
+    logical_width: f64,
+    logical_height: f64,
+}
+
+impl CompositedMapping {
+    fn normalized_to_composite(self, x: f64, y: f64) -> (f64, f64) {
+        // A normalized edge names the last point inside the frame, not the
+        // first point outside it. Wayland positions have 1/256 precision.
+        let inside = |fraction: f64, extent: f64| {
+            (fraction.clamp(0.0, 1.0) * extent).min((extent - 1.0 / 256.0).max(0.0))
+        };
+        (
+            inside(x, self.physical_width),
+            inside(y, self.physical_height),
+        )
+    }
+
+    fn point_to_surface_tree(self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.logical_x + x * self.logical_width / self.physical_width,
+            self.logical_y + y * self.logical_height / self.physical_height,
+        )
+    }
+
+    fn vector_to_logical(self, x: f64, y: f64) -> (f64, f64) {
+        (
+            x * self.logical_width / self.physical_width,
+            y * self.logical_height / self.physical_height,
+        )
+    }
+
+    fn rect_to_composited(self, x: f64, y: f64, w: f64, h: f64) -> (i32, i32, i32, i32) {
+        let sx = self.physical_width / self.logical_width;
+        let sy = self.physical_height / self.logical_height;
+        (
+            ((x - self.logical_x) * sx).round() as i32,
+            ((y - self.logical_y) * sy).round() as i32,
+            (w * sx).round() as i32,
+            (h * sy).round() as i32,
+        )
+    }
+}
+
+fn composited_mapping_from(
+    reported: Option<(u32, u32, u32, u32)>,
+    composited_origin: Option<(i32, i32)>,
+    live_geometry: Option<(i32, i32, i32, i32)>,
+) -> Option<CompositedMapping> {
+    let geometry = live_geometry.filter(|&(_, _, width, height)| width > 0 && height > 0);
+    match (reported, geometry) {
+        (Some((pw, ph, logical_width, logical_height)), geometry) if pw > 0 && ph > 0 => {
+            let (logical_x, logical_y) = composited_origin
+                .or_else(|| geometry.map(|(x, y, _, _)| (x, y)))
+                .unwrap_or((0, 0));
+            (logical_width > 0 && logical_height > 0).then_some(CompositedMapping {
+                physical_width: f64::from(pw),
+                physical_height: f64::from(ph),
+                logical_x: f64::from(logical_x),
+                logical_y: f64::from(logical_y),
+                logical_width: f64::from(logical_width),
+                logical_height: f64::from(logical_height),
+            })
+        }
+        (None, Some((x, y, width, height))) => Some(CompositedMapping {
+            physical_width: f64::from(width),
+            physical_height: f64::from(height),
+            logical_x: f64::from(x),
+            logical_y: f64::from(y),
+            logical_width: f64::from(width),
+            logical_height: f64::from(height),
+        }),
+        _ => None,
+    }
+}
+
 /// Resolve the native size to publish after one render attempt.
 ///
-/// A browser-requested composite size is authoritative even if this attempt
-/// could not submit. Otherwise only the renderer's explicit submission
-/// metadata is usable; published frames may all be per-client downscales.
+/// A configured composite size becomes pointer-visible only when a render
+/// using it was actually submitted. Publishing the request itself advances
+/// browser pointer scaling while the pixels still describe the previous
+/// window, which makes input jump during every live resize. Published frames
+/// may all be per-client downscales, so the renderer's native submission is
+/// still the authority for the physical extent.
 fn native_size_after_render(
     toplevel_sid: u16,
     configured: Option<(u32, u32, u32, u32)>,
     submitted: Option<(u16, u32, u32)>,
     scale_120: u32,
 ) -> Option<(u16, u32, u32, u32, u32)> {
-    if let Some((w, h, log_w, log_h)) = configured {
-        return Some((toplevel_sid, w, h, log_w, log_h));
-    }
-    submitted.map(|(sid, w, h)| {
-        (
-            sid,
-            w,
-            h,
-            (w * 120).div_ceil(scale_120),
-            (h * 120).div_ceil(scale_120),
-        )
-    })
+    let (sid, w, h) = submitted?;
+    let (log_w, log_h) = configured
+        .map(|(_, _, log_w, log_h)| (log_w, log_h))
+        .unwrap_or_else(|| ((w * 120).div_ceil(scale_120), (h * 120).div_ceil(scale_120)));
+    debug_assert_eq!(sid, toplevel_sid);
+    Some((sid, w, h, log_w, log_h))
 }
 
 impl Compositor {
@@ -2670,28 +2778,10 @@ impl Compositor {
         surface_id: u16,
         (x, y, w, h): (i32, i32, i32, i32),
     ) -> (i32, i32, i32, i32) {
-        let (mut x, mut y) = (x as f64, y as f64);
-        if let Some((gx, gy, _, _)) = self
-            .toplevel_surface_ids
-            .get(&surface_id)
-            .and_then(|rid| self.surfaces.get(rid))
-            .and_then(|s| s.xdg_geometry)
-        {
-            x -= gx as f64;
-            y -= gy as f64;
-        }
-        let (sx, sy) = match self.last_reported_size.get(&surface_id) {
-            Some(&(cw, ch, lw, lh)) if lw > 0 && lh > 0 => {
-                (cw as f64 / lw as f64, ch as f64 / lh as f64)
-            }
-            _ => (1.0, 1.0),
-        };
-        (
-            (x * sx).round() as i32,
-            (y * sy).round() as i32,
-            (w as f64 * sx).round() as i32,
-            (h as f64 * sy).round() as i32,
-        )
+        self.composited_mapping(surface_id)
+            .map_or((x, y, w, h), |mapping| {
+                mapping.rect_to_composited(x.into(), y.into(), w.into(), h.into())
+            })
     }
 
     fn text_input_has_focus(ti: &TextInputState, focused_wl: &WlSurface) -> bool {
@@ -2983,10 +3073,13 @@ impl Compositor {
         // what sizes.
         for (surface_id, (width, height, log_w, log_h)) in self.pending_native_sizes.drain() {
             let prev = self.last_reported_size.get(&surface_id).copied();
+            if let Some(origin) = self.pending_composited_origins.remove(&surface_id) {
+                self.last_composited_origins.insert(surface_id, origin);
+            }
             // Record unconditionally. The entry is not only the size the
             // client was told; its logical half is the denominator the
-            // pointer path divides browser coordinates by
-            // (`PointerMotion`). Logical size can change while the physical
+            // compositor-frame input path uses to recover logical positions.
+            // Logical size can change while the physical
             // size does not — an output scale change alone does exactly that
             // — so gating the *store* on the physical size left the ratio
             // stale and scaled every later coordinate by the wrong factor.
@@ -3389,11 +3482,10 @@ impl Compositor {
     /// is only known once the layers are collected).
     ///
     /// This follows the *requested* size, so it changes the instant a
-    /// `SurfaceResize` is handled — before the Wayland client has acked
-    /// the configure, let alone painted.  That is deliberate: the render
-    /// target is `surface_sizes` either way, so this is what the very next
-    /// composite will produce, and the server needs it to size encoders
-    /// against the right aspect rather than the previous one.
+    /// `SurfaceResize` is handled — before the Wayland client has acked the
+    /// configure, let alone painted. It is only the next render target;
+    /// `native_size_after_render` does not publish it until that render was
+    /// actually submitted.
     ///
     /// The client's own size range applies on the way out.  A client that
     /// declared a minimum draws itself at that minimum no matter what we
@@ -3748,6 +3840,13 @@ impl Compositor {
         let s120 = self.surface_scale_120(toplevel_sid);
         let native = self.native_composite_size(toplevel_sid);
         let target_phys = native.map(|(pw, ph, _, _)| (pw, ph));
+        let composited_origin = self
+            .surfaces
+            .get(root_id)
+            .and_then(|surface| surface.xdg_geometry)
+            .filter(|&(_, _, width, height)| width > 0 && height > 0)
+            .map(|(x, y, _, _)| (x, y))
+            .unwrap_or((0, 0));
         let mut encode_giveups: Vec<(u32, u64)> = Vec::new();
         let screen_cast = self.screencast_surfaces.contains(&toplevel_sid);
         let (submitted_native, composited) = if let Some(ref mut vk) = self.vulkan_renderer {
@@ -3798,6 +3897,12 @@ impl Compositor {
         {
             self.pending_native_sizes
                 .insert(sid, (nw, nh, nlog_w, nlog_h));
+            // The size and crop origin came from the same successful render
+            // submission and must advance together for pointer inversion.
+            if submitted_native.is_some() {
+                self.pending_composited_origins
+                    .insert(sid, composited_origin);
+            }
         }
 
         for (result_sid, w, h, pixels, encoder_skip) in composited {
@@ -4975,6 +5080,9 @@ impl Compositor {
                     self.pending_request_frames.remove(&surf.surface_id);
                     self.frame_callback_toplevels.remove(&surf.surface_id);
                     self.last_reported_size.remove(&surf.surface_id);
+                    self.last_composited_origins.remove(&surf.surface_id);
+                    self.pending_composited_origins.remove(&surf.surface_id);
+                    self.pending_native_sizes.remove(&surf.surface_id);
                     self.pointer_frame_positions.remove(&surf.surface_id);
                     self.surface_sizes.remove(&surf.surface_id);
                     if let Some(ref mut vk) = self.vulkan_renderer {
@@ -5133,6 +5241,36 @@ impl Compositor {
             })
     }
 
+    /// Mapping used by both rendering and browser input for this toplevel.
+    ///
+    /// `last_reported_size` names both the physical render target and the
+    /// configured logical extent that determines the renderer's scale. Xdg
+    /// geometry contributes only the crop origin; its extent may still be the
+    /// app's previous committed size while the requested target is already
+    /// being rendered.
+    fn composited_mapping(&self, surface_id: u16) -> Option<CompositedMapping> {
+        let reported = self.last_reported_size.get(&surface_id).copied();
+        let live_geometry = self
+            .toplevel_surface_ids
+            .get(&surface_id)
+            .and_then(|root_id| self.surfaces.get(root_id))
+            .and_then(|surface| surface.xdg_geometry);
+        composited_mapping_from(
+            reported,
+            self.last_composited_origins.get(&surface_id).copied(),
+            live_geometry,
+        )
+    }
+
+    /// Expand a frame-relative browser point only at the compositor boundary.
+    /// Both the expansion and the inverse hit-test then read one mapping, so a
+    /// resize cannot put live dimensions on coordinates measured from stale
+    /// pixels.
+    fn normalized_pointer_position(&self, surface_id: u16, x: f64, y: f64) -> Option<(f64, f64)> {
+        let mapping = self.composited_mapping(surface_id)?;
+        Some(mapping.normalized_to_composite(x, y))
+    }
+
     /// Every lookup `pointer_focus_matches_surface` consults, for a
     /// `--verbose` log.
     ///
@@ -5160,28 +5298,12 @@ impl Compositor {
     /// so they cannot disagree about scale, crop, popup, or subsurface rules.
     fn dispatch_pointer_motion(&mut self, surface_id: u16, x: f64, y: f64, time_ms: u32) {
         let time = self.input_event_time(time_ms);
-        // The browser sends coordinates in the composited frame's physical
-        // pixel space. Convert to logical (surface-local) coordinates using
-        // the actual composited-to-logical ratio for this surface.
-        let (mut x, mut y) =
-            if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
-                let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
-                let sy = if ch > 0 { lh as f64 / ch as f64 } else { 1.0 };
-                (x * sx, y * sy)
-            } else {
-                (x, y)
-            };
-        // The composited frame is cropped to xdg_geometry (if set), so the
-        // browser's (0,0) corresponds to (geo_x, geo_y) in the surface tree.
-        if let Some((gx, gy, _, _)) = self
-            .toplevel_surface_ids
-            .get(&surface_id)
-            .and_then(|rid| self.surfaces.get(rid))
-            .and_then(|s| s.xdg_geometry)
-        {
-            x += gx as f64;
-            y += gy as f64;
-        }
+        // The caller supplies physical pixels in the encoded composite. The
+        // normalized browser path expands its frame fraction immediately
+        // before entering here. Invert the renderer's crop-and-scale mapping.
+        let (x, y) = self
+            .composited_mapping(surface_id)
+            .map_or((x, y), |mapping| mapping.point_to_surface_tree(x, y));
         // Hit-test the surface tree to find the actual target (which may be a
         // subsurface or popup rather than the root).
         let target_wl = self
@@ -5499,6 +5621,24 @@ impl Compositor {
                 self.dispatch_pointer_motion(surface_id, x, y, time_ms);
                 let _ = self.display_handle.flush_clients();
             }
+            CompositorCommand::NormalizedPointerMotion {
+                surface_id,
+                x,
+                y,
+                time_ms,
+            } => {
+                let Some((x, y)) = self.normalized_pointer_position(surface_id, x, y) else {
+                    return;
+                };
+                if self.client_pointer_drag_grabbed() {
+                    self.client_drag_motion(surface_id, x, y);
+                    let _ = self.display_handle.flush_clients();
+                    return;
+                }
+                self.pointer_frame_positions.insert(surface_id, (x, y));
+                self.dispatch_pointer_motion(surface_id, x, y, time_ms);
+                let _ = self.display_handle.flush_clients();
+            }
             CompositorCommand::PointerButton {
                 surface_id: _,
                 button,
@@ -5515,9 +5655,46 @@ impl Compositor {
                 pressed,
                 time_ms,
             } => {
+                if self.verbose && pressed {
+                    eprintln!(
+                        "[pointer-click] sid={surface_id} composite=({x:.2},{y:.2}) mapping={:?} reported={:?} composited_origin={:?} live_geometry={:?}",
+                        self.composited_mapping(surface_id),
+                        self.last_reported_size.get(&surface_id),
+                        self.last_composited_origins.get(&surface_id),
+                        self.toplevel_surface_ids
+                            .get(&surface_id)
+                            .and_then(|root_id| self.surfaces.get(root_id))
+                            .and_then(|surface| surface.xdg_geometry),
+                    );
+                }
                 // Motion and button share one bounded queue slot. Besides
                 // preventing a dropped button, this guarantees the click is
                 // routed to the subsurface hit at these coordinates.
+                if self.client_pointer_drag_grabbed() {
+                    self.client_drag_motion(surface_id, x, y);
+                } else {
+                    self.pointer_frame_positions.insert(surface_id, (x, y));
+                    self.dispatch_pointer_motion(surface_id, x, y, time_ms);
+                }
+                self.dispatch_pointer_button(button, pressed, time_ms);
+            }
+            CompositorCommand::NormalizedPointerButtonAt {
+                surface_id,
+                x,
+                y,
+                button,
+                pressed,
+                time_ms,
+            } => {
+                let Some((x, y)) = self.normalized_pointer_position(surface_id, x, y) else {
+                    return;
+                };
+                if self.verbose && pressed {
+                    eprintln!(
+                        "[pointer-click] sid={surface_id} composite=({x:.2},{y:.2}) normalized=true mapping={:?}",
+                        self.composited_mapping(surface_id),
+                    );
+                }
                 if self.client_pointer_drag_grabbed() {
                     self.client_drag_motion(surface_id, x, y);
                 } else {
@@ -5590,24 +5767,9 @@ impl Compositor {
                 // surface-logical pixels. Same conversion PointerMotion
                 // does, so a wheel and a drag move content by equal amounts
                 // on a scaled surface.
-                let (sx, sy) = self.last_reported_size.get(&surface_id).map_or(
-                    (1.0, 1.0),
-                    |&(cw, ch, lw, lh)| {
-                        (
-                            if cw > 0 {
-                                f64::from(lw) / f64::from(cw)
-                            } else {
-                                1.0
-                            },
-                            if ch > 0 {
-                                f64::from(lh) / f64::from(ch)
-                            } else {
-                                1.0
-                            },
-                        )
-                    },
-                );
-                let (dx, dy) = (dx * sx, dy * sy);
+                let (dx, dy) = self
+                    .composited_mapping(surface_id)
+                    .map_or((dx, dy), |mapping| mapping.vector_to_logical(dx, dy));
                 if !stop && dx == 0.0 && dy == 0.0 && v120_x == 0 && v120_y == 0 {
                     return;
                 }
@@ -5749,24 +5911,12 @@ impl Compositor {
                     self.pending_kb_reenter = true;
                 }
 
-                // The composite target moved the moment `surface_sizes`
-                // (and possibly the output scale) changed above, so report
-                // the new native size now instead of waiting for the client
-                // to paint.  The server sizes each viewer's encoder by
-                // inscribing this aspect into that viewer's box: reporting
-                // it a round trip late meant the first encoder built after
-                // every resize was inscribed into the *previous* aspect,
-                // and the composite got squeezed into it (a 1200x1000 pane
-                // encoded at 1200x674).  A second encoder then replaced it
-                // — one wasted rebuild, one wasted keyframe, and a visibly
-                // squashed picture in between.
-                //
-                // Only this surface's composite moved: scale is per-surface,
-                // so a density change no longer rescales the session.
-                if let Some(dims) = self.native_composite_size(surface_id) {
-                    self.pending_native_sizes.insert(surface_id, dims);
-                }
-                self.flush_pending_commits();
+                // Do not publish the requested geometry yet. Pointer input is
+                // expressed in the published composite's physical pixels, so
+                // advancing it before the app paints makes the browser scale
+                // input against the new size while it still shows the old
+                // frame. `composite_toplevel_into_pending` publishes the size
+                // atomically with the first successful render submission.
 
                 let _ = self.display_handle.flush_clients();
             }
@@ -7380,6 +7530,9 @@ impl Dispatch<WlSurface, ()> for Compositor {
                         state.pending_request_frames.remove(&surf.surface_id);
                         state.frame_callback_toplevels.remove(&surf.surface_id);
                         state.last_reported_size.remove(&surf.surface_id);
+                        state.last_composited_origins.remove(&surf.surface_id);
+                        state.pending_composited_origins.remove(&surf.surface_id);
+                        state.pending_native_sizes.remove(&surf.surface_id);
                         state.pointer_frame_positions.remove(&surf.surface_id);
                         state.surface_sizes.remove(&surf.surface_id);
                         if let Some(ref mut vk) = state.vulkan_renderer {
@@ -8362,6 +8515,9 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                         state.pending_request_frames.remove(&sid);
                         state.frame_callback_toplevels.remove(&sid);
                         state.last_reported_size.remove(&sid);
+                        state.last_composited_origins.remove(&sid);
+                        state.pending_composited_origins.remove(&sid);
+                        state.pending_native_sizes.remove(&sid);
                         state.pointer_frame_positions.remove(&sid);
                         state.surface_sizes.remove(&sid);
                         if let Some(ref mut vk) = state.vulkan_renderer {
@@ -10355,23 +10511,9 @@ impl Compositor {
         x: f64,
         y: f64,
     ) -> Option<(ObjectId, f64, f64)> {
-        let (mut x, mut y) =
-            if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
-                let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
-                let sy = if ch > 0 { lh as f64 / ch as f64 } else { 1.0 };
-                (x * sx, y * sy)
-            } else {
-                (x, y)
-            };
-        if let Some((gx, gy, _, _)) = self
-            .toplevel_surface_ids
-            .get(&surface_id)
-            .and_then(|rid| self.surfaces.get(rid))
-            .and_then(|s| s.xdg_geometry)
-        {
-            x += gx as f64;
-            y += gy as f64;
-        }
+        let (x, y) = self
+            .composited_mapping(surface_id)
+            .map_or((x, y), |mapping| mapping.point_to_surface_tree(x, y));
         self.toplevel_surface_ids
             .get(&surface_id)
             .cloned()
@@ -12171,6 +12313,7 @@ fn run_compositor(
         pending_commits: HashMap::new(),
         pending_encoded: Vec::new(),
         pending_native_sizes: FxHashMap::default(),
+        pending_composited_origins: FxHashMap::default(),
         pending_recomposite_toplevels: FxHashMap::default(),
         deferred_buffer_holds: FxHashMap::default(),
         focused_surface_id: 0,
@@ -12183,6 +12326,7 @@ fn run_compositor(
         verbose,
         shutdown: shutdown.clone(),
         last_reported_size: FxHashMap::default(),
+        last_composited_origins: FxHashMap::default(),
         surface_sizes: FxHashMap::default(),
         positioners: FxHashMap::default(),
         fractional_scales: Vec::new(),
@@ -12508,12 +12652,13 @@ fn run_compositor(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppIdentity, AppSocketTokens, COMPOSITOR_COMMAND_QUEUE, COMPOSITOR_EVENT_QUEUE, Compositor,
-        CompositorCommand, CompositorEvent, CompositorEventSender, FRAME_CLOCK_COMMAND_QUEUE,
-        FrameClockCommand, FrameClockEntry, PendingDamage, apply_add_app_socket,
-        apply_remove_app_socket, consume_frame_clock_deadline, dir_is_chromium,
-        native_size_after_render, next_surface_id_after, parent_pid, scan_free_surface_id,
-        send_command_with_wake, shm_damage_rects, update_frame_clock,
+        AppIdentity, AppSocketTokens, COMPOSITOR_COMMAND_QUEUE, COMPOSITOR_EVENT_QUEUE,
+        CompositedMapping, Compositor, CompositorCommand, CompositorEvent, CompositorEventSender,
+        FRAME_CLOCK_COMMAND_QUEUE, FrameClockCommand, FrameClockEntry, PendingDamage,
+        apply_add_app_socket, apply_remove_app_socket, composited_mapping_from,
+        consume_frame_clock_deadline, dir_is_chromium, native_size_after_render,
+        next_surface_id_after, parent_pid, scan_free_surface_id, send_command_with_wake,
+        shm_damage_rects, update_frame_clock,
     };
     use crate::vulkan_render::ShmDamageRect;
     use calloop::EventLoop;
@@ -12897,6 +13042,116 @@ mod tests {
             native.map(|(_, w, h, _, _)| (w, h)),
             Some((sidebar_frame.1, sidebar_frame.2))
         );
+    }
+
+    #[test]
+    fn resize_is_not_published_before_its_composite_is_submitted() {
+        let requested = Some((2400, 1600, 1200, 800));
+
+        assert_eq!(native_size_after_render(7, requested, None, 240), None);
+        assert_eq!(
+            native_size_after_render(7, requested, Some((7, 2400, 1600)), 240),
+            Some((7, 2400, 1600, 1200, 800)),
+        );
+    }
+
+    #[test]
+    fn pointer_inverts_the_render_scale_and_xdg_crop_origin() {
+        // A 1920x1080 configure whose currently committed CSD geometry is
+        // still 1904x1056 renders that geometry at 2x into the 3840x2160
+        // target. The unpainted trailing edge stays blank; it is not license
+        // to stretch pointer coordinates over the smaller committed extent.
+        let mapping = CompositedMapping {
+            physical_width: 3840.0,
+            physical_height: 2160.0,
+            logical_x: 8.0,
+            logical_y: 12.0,
+            logical_width: 1920.0,
+            logical_height: 1080.0,
+        };
+
+        assert_eq!(mapping.point_to_surface_tree(0.0, 0.0), (8.0, 12.0));
+        assert_eq!(
+            mapping.point_to_surface_tree(3840.0, 2160.0),
+            (1928.0, 1092.0),
+        );
+        assert_eq!(
+            mapping.point_to_surface_tree(1920.0, 1080.0),
+            (968.0, 552.0),
+        );
+    }
+
+    #[test]
+    fn pointer_uses_the_crop_origin_paired_with_the_visible_composite() {
+        let mapping = composited_mapping_from(
+            Some((2000, 1200, 1000, 600)),
+            Some((8, 12)),
+            // The client has already assembled geometry for its next frame.
+            Some((32, 40, 1000, 600)),
+        )
+        .expect("reported composite has a mapping");
+
+        assert_eq!(mapping.point_to_surface_tree(0.0, 0.0), (8.0, 12.0));
+        assert_eq!(
+            mapping.point_to_surface_tree(2000.0, 1200.0),
+            (1008.0, 612.0)
+        );
+    }
+
+    #[test]
+    fn normalized_pointer_survives_a_live_resize_without_old_dimensions() {
+        let before = CompositedMapping {
+            physical_width: 1000.0,
+            physical_height: 600.0,
+            logical_x: 0.0,
+            logical_y: 0.0,
+            logical_width: 500.0,
+            logical_height: 300.0,
+        };
+        let after = CompositedMapping {
+            physical_width: 2400.0,
+            physical_height: 1600.0,
+            logical_x: 8.0,
+            logical_y: 12.0,
+            logical_width: 1200.0,
+            logical_height: 800.0,
+        };
+
+        let old_composite = before.normalized_to_composite(0.25, 0.75);
+        let new_composite = after.normalized_to_composite(0.25, 0.75);
+        assert_eq!(old_composite, (250.0, 450.0));
+        assert_eq!(new_composite, (600.0, 1200.0));
+        assert_eq!(
+            before.point_to_surface_tree(old_composite.0, old_composite.1),
+            (125.0, 225.0),
+        );
+        assert_eq!(
+            after.point_to_surface_tree(new_composite.0, new_composite.1),
+            (308.0, 612.0),
+        );
+
+        let edge = after.normalized_to_composite(1.0, 1.0);
+        assert!(edge.0 < after.physical_width);
+        assert!(edge.1 < after.physical_height);
+    }
+
+    #[test]
+    fn ime_and_pointer_transforms_are_inverse() {
+        let mapping = CompositedMapping {
+            physical_width: 3840.0,
+            physical_height: 2160.0,
+            logical_x: 8.0,
+            logical_y: 12.0,
+            logical_width: 1920.0,
+            logical_height: 1080.0,
+        };
+        let rect = mapping.rect_to_composited(968.0, 552.0, 20.0, 24.0);
+        let point = mapping.point_to_surface_tree(f64::from(rect.0), f64::from(rect.1));
+
+        assert!((point.0 - 968.0).abs() < 0.25);
+        assert!((point.1 - 552.0).abs() < 0.25);
+        assert_eq!(rect.2, 40);
+        assert_eq!(rect.3, 48);
     }
 
     #[test]

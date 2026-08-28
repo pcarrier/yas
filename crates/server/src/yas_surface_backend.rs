@@ -147,8 +147,12 @@ pub(crate) enum Input {
     Pointer {
         phase: PointerPhase,
         button: u8,
-        x: u16,
-        y: u16,
+        /// Position within the presented frame, normalized to 0..=1. The
+        /// compositor expands this against the mapping current when it
+        /// consumes the command, so a resize cannot mix browser catalogue
+        /// geometry with a different rendered frame.
+        x: f64,
+        y: f64,
         time_ms: u32,
     },
     Axis {
@@ -652,31 +656,49 @@ pub(crate) async fn input(state: &AppState, client_id: u64, surface_id: u16, inp
             y,
             time_ms,
         } => {
+            // REMOTE_INPUT still mirrors compositor-frame pixels. Derive that
+            // presentation-only copy from the server's current catalogue; the
+            // actual input command stays normalized until the compositor can
+            // expand it against its exact live mapping.
+            let mirrored = session
+                .compositor
+                .as_ref()
+                .and_then(|compositor| compositor.surfaces.get(&surface_id))
+                .map(|surface| {
+                    let pixel = |fraction: f64, extent: u16| {
+                        (fraction.clamp(0.0, 1.0) * f64::from(extent))
+                            .floor()
+                            .clamp(0.0, f64::from(extent.saturating_sub(1)))
+                            as u16
+                    };
+                    (pixel(x, surface.width), pixel(y, surface.height))
+                })
+                .unwrap_or((0, 0));
             match phase {
                 PointerPhase::Move
                 | PointerPhase::Enter
                 | PointerPhase::Down
                 | PointerPhase::Up => {
-                    session.update_surface_pointer(client_id, surface_id, x, y);
+                    session.update_surface_pointer(client_id, surface_id, mirrored.0, mirrored.1);
                 }
                 PointerPhase::Leave => session.clear_surface_pointer_owner(client_id),
             }
             match phase {
                 PointerPhase::Down | PointerPhase::Up => {
-                    commands.push(CompositorCommand::PointerButtonAt {
+                    commands.push(CompositorCommand::NormalizedPointerButtonAt {
                         surface_id,
-                        x: f64::from(x),
-                        y: f64::from(y),
+                        x,
+                        y,
                         button: evdev_button(button),
                         pressed: matches!(phase, PointerPhase::Down),
                         time_ms,
                     });
                 }
                 PointerPhase::Move | PointerPhase::Enter => {
-                    commands.push(CompositorCommand::PointerMotion {
+                    commands.push(CompositorCommand::NormalizedPointerMotion {
                         surface_id,
-                        x: f64::from(x),
-                        y: f64::from(y),
+                        x,
+                        y,
                         time_ms,
                     });
                 }
@@ -719,7 +741,11 @@ pub(crate) async fn input(state: &AppState, client_id: u64, surface_id: u16, inp
             return false;
         };
         for command in commands {
-            let reliable = matches!(&command, CompositorCommand::PointerButtonAt { .. });
+            let reliable = matches!(
+                &command,
+                CompositorCommand::PointerButtonAt { .. }
+                    | CompositorCommand::NormalizedPointerButtonAt { .. }
+            );
             let failed = if reliable {
                 // A click is discrete state, not a coalescible motion sample.
                 // Wait for one bounded-queue slot instead of silently losing

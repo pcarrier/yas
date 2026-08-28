@@ -333,13 +333,16 @@ const NVENC_AV1_COLOR_RANGE_OFFSET: usize = 248;
 /// `NV_ENC_VUI_TRANSFER_CHARACTERISTIC_RESERVED0` and — worst —
 /// `NV_ENC_VUI_MATRIX_COEFFS_RGB` (MC_IDENTITY, which on a 4:2:0 stream is
 /// spec-invalid and tells a conforming decoder to read the planes as GBR).
-/// YAS's actual values are BT.709 primaries, sRGB transfer and the
-/// SMPTE-170M (BT.601) matrix.
+/// YAS uses BT.709 primaries/transfer and the SMPTE-170M (BT.601) matrix.
+/// NVENC emits an AV1 sequence header that both dav1d and libaom reject when
+/// `IEC61966_2_1` is paired with its 4:2:0 output, even though that transfer
+/// characteristic is valid in isolation. BT.709 is the interoperable
+/// declaration for the nonlinear desktop pixels this path carries.
 const NVENC_AV1_COLOR_PRIMARIES_OFFSET: usize = 236;
 const NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET: usize = 240;
 const NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET: usize = 244;
 const NVENC_VUI_COLOR_PRIMARIES_BT709: u32 = 1;
-const NVENC_VUI_TRANSFER_CHARACTERISTIC_IEC61966_2_1: u32 = 13;
+const NVENC_VUI_TRANSFER_CHARACTERISTIC_BT709: u32 = 1;
 const NVENC_VUI_MATRIX_COEFFS_SMPTE170M: u32 = 6;
 /// NVIDIA's documented low-latency setting: keep one reference chain until
 /// the application explicitly requests recovery instead of inserting an IDR
@@ -400,7 +403,7 @@ fn write_av1_color_description(config_buf: &mut [u8]) {
     w32(
         config_buf,
         NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET,
-        NVENC_VUI_TRANSFER_CHARACTERISTIC_IEC61966_2_1,
+        NVENC_VUI_TRANSFER_CHARACTERISTIC_BT709,
     );
     w32(
         config_buf,
@@ -1904,7 +1907,7 @@ mod tests {
         );
         assert_eq!(
             r32(&config, NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET),
-            NVENC_VUI_TRANSFER_CHARACTERISTIC_IEC61966_2_1,
+            NVENC_VUI_TRANSFER_CHARACTERISTIC_BT709,
         );
         assert_eq!(
             r32(&config, NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET),

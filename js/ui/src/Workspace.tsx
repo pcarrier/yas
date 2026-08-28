@@ -211,6 +211,7 @@ import { MediaOverlay } from "./MediaOverlay";
 import { createMediaDevices } from "./mediaDevices";
 import { LayoutContainer, EmptyPane } from "./layout/LayoutContainer";
 import { WindowManagerChooser } from "./layout/WindowManagerChooser";
+import { newlyLaunchedSurface } from "./layout/floatingWindow";
 import { autoFocusPaneTarget } from "./layout/treeContext";
 import { WebOverlay } from "./WebOverlay";
 import type { WebPaneHandle } from "./WebPane";
@@ -361,7 +362,9 @@ function getHmrWorkspace(
   transportOwnership: WorkspaceTransportOwnership,
 ): HmrWorkspaceData {
   const raw = import.meta.hot?.data?.workspace as
-    HmrWorkspaceData | YasWorkspace | undefined;
+    | HmrWorkspaceData
+    | YasWorkspace
+    | undefined;
   // Accept the raw YasWorkspace stored by versions before HmrWorkspaceData.
   const prev = raw && "workspace" in raw ? raw.workspace : raw;
   const previousOwner = raw && "workspace" in raw ? raw.owner : null;
@@ -408,7 +411,8 @@ export function Workspace(props: {
   onAuthError: () => void;
   relayRoutes?: () => readonly YasRelayRoute[];
   workspaceSession?:
-    WorkspaceSessionBinding | Accessor<WorkspaceSessionBinding | null>;
+    | WorkspaceSessionBinding
+    | Accessor<WorkspaceSessionBinding | null>;
   workspaceSessions?: WorkspaceSessionController;
   transportOwnership?: WorkspaceTransportOwnership;
 }) {
@@ -678,15 +682,9 @@ function WorkspaceScreen(props: {
 
   // Per-surface signature of the fields that drive the thumbnail UI
   // (title, appId, and both size pairs — see surfaceCardSignature).
-  // SurfaceStore mutates the dimensions
-  // in place on each frame so ref-level diffing never sees dim changes,
-  // and <For each> keys by reference so a child component reading
-  // `props.surface.width` won't re-render when the underlying field is
-  // mutated.  We fix both by tracking a per-surface sig: when a
-  // surface's sig changes we emit a shallow copy (new ref → <For>
-  // remounts that one child and reads the new dims), while surfaces
-  // whose sig is unchanged keep their ref so their children aren't
-  // disturbed.
+  // <For each> keys by reference, while surface metadata is held in plain
+  // objects. Track a per-surface signature so every field a card renders gets
+  // a fresh item when it changes, while unchanged surfaces keep their child.
   const surfaceSigs = new Map<string, string>();
 
   // Track the set of available connection IDs so the surface aggregation
@@ -776,13 +774,11 @@ function WorkspaceScreen(props: {
       // surface into the active panel as soon as it appears.
       const pending = untrack(() => pendingAppStart());
       if (pending) {
-        const prevKey = (s: YasSurface) => `${s.connectionId}:${s.surfaceId}`;
-        const prevKeys = new Set(prev.map(prevKey));
-        const match = all.find(
-          (s) =>
-            s.connectionId === pending.connectionId &&
-            s.appId === pending.appId &&
-            !prevKeys.has(prevKey(s)),
+        const match = newlyLaunchedSurface(
+          all,
+          pending.connectionId,
+          pending.appId,
+          pending.existingSurfaceKeys,
         );
         if (match) {
           if (pendingAppStartTimer) {
@@ -790,7 +786,11 @@ function WorkspaceScreen(props: {
             pendingAppStartTimer = undefined;
           }
           setPendingAppStart(null);
-          focusSurface(match.surfaceId, match.connectionId);
+          // An application launched while floating owns a new window. The
+          // generic focus path replaces the focused pane unless this flag is
+          // explicit, which can leave the new surface parked until a later
+          // layout remount happens to reconcile it.
+          focusSurface(match.surfaceId, match.connectionId, true);
         }
       }
     };
@@ -936,6 +936,7 @@ function WorkspaceScreen(props: {
   // null = size to content (capped at half the column); a number pins an
   // explicit fraction after the user drags the handle.
   const [searchHeight, setSearchHeight] = createSignal<number | null>(null);
+  let middleWorkspaceColumn: HTMLDivElement | null = null;
   /** Dismiss the search pane and hand focus back to whatever was using it.
    *  Closing chrome should return you to the thing underneath — otherwise
    *  focus is left on `document.body` and the next keystroke goes nowhere.
@@ -949,7 +950,7 @@ function WorkspaceScreen(props: {
    *  measured share of the column, so the handle does not jump. */
   const autoSearchFraction = () => {
     const el = document.querySelector("[data-yas-search-pane]");
-    const parent = el?.parentElement;
+    const parent = middleWorkspaceColumn;
     return el && parent && parent.clientHeight > 0
       ? el.clientHeight / parent.clientHeight
       : 0.32;
@@ -1859,14 +1860,29 @@ function WorkspaceScreen(props: {
    * list for the first new surface with a matching appId on this connection
    * and place it in the active panel.
    */
-  type PendingAppStart = { connectionId: ConnectionId; appId: string };
+  type PendingAppStart = {
+    connectionId: ConnectionId;
+    appId: string;
+    /** Surface identities present before launch. Metadata for a new surface
+     * can arrive after CREATE; comparing against the previous render would
+     * misclassify that second-stage update as an old window. */
+    existingSurfaceKeys: ReadonlySet<string>;
+  };
   const [pendingAppStart, setPendingAppStart] =
     createSignal<PendingAppStart | null>(null);
   let pendingAppStartTimer: ReturnType<typeof setTimeout> | undefined;
   function startAppFromSwitcher(connectionId: ConnectionId, appId: string) {
     if (pendingAppStartTimer) clearTimeout(pendingAppStartTimer);
     if (!startApplication(connectionId, appId)) return false;
-    setPendingAppStart({ connectionId, appId });
+    setPendingAppStart({
+      connectionId,
+      appId,
+      existingSurfaceKeys: new Set(
+        surfaces().map(
+          (surface) => `${surface.connectionId}:${surface.surfaceId}`,
+        ),
+      ),
+    });
     // If the surface never appears, don't leave this hanging forever.
     pendingAppStartTimer = setTimeout(() => {
       pendingAppStartTimer = undefined;
@@ -3054,8 +3070,12 @@ function WorkspaceScreen(props: {
   /** Open a location as a pane, and remember it. */
   function openWebPane(url: string, connectionId?: string, paneId?: string) {
     const assignment = webAssignment(connectionId ?? activeConnectionId(), url);
-    if (paneId) dropTileIntoPane(assignment, paneId);
-    else openTile(assignment);
+    // Floating mode is one window per assignment. A target pane only names
+    // where the picker was opened; it must not turn creation into replace.
+    if (!showAsFloatingWindow(assignment)) {
+      if (paneId) dropTileIntoPane(assignment, paneId);
+      else openTile(assignment);
+    }
     persistWebLocations(withLocation(webLocations(), url, Date.now()));
   }
 
@@ -3255,12 +3275,11 @@ function WorkspaceScreen(props: {
    * it is empty or toggled off — it is the drop-to-park target, and "nothing
    * parked yet" is exactly when a drag needs somewhere to park.
    */
-  const previewPanelVisible = () =>
-    paneDragActive() ||
-    (previewPanelOpen() &&
-      (offScreenSessions().length > 0 ||
-        offScreenSurfaces().length > 0 ||
-        backgroundTiles().length > 0));
+  // Manual open/close is authoritative. Deriving the panel's existence from
+  // its live contents made its width disappear for one catalog frame when a
+  // terminal exited, then reappear after reconciliation; every floating
+  // window rebased twice and the workspace visibly jumped.
+  const previewPanelVisible = () => paneDragActive() || previewPanelOpen();
   let paneDragDepth = 0;
   const paneDragEnter = (e: DragEvent) => {
     if (!isPaneDrag(e)) return;
@@ -4081,7 +4100,8 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
+    | ((sessionId: SessionId, targetPaneId: string) => void)
+    | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
@@ -4093,6 +4113,10 @@ function WorkspaceScreen(props: {
   let focusPaneFn: ((paneId: string) => void) | null = null;
   let chooseWindowManagerFn: ((manager: WindowManager) => void) | null = null;
   let addFloatingWindowFn: ((assignment: string) => void) | null = null;
+  // Surfaces can arrive during the brief interval in which a floating
+  // LayoutContainer is remounting and has not published its controls yet.
+  // Retain those placements until the replacement container can accept them.
+  const pendingFloatingPlacements = new Set<string>();
   // Drop every LayoutContainer control-fn reference. These close over a specific
   // LayoutContainer instance; when the container unmounts that instance is
   // disposed, so the stale fns must be cleared or a later call would write into
@@ -4117,10 +4141,54 @@ function WorkspaceScreen(props: {
     const shown = Object.entries(layoutAssignments()?.assignments ?? {}).find(
       ([, value]) => value === assignment,
     )?.[0];
-    if (shown) focusPaneFn?.(shown);
-    else addFloatingWindowFn?.(assignment);
+    if (shown) {
+      pendingFloatingPlacements.delete(assignment);
+      focusPaneFn?.(shown);
+      return true;
+    }
+    // Falling back here means "replace the current pane", which is never the
+    // right semantics in floating mode. Queue across the remount instead.
+    if (!addFloatingWindowFn) {
+      pendingFloatingPlacements.add(assignment);
+      return true;
+    }
+    pendingFloatingPlacements.delete(assignment);
+    addFloatingWindowFn(assignment);
     return true;
   }
+
+  // Floating mode models compositor toplevels as windows, so their visibility
+  // must not depend on which launcher happened to create them. The launcher
+  // correlation above is still useful for focus, but a surface started from a
+  // terminal, an extension, or a delayed process gets the same window. Keep
+  // identities once observed so a transient catalogue reset does not duplicate
+  // every pre-existing surface when it reconnects.
+  const knownFloatingSurfaceKeys = new Set(
+    surfaces().map((surface) =>
+      surfaceAssignment(surface.connectionId, surface.surfaceId),
+    ),
+  );
+  let floatingSurfaceBaselineReady = false;
+  createEffect(() => {
+    const current = surfaces();
+    const added: string[] = [];
+    for (const surface of current) {
+      const assignment = surfaceAssignment(
+        surface.connectionId,
+        surface.surfaceId,
+      );
+      if (!knownFloatingSurfaceKeys.has(assignment) && surface.parentId === 0n)
+        added.push(assignment);
+      knownFloatingSurfaceKeys.add(assignment);
+    }
+    if (!floatingSurfaceBaselineReady) {
+      floatingSurfaceBaselineReady = true;
+      return;
+    }
+    if (!inLayout() || windowManagerOf(activeLayout()!.root) !== "floating")
+      return;
+    for (const assignment of added) showAsFloatingWindow(assignment);
+  });
 
   /**
    * Ctrl+B h / Ctrl+B v with no layout on screen: turn the single view into a
@@ -4307,14 +4375,25 @@ function WorkspaceScreen(props: {
     asNewFloatingWindow = false,
   ) {
     setActiveTile(null); // stops displaying the single-view tile; tab stays open
-    // When a layout is active, place the surface into the focused pane.
-    if (activeLayout() && layoutFocusedPaneId()) {
+    const layout = activeLayout();
+    const focusedPaneId = layoutFocusedPaneId();
+    // Resolve the assignment before consulting focus: a freshly remounted
+    // floating layout can have no focused pane for one reactive turn, but a
+    // new application must still append its own window during that turn.
+    if (layout) {
       const connId =
         connectionId ??
         surfaces().find((x) => x.surfaceId === surfaceId)?.connectionId ??
         activeConnectionId();
       const assignment = surfaceAssignment(connId, surfaceId);
       if (asNewFloatingWindow && showAsFloatingWindow(assignment)) {
+        focusSurfaceById(null);
+        previousFocus = null;
+        closeOverlay();
+        return;
+      }
+      // When a layout is active, place the surface into the focused pane.
+      if (!focusedPaneId) {
         focusSurfaceById(null);
         previousFocus = null;
         closeOverlay();
@@ -4333,7 +4412,7 @@ function WorkspaceScreen(props: {
         ([, value]) => value === assignment,
       )?.[0];
       if (shown) focusPaneFn?.(shown);
-      else moveToPaneFn?.(assignment, layoutFocusedPaneId()!);
+      else moveToPaneFn?.(assignment, focusedPaneId);
       focusSurfaceById(null);
     } else {
       focusSurfaceById(surfaceId, connectionId);
@@ -4427,8 +4506,11 @@ function WorkspaceScreen(props: {
         ...(command ? { command } : {}),
         ...(!command && fid && !connectionId ? { cwdFromSessionId: fid } : {}),
       });
-      focusSurfaceById(null);
-      setActiveTile(null); // stops displaying the single-view tile; tab stays open
+      if (!showAsFloatingWindow(session.id)) {
+        focusSurfaceById(null);
+        // Stops displaying the single-view tile; the tab stays open.
+        setActiveTile(null);
+      }
       retainMainTerminalRef(session.id);
       workspace.focusSession(session.id);
       previousFocus = null;
@@ -4452,7 +4534,9 @@ function WorkspaceScreen(props: {
       });
       focusSurfaceById(null);
       setActiveTile(null);
-      moveSessionToPaneFn?.(session.id, preferredTilePane());
+      if (!showAsFloatingWindow(session.id)) {
+        moveSessionToPaneFn?.(session.id, preferredTilePane());
+      }
       retainMainTerminalRef(session.id);
       workspace.focusSession(session.id);
     } catch {}
@@ -4477,7 +4561,9 @@ function WorkspaceScreen(props: {
         ...(command ? { command } : {}),
         ...(!command && fid && !connectionId ? { cwdFromSessionId: fid } : {}),
       });
-      moveSessionToPaneFn?.(session.id, paneId);
+      if (!showAsFloatingWindow(session.id)) {
+        moveSessionToPaneFn?.(session.id, paneId);
+      }
       retainMainTerminalRef(session.id);
       workspace.focusSession(session.id);
     } catch {}
@@ -4998,56 +5084,71 @@ function WorkspaceScreen(props: {
               renderBody={panelBody}
             />
           </Show>
-          {/* The middle column, with the docks flanking it: project
-              search is a top pane *here*, so the left dock and the preview
-              panel keep their full height beside it rather than being
-              pushed down by it. */}
+          {/* The middle column, with the docks flanking it. Project search is
+              absolutely overlaid inside this box so opening it cannot resize
+              the workspace, while both docks retain their full height. */}
           <div
+            ref={(element) => (middleWorkspaceColumn = element)}
             style={{
               flex: 1,
               "min-width": 0,
               display: "flex",
               "flex-direction": "column",
               overflow: "hidden",
+              position: "relative",
             }}
           >
             <Show when={searchOpen()}>
-              <section
-                data-yas-search-pane
+              <div
                 style={{
-                  // Auto by default — the pane is as tall as its results,
-                  // capped at half the column so it can never swallow what
-                  // you are searching. Dragging the handle pins an explicit
-                  // fraction and drops the cap.
-                  ...(searchHeight() == null
-                    ? { flex: "0 1 auto", "max-height": "50%" }
-                    : { flex: `0 0 ${(searchHeight()! * 100).toFixed(1)}%` }),
-                  // No floor: an empty query should be exactly the input
-                  // row, not a box with blank lines under it. Dragging the
-                  // handle pins a height and can still shrink it away.
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  "z-index": z.exitedBanner,
                   display: "flex",
                   "flex-direction": "column",
-                  overflow: "hidden",
-                  background: theme().bg,
+                  ...(searchHeight() == null
+                    ? { height: "auto", "max-height": "50%" }
+                    : { height: `${(searchHeight()! * 100).toFixed(1)}%` }),
                 }}
               >
-                <SearchPanel
-                  {...leftPanelProps}
-                  focusNonce={searchFocus()}
-                  onClose={closeSearch}
+                <section
+                  data-yas-search-pane
+                  style={{
+                    // This is visual chrome over the workspace, not a flex
+                    // sibling of it. Opening search must never renegotiate a
+                    // terminal grid or a native surface size.
+                    flex: searchHeight() == null ? "0 1 auto" : 1,
+                    "min-height": 0,
+                    display: "flex",
+                    "flex-direction": "column",
+                    overflow: "hidden",
+                    background: theme().bg,
+                  }}
+                >
+                  <SearchPanel
+                    {...leftPanelProps}
+                    focusNonce={searchFocus()}
+                    onClose={closeSearch}
+                  />
+                </section>
+                <ResizeHandle
+                  direction="vertical"
+                  measureElement={() => middleWorkspaceColumn}
+                  onDrag={(fraction) =>
+                    setSearchHeight((cur) =>
+                      Math.min(
+                        0.9,
+                        Math.max(
+                          0.08,
+                          (cur ?? autoSearchFraction()) + fraction,
+                        ),
+                      ),
+                    )
+                  }
                 />
-              </section>
-              <ResizeHandle
-                direction="vertical"
-                onDrag={(fraction) =>
-                  setSearchHeight((cur) =>
-                    Math.min(
-                      0.9,
-                      Math.max(0.08, (cur ?? autoSearchFraction()) + fraction),
-                    ),
-                  )
-                }
-              />
+              </div>
             </Show>
             <div
               data-yas-workspace-focus-owner={
@@ -5378,6 +5479,16 @@ function WorkspaceScreen(props: {
                     }}
                     onAddFloatingWindow={(fn) => {
                       addFloatingWindowFn = fn;
+                      const layout = activeLayout();
+                      if (
+                        layout &&
+                        windowManagerOf(layout.root) === "floating"
+                      ) {
+                        for (const assignment of pendingFloatingPlacements) {
+                          fn(assignment);
+                        }
+                        pendingFloatingPlacements.clear();
+                      }
                     }}
                     onMoveSessionToPane={(fn) => {
                       moveSessionToPaneFn = fn;

@@ -782,6 +782,7 @@ export const YAS_MEDIA_PORTAL_REQUEST = 16 as const;
 export const YAS_MEDIA_FRAME = 32 as const;
 export const YAS_MEDIA_FRAME_ACK = 33 as const;
 export const YAS_MEDIA_STREAM_STATUS = 34 as const;
+export const YAS_MEDIA_PLAYOUT_REPORT = 35 as const;
 export const YAS_MEDIA_KIND_AUDIO_OUTPUT = 0 as const;
 export const YAS_MEDIA_KIND_MICROPHONE = 1 as const;
 export const YAS_MEDIA_KIND_CAMERA = 2 as const;
@@ -2403,6 +2404,7 @@ export const YAS_OPERATION_POLICIES: Readonly<Record<string, YasOperationPolicy>
   "35/0/32": [1, 2, 3],
   "35/0/33": [1, 0, 0],
   "35/0/34": [1, 0, 0],
+  "35/0/35": [1, 0, 0],
   "36/1/0": [0, 0, 0],
   "36/2/0": [0, 0, 0],
   "36/1/1": [0, 0, 0],
@@ -2703,6 +2705,7 @@ export const YAS_OPERATION_DIRECTION_MASKS: Readonly<Record<string, number>> = {
   "35/0/32": 3,
   "35/0/33": 3,
   "35/0/34": 2,
+  "35/0/35": 1,
   "36/1/0": 1,
   "36/1/1": 1,
   "36/1/2": 1,
@@ -6781,6 +6784,15 @@ export const YAS_SCHEMA = {
           "compression": "allowed",
           "datagram": "forbidden",
           "layout": "stream_handle:u64,revision:u64,status:u16,flags:u16,codec_config:bytes_u32,Extensions"
+        },
+        {
+          "name": "PLAYOUT_REPORT",
+          "kind": 35,
+          "direction": "client_to_server",
+          "sensitive": "required",
+          "compression": "allowed",
+          "datagram": "forbidden",
+          "layout": "stream_handle:u64,consumed_sequence:u64,audio_video_delay_ns:u64; measured client-side difference between audible audio and visible video presentation latency"
         }
       ],
       "types": [
@@ -14501,6 +14513,10 @@ export const YAS_GOLDEN_VECTORS = {
     {
       "name": "yas.media.event.stream_status.header",
       "hex": "2300220008"
+    },
+    {
+      "name": "yas.media.event.playout_report.header",
+      "hex": "2300230008"
     },
     {
       "name": "yas.font.request.watch.header",

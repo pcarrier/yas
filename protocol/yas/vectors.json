@@ -482,6 +482,10 @@
       "hex": "2300220008"
     },
     {
+      "name": "yas.media.event.playout_report.header",
+      "hex": "2300230008"
+    },
+    {
       "name": "yas.font.request.watch.header",
       "hex": "240000000101000000"
     },

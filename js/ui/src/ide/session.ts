@@ -75,18 +75,12 @@ import {
 } from "./followTerminal";
 import { settledWithoutRepo } from "./gitPresence";
 import { selectIdeSessionForDisplay } from "./ideSessionDisplay";
+import { isSyncLimitError } from "./syncErrors";
+export { isSyncLimitError } from "./syncErrors";
 
 /** Ceiling on consecutive transient open-retries — see the per-session
  *  counters. Generous: a real reconnect needs one. */
 const MAX_OPEN_RETRIES = 20;
-
-/** The per-connection sync cap refused us (docs/design/fs-watch.md
- *  budgets). Transient in practice — slots free as idle warm sessions
- *  expire and dock cards close — so openers re-attempt on a timer. */
-export function isSyncLimitError(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e);
-  return /resource limit/i.test(msg);
-}
 
 /** A `GIT_CLOSED` reason, for the panels that have to explain it. */
 function gitClosedText(reason: number): string {
@@ -508,7 +502,7 @@ function buildSession(
           // The per-connection sync cap is transient in practice: slots
           // free as idle warm sessions expire and dock cards close. Show
           // the error but keep re-attempting instead of bricking the tree.
-          setFsError(e instanceof Error ? e.message : String(e));
+          setFsError("Filesystem capacity reached; retrying…");
           retryTimer = setTimeout(() => setFsRetry((n) => n + 1), 3000);
         } else if (isSourceTerminalUnavailableError(e)) {
           // The focused terminal exited between choosing the dock root and

@@ -3566,6 +3566,23 @@
       "sensitive": "required"
     },
     {
+      "class": "event",
+      "class_id": 0,
+      "compression": "allowed",
+      "correlated": false,
+      "datagram": "forbidden",
+      "direction": "client_to_server",
+      "family": 35,
+      "family_name": "yas.media",
+      "family_version": 1,
+      "header_bytes": 5,
+      "key": "35/0/35",
+      "kind": 35,
+      "layout": "stream_handle:u64,consumed_sequence:u64,audio_video_delay_ns:u64; measured client-side difference between audible audio and visible video presentation latency",
+      "name": "PLAYOUT_REPORT",
+      "sensitive": "required"
+    },
+    {
       "class": "request",
       "class_id": 1,
       "compression": "allowed",

@@ -97,7 +97,6 @@ type DebugStats = {
     outputLatencyMs: number;
     baseLatencyMs: number;
     sampleRate: number;
-    deviceFloorMs: number;
     received: number;
     decoded: number;
     fastPath: string;
@@ -352,6 +351,27 @@ export function StatusBar(props: {
     }
     return { ok, busy, bad };
   };
+  const connectionRttRange = createMemo(() => {
+    let minimum: number | null = null;
+    let maximum: number | null = null;
+    for (const connection of props.connections) {
+      if (
+        connection.status !== "connected" ||
+        typeof connection.rttMs !== "number"
+      )
+        continue;
+      minimum = Math.min(minimum ?? Infinity, connection.rttMs);
+      maximum = Math.max(maximum ?? 0, connection.rttMs);
+    }
+    return minimum === null || maximum === null ? null : { minimum, maximum };
+  });
+  const connectionRttText = createMemo(() => {
+    const range = connectionRttRange();
+    if (!range) return null;
+    const minimum = Math.round(range.minimum);
+    const maximum = Math.round(range.maximum);
+    return minimum === maximum ? `${minimum} ms` : `${minimum}–${maximum} ms`;
+  });
 
   // Worst status across all connections (for aria)
   const worstStatus = () => connectionStatusLabel(props.status);
@@ -818,6 +838,21 @@ export function StatusBar(props: {
               size={dotSize()}
             />
           </Show>
+          <Show when={connectionRttRange()}>
+            {(range) => (
+              <span
+                data-yas-connection-rtt=""
+                title={`${range().minimum.toFixed(1)}–${range().maximum.toFixed(1)} ms RTT`}
+                style={{
+                  "font-size": `${scale().xs}px`,
+                  "font-variant-numeric": "tabular-nums",
+                  "white-space": "nowrap",
+                }}
+              >
+                {connectionRttText()}
+              </span>
+            )}
+          </Show>
         </button>
 
         <Show when={connectionOpen() && !props.onRemotes}>
@@ -981,6 +1016,14 @@ function ConnectionStatusPopover(props: {
                 }}
               >
                 {connectionStatusText(connection)}
+                <Show
+                  when={
+                    connection.status === "connected" &&
+                    typeof connection.rttMs === "number"
+                  }
+                >
+                  {` · ${Math.round(connection.rttMs!)} ms`}
+                </Show>
               </span>
             </div>
 
@@ -1792,17 +1835,12 @@ function DebugPanel(props: {
               label="Audio dropped"
               value={`${audio().skips} skips (${audio().skippedMs} ms) · ${audio().resets} pipeline resets`}
             />
-            {/* Which sink produced the numbers above. A wired device reports
-                single-digit output latency; Bluetooth reports hundreds of ms
-                and asks for audio in bites that large, which a 60 ms target
-                cannot survive. Without this the two cases are indistinguishable
-                in the rows above. */}
             <Row
               label="Audio output"
               value={
                 audio().sampleRate === 0
                   ? "no context"
-                  : `${audio().outputLatencyMs} ms out, ${audio().baseLatencyMs} ms base · ${audio().sampleRate} Hz · floor ${audio().deviceFloorMs} ms`
+                  : `${audio().outputLatencyMs} ms out, ${audio().baseLatencyMs} ms base · ${audio().sampleRate} Hz`
               }
             />
           </>

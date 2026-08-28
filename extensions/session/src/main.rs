@@ -159,22 +159,15 @@ const MAX_ICON_REQUEST: usize = 48;
 
 /// Resolved icon paths kept in the guest before the cache is dropped wholesale.
 ///
-/// Measured in bytes rather than entries because the entries are not
-/// comparable: a themed SVG is 3 KB and a 128px PNG can be [`icon::MAX_ICON_BYTES`],
-/// so any count that is safe for the second is uselessly small for the first.
-/// Base64 art is by far the largest thing this extension holds, and a session
-/// whose operator scrolls a thousand-entry catalog would otherwise accumulate
-/// all of it.
-///
-/// Clearing rather than evicting the oldest entry keeps the bookkeeping to a
-/// comparison: a miss costs one shell round trip, and the panel has its own
-/// cache, so nothing already on screen pays for it.
-///
-/// Large enough to hold one whole request — [`MAX_ICON_REQUEST`] files of
-/// [`icon::MAX_ICON_BYTES`] come to about 8 MiB once base64 has grown them by a
-/// third. Below that a single scroll of big artwork is guaranteed to clear the
-/// cache it is still filling, which costs a re-read of everything it just did.
+/// These are paths, not artwork bytes. The byte bound is simply a hard ceiling
+/// for a hostile catalog containing distinct maximum-length `Icon=` values.
 const MAX_CACHED_ICON_BYTES: usize = 12 * 1024 * 1024;
+
+/// Maximum files one indexed application/theme tree can contribute.
+///
+/// This bounds both the native FS walk and the icon replies retained for one
+/// browser, so accepting a complete catalog cannot overflow its reply queue.
+const MAX_CATALOG_ENTRIES: usize = 65_536;
 
 /// GUI diagnostics are consumed and discarded as they arrive. A small
 /// replenished window prevents every open application from pinning the guest
@@ -182,15 +175,15 @@ const MAX_CACHED_ICON_BYTES: usize = 12 * 1024 * 1024;
 const APP_PROCESS_STREAM_WINDOW: u64 = 64 * 1024;
 const APP_DIAGNOSTIC_BYTES: usize = 4096;
 
-/// Icon messages a connection may have waiting on credit.
+/// Icon-path replies a connection may have waiting on credit.
 ///
-/// Icons are queued rather than dropped, because unlike state nothing provokes
-/// a repeat: a dropped one leaves a placeholder until the panel asks again. Two
-/// full requests' worth, so an ordinary scroll never reaches it, and a panel
-/// that has stopped acking altogether still cannot grow the guest without
-/// limit. What is dropped past here the panel re-asks for, once it stops
-/// counting the id as outstanding.
-const MAX_QUEUED_ICONS: usize = 128;
+/// These used to contain base64 artwork and the old limit of 128 was sensible.
+/// They now contain only an id and a native path. Keeping that stale limit
+/// silently discarded replies when a catalog shelf was prefetched; the panel
+/// then waited for its eight-second lost-request timeout before filling the
+/// remaining rows. One complete bounded catalog is cheap and, importantly,
+/// means every accepted request gets an answer.
+const MAX_QUEUED_ICONS: usize = MAX_CATALOG_ENTRIES;
 
 /// One browser connected to [`CHANNEL_NAME`].
 struct Conn {
@@ -251,11 +244,14 @@ struct State {
     /// found the catalog. Empty until that read happens.
     icon_theme_roots: Vec<String>,
     icon_flat_roots: Vec<String>,
-    /// Every directory an icon could be in, best-first. Expanding the roots'
-    /// globs is the one part of a lookup that does not depend on what is being
-    /// looked up, so it is done once and reused; a catalog refresh clears it,
-    /// because that is when a newly installed theme would show up.
-    icon_dirs: Vec<String>,
+    /// Best path for every indexed icon name. Native INDEX walks the icon
+    /// roots once; launcher requests are then in-memory lookups rather than a
+    /// cross-product of every visible row and every theme directory.
+    icon_paths: BTreeMap<String, String>,
+    /// Whether the path walk has completed, including a valid empty result.
+    /// Testing `icon_paths.is_empty()` made every request repeat the complete
+    /// theme walk on hosts whose roots contained no drawable icons.
+    icon_paths_indexed: bool,
     /// Resolved artwork, keyed by the `Icon=` value rather than by application
     /// id — a desktop and its `-nightly` twin share a key, and so do the dozens
     /// of entries that all say `application-x-executable`.
@@ -317,7 +313,8 @@ fn run(mut client: Client) -> Result<(), Error> {
             installed_at_ns: None,
             icon_theme_roots: Vec::new(),
             icon_flat_roots: Vec::new(),
-            icon_dirs: Vec::new(),
+            icon_paths: BTreeMap::new(),
+            icon_paths_indexed: false,
             icons: BTreeMap::new(),
             icon_bytes: 0,
             surface_apps: BTreeMap::new(),
@@ -535,22 +532,11 @@ fn batch_answers(
         .collect()
 }
 
-/// Answer a panel's icon request, reading whatever is not already cached.
+/// Answer a panel's icon request from the retained path index.
 ///
-/// One child for the whole batch, and it does the searching and the reading
-/// together — see [`icon::fetch_script`]. Deliberately *not* preceded by a
-/// catalog refresh: the ids came out of the catalog the panel already holds, so
-/// the only thing rereading it could add is a random half-second stall in the
-/// middle of a scroll. An id this does not recognise is answered "no artwork",
-/// which is what it will be until the panel resyncs anyway.
-///
-/// What this batch resolved is held here and answered from here, never read back
-/// out of [`State::icons`]: that cache is dropped wholesale when it grows past
-/// [`MAX_CACHED_ICON_BYTES`], and at [`icon::MAX_ICON_BYTES`] per file it can
-/// hit that limit *part way through one batch*. Answering from it afterwards
-/// reported every icon cached before the drop as "no artwork" — which the panel
-/// believes forever, so a scrolled list grew a permanent gap exactly one
-/// cache-worth long, and the row after it was fine.
+/// What this batch resolved is held locally and answered from there, never read
+/// back out of [`State::icons`]: that cache may be dropped part way through one
+/// hostile maximum-length request.
 fn resolve_icons(
     client: &mut Client,
     state: &mut State,
@@ -589,56 +575,14 @@ fn resolve_icons(
         }
     }
 
-    // One exhaustive native query per bounded name chunk. Staging the ranked
-    // directories saved cheap local stats but inserted a host round trip after
-    // every stage; one missing icon then held all the already-found artwork
-    // behind that serial tail. The launcher wants the complete small shelf now.
+    // Theme roots are indexed once when the panel connects. A visible shelf is
+    // therefore a set of map lookups, not thousands of serial STAT questions.
     if !lookups.is_empty() {
-        refresh_icon_dirs(client, state);
-        let dirs = state.icon_dirs.clone();
-        if dirs.is_empty() {
-            for name in &lookups {
-                state.cache_icon(name.clone(), None);
-                resolved.insert(name.clone(), None);
-            }
-        } else {
-            let mut complete = true;
-            let per_message = (wire::fs::MAX_QUERY_RECORDS / (dirs.len() * 2).max(1)).max(1);
-            for names in lookups.chunks(per_message) {
-                let candidates: Vec<Vec<String>> = names
-                    .iter()
-                    .map(|name| icon::candidates(&dirs, name))
-                    .collect();
-                let groups: Vec<Vec<&str>> = candidates
-                    .iter()
-                    .map(|paths| paths.iter().map(String::as_str).collect())
-                    .collect();
-                let borrowed: Vec<&[&str]> = groups.iter().map(Vec::as_slice).collect();
-                // Which file, not what is in it: the panel reads the bytes
-                // itself, so these are STAT questions and carry no artwork.
-                let Some(records) =
-                    fs_read(client, ReadMode::FirstStat, icon::MAX_ICON_BYTES, &borrowed)
-                else {
-                    complete = false;
-                    break;
-                };
-                for (name, (found, path, _)) in names.iter().zip(records) {
-                    if found && icon::is_drawable_path(&path) {
-                        state.cache_icon(name.clone(), Some(path.clone()));
-                        resolved.insert(name.clone(), Some(path));
-                    }
-                }
-            }
-            // Only an exhaustive search proves that a name has no artwork. A
-            // transport failure leaves it unanswered so the panel retries it.
-            if complete {
-                for name in &lookups {
-                    if !resolved.contains_key(name) {
-                        state.cache_icon(name.clone(), None);
-                        resolved.insert(name.clone(), None);
-                    }
-                }
-            }
+        refresh_icon_paths(client, state);
+        for name in &lookups {
+            let found = state.icon_paths.get(name).cloned();
+            state.cache_icon(name.clone(), found.clone());
+            resolved.insert(name.clone(), found);
         }
     }
 
@@ -665,39 +609,36 @@ fn resolve_icons(
     batch_answers(keys, &resolved)
 }
 
-/// Expand the icon path's globs into a ranked directory list, once.
-///
-/// The list is the same whatever is being looked up, and expanding it is the
-/// expensive half of a lookup — a dozen roots, each with two globs — so a batch
-/// that had to redo it would pay for the whole icon path to answer one name.
-fn refresh_icon_dirs(client: &mut Client, state: &mut State) {
-    if !state.icon_dirs.is_empty() {
+/// Index the icon path once and retain its best path per name.
+fn refresh_icon_paths(client: &mut Client, state: &mut State) {
+    if state.icon_paths_indexed {
         return;
     }
     let theme_roots = state.icon_theme_roots.clone();
-    let mut dirs: Vec<String> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
     for root in icon_index_roots(client, &theme_roots) {
-        // Directories only: an icon theme is a few dozen directories holding
-        // tens of thousands of files, and this wants somewhere to look.
-        let Some(indexed) = fs_index(client, &root, IndexKind::Directories) else {
+        let Some(indexed) = fs_index(client, &root) else {
             continue;
         };
         for rel in indexed {
-            if icon::is_icon_dir(&rel) {
-                dirs.push(format!("{root}/{rel}"));
+            let parent = rel.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if icon::is_icon_dir(parent) && icon::is_drawable_path(&rel) {
+                paths.push(format!("{root}/{rel}"));
             }
         }
     }
-    // Pixmaps is flat — the name sits directly in it — so it is a candidate
-    // without a listing. One that does not exist costs a stat per lookup and
-    // answers nothing, which is the same as not being there.
-    dirs.extend(state.icon_flat_roots.iter().cloned());
-    let borrowed: Vec<&str> = dirs.iter().map(String::as_str).collect();
-    let mut seen = BTreeSet::new();
-    state.icon_dirs = icon::rank_directories(&borrowed)
-        .into_iter()
-        .filter(|dir| seen.insert(dir.clone()))
-        .collect();
+    for root in state.icon_flat_roots.clone() {
+        let Some(indexed) = fs_index(client, &root) else {
+            continue;
+        };
+        for rel in indexed {
+            if !rel.contains('/') && icon::is_drawable_path(&rel) {
+                paths.push(format!("{root}/{rel}"));
+            }
+        }
+    }
+    state.icon_paths = icon::path_index(&paths);
+    state.icon_paths_indexed = true;
 }
 
 /// Roots safe for recursive icon-directory indexing.
@@ -709,22 +650,46 @@ fn refresh_icon_dirs(client: &mut Client, state: &mut State) {
 /// and index its target, as required by the FS contract. Resolving the XDG root
 /// itself also covers profiles whose final `icons` component is a link.
 fn icon_index_roots(client: &mut Client, roots: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(roots.len() * 4);
+    let mut candidates = Vec::with_capacity(roots.len() * 2);
     let mut seen = BTreeSet::new();
     for root in roots {
         let fallback = format!("{root}/hicolor");
         for candidate in [root.as_str(), fallback.as_str()] {
             if seen.insert(candidate.to_string()) {
-                out.push(candidate.to_string());
-            }
-            if let Some(resolved) = fs_link_target(client, candidate)
-                && seen.insert(resolved.clone())
-            {
-                out.push(resolved);
+                candidates.push(candidate.to_string());
             }
         }
     }
-    out
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // LINK_TARGET and existence checks are each one batched native request.
+    // The old per-candidate probes spent dozens of guest scheduling turns
+    // before the first icon lookup could even begin.
+    let borrowed: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let links = fs_read(client, ReadMode::LinkTarget, 4096, &[borrowed.as_slice()]);
+    let mut resolved = Vec::with_capacity(candidates.len());
+    let mut seen = BTreeSet::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let path = links
+            .as_ref()
+            .and_then(|records| records.get(index))
+            .filter(|record| record.0)
+            .and_then(|record| resolve_symlink_target(candidate, &record.2))
+            .unwrap_or_else(|| candidate.clone());
+        if seen.insert(path.clone()) {
+            resolved.push(path);
+        }
+    }
+    let borrowed: Vec<&str> = resolved.iter().map(String::as_str).collect();
+    let Some(records) = fs_read(client, ReadMode::Stat, u32::MAX, &[borrowed.as_slice()]) else {
+        return Vec::new();
+    };
+    records
+        .into_iter()
+        .filter_map(|(found, path, _)| found.then_some(path))
+        .collect()
 }
 
 /// Send one JSON message to one connection, respecting its credit.
@@ -763,9 +728,9 @@ fn send_json(client: &mut Client, conn: &mut Conn, payload: &str) -> bool {
 /// icons to rows by id, but a viewer watching them appear should see them in
 /// the order they were asked for.
 fn flush_queued(client: &mut Client, conn: &mut Conn) {
-    // Taken rather than cloned, and drained once at the end: a queued icon is
-    // 30 KB, so copying each one to send it — and memmoving the rest of the
-    // queue after every send — was pure overhead on the path that matters.
+    // Taken rather than cloned, and drained once at the end: copying each
+    // reply to send it and memmoving the rest after every send is avoidable
+    // overhead on the path that matters.
     let mut sent = 0;
     while sent < conn.queued.len() {
         let payload = core::mem::take(&mut conn.queued[sent]);
@@ -856,7 +821,7 @@ fn accept_panel(client: &mut Client, state: &mut State, channel: Channel) {
     // The greeting goes first: catalog availability is not held behind this
     // optimization, and any unusually early icon request simply waits in the
     // channel while the one-time native INDEX finishes.
-    refresh_icon_dirs(client, state);
+    refresh_icon_paths(client, state);
 }
 
 /// Apply one complete panel command after the Channel helper has consumed and
@@ -1606,7 +1571,8 @@ fn refresh_installed(client: &mut Client, state: &mut State) -> Result<(), Error
     state.icon_flat_roots = flat_roots;
     // A package installed mid-session can bring a theme with it, and this read
     // is the moment that becomes visible.
-    state.icon_dirs.clear();
+    state.icon_paths.clear();
+    state.icon_paths_indexed = false;
     state.icons.clear();
     state.icon_bytes = 0;
 
@@ -1670,7 +1636,7 @@ fn read_desktop_files(client: &mut Client, roots: &[String]) -> Option<Vec<(Stri
     let mut out = Vec::new();
     for root in roots {
         // Root-relative, so a nested `kde4/foo.desktop` keeps its subdirectory.
-        let entries: Vec<String> = fs_index(client, root, IndexKind::Files)?
+        let entries: Vec<String> = fs_index(client, root)?
             .into_iter()
             .filter(|rel| rel.ends_with(".desktop"))
             .map(|rel| format!("{root}/{rel}"))
@@ -1704,22 +1670,9 @@ fn read_desktop_files(client: &mut Client, roots: &[String]) -> Option<Vec<(Stri
 /// away — which is the only case a caller has to treat as "ask again later".
 #[derive(Clone, Copy)]
 enum ReadMode {
-    FirstStat,
     Stat,
     LinkTarget,
     Content,
-}
-
-/// Resolve one absolute symlink through READ_LINK_TARGET.
-fn fs_link_target(client: &mut Client, link: &str) -> Option<String> {
-    let paths = [link];
-    let groups = [paths.as_slice()];
-    let (found, _, target) = fs_read(client, ReadMode::LinkTarget, 4096, &groups)?
-        .into_iter()
-        .next()?;
-    found
-        .then(|| resolve_symlink_target(link, &target))
-        .flatten()
 }
 
 /// Turn an absolute or link-relative Unix symlink target into an absolute path.
@@ -1782,7 +1735,7 @@ fn fs_read(
                 kind: match mode {
                     ReadMode::Content => wire::schema::fs::READ_CONTENT as u16,
                     ReadMode::LinkTarget => wire::schema::fs::READ_LINK_TARGET as u16,
-                    ReadMode::FirstStat | ReadMode::Stat => wire::schema::fs::READ_STAT as u16,
+                    ReadMode::Stat => wire::schema::fs::READ_STAT as u16,
                 },
                 flags: 0,
                 path: path_value,
@@ -1821,52 +1774,22 @@ fn fs_read(
         ));
     }
 
-    match mode {
-        ReadMode::FirstStat => {
-            let mut grouped = Vec::with_capacity(groups.len());
-            for (group, paths) in groups.iter().enumerate() {
-                let first = flattened
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (candidate_group, _))| *candidate_group == group)
-                    .find_map(|(index, _)| answers[index].clone().filter(|answer| answer.0))
-                    .or_else(|| {
-                        paths
-                            .first()
-                            .map(|path| (false, (*path).to_string(), Vec::new()))
-                    });
-                if let Some(answer) = first {
-                    grouped.push(answer);
-                }
-            }
-            Some(grouped)
-        }
-        ReadMode::Stat | ReadMode::LinkTarget | ReadMode::Content => Some(
-            flattened
-                .into_iter()
-                .enumerate()
-                .map(|(index, (_, path))| {
-                    answers[index].clone().unwrap_or((false, path, Vec::new()))
-                })
-                .collect(),
-        ),
-    }
+    Some(
+        flattened
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, path))| answers[index].clone().unwrap_or((false, path, Vec::new())))
+            .collect(),
+    )
 }
 
-/// Everything under `root`, root-relative: its files, or its directories.
+/// Every file under `root`, root-relative.
 ///
 /// The walk is the server's native FS INDEX, which is what makes a directory
 /// listing a message rather than a glob. A truncated answer is used as far as it
 /// goes: for both callers here that means some applications or some themes, not
 /// a wrong answer.
-#[derive(Clone, Copy)]
-enum IndexKind {
-    Files,
-    Directories,
-}
-
-fn fs_index(client: &mut Client, root_path: &str, kind: IndexKind) -> Option<Vec<String>> {
-    const MAX_INDEX_PATHS: usize = 65_536;
+fn fs_index(client: &mut Client, root_path: &str) -> Option<Vec<String>> {
     let mut root = match client.open_fs(
         wire::fs::RootSource::PlatformPath(root_path.as_bytes().to_vec()),
         0,
@@ -1886,10 +1809,7 @@ fn fs_index(client: &mut Client, root_path: &str, kind: IndexKind) -> Option<Vec
             };
         }
     };
-    let flags = match kind {
-        IndexKind::Files => wire::schema::fs::INDEX_INCLUDE_FILES as u16,
-        IndexKind::Directories => wire::schema::fs::INDEX_INCLUDE_DIRECTORIES as u16,
-    };
+    let flags = wire::schema::fs::INDEX_INCLUDE_FILES as u16;
     let mut cursor = Vec::new();
     let mut out = Vec::new();
     let complete = loop {
@@ -1916,11 +1836,13 @@ fn fs_index(client: &mut Client, root_path: &str, kind: IndexKind) -> Option<Vec
             if !path.is_empty() {
                 out.push(path);
             }
-            if out.len() >= MAX_INDEX_PATHS {
+            if out.len() >= MAX_CATALOG_ENTRIES {
                 break;
             }
         }
-        if out.len() >= MAX_INDEX_PATHS || page.next_cursor.is_empty() || page.next_cursor == cursor
+        if out.len() >= MAX_CATALOG_ENTRIES
+            || page.next_cursor.is_empty()
+            || page.next_cursor == cursor
         {
             break true;
         }

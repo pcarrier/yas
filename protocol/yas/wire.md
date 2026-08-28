@@ -485,6 +485,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | `0x0020` | `FRAME` | `bidirectional` | `required` | `forbidden` | `media_frame` | stream_handle:u64,sequence:u64,capture_time:u64,presentation_time:u64,codec_version:u16,flags:u16,fragment_index:u16,fragment_count:u16,complete_len:u32,payload:remaining; audio capture_time and nonzero presentation_time are sample positions at the selected MediaFormat.sample_rate from the server media-session epoch, while video values are nanoseconds from that same epoch; presentation_time 0 means use capture_time |
 | `0x0021` | `FRAME_ACK` | `bidirectional` | `required` | `allowed` | `forbidden` | stream_handle:u64,consumed_sequence:u64,queue_depth:u16,desired_credit_frames:u16 |
 | `0x0022` | `STREAM_STATUS` | `server_to_client` | `required` | `allowed` | `forbidden` | stream_handle:u64,revision:u64,status:u16,flags:u16,codec_config:bytes_u32,Extensions |
+| `0x0023` | `PLAYOUT_REPORT` | `client_to_server` | `required` | `allowed` | `forbidden` | stream_handle:u64,consumed_sequence:u64,audio_video_delay_ns:u64; measured client-side difference between audible audio and visible video presentation latency |
 
 ### Limits
 

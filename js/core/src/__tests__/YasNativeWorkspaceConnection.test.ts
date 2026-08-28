@@ -99,6 +99,7 @@ function surfaceTestConnection(openView: ReturnType<typeof vi.fn>) {
     surfaceViewSizes: new Map(),
     views: new Map(),
     session: { ready: true },
+    listeners: new Set(),
     surfaceStore: { handleSurfaceEncoder: vi.fn() },
   });
   return {
@@ -113,6 +114,7 @@ function surfaceTestConnection(openView: ReturnType<typeof vi.fn>) {
         { promise: Promise<void>; cancelled: boolean }
       >;
       surfaceViews: Map<bigint, unknown>;
+      applySurfaceCatalog(records: readonly unknown[]): void;
     },
   };
 }
@@ -1151,6 +1153,7 @@ describe("YasNativeWorkspaceConnection", () => {
     ) as YasNativeWorkspaceConnection;
     Object.assign(connection as object, {
       surfaceRecords: new Map(),
+      surfaceMounts: new Map(),
       surfaceStore: {
         handleSurfaceCreated,
         handleSurfaceResized,
@@ -1195,6 +1198,52 @@ describe("YasNativeWorkspaceConnection", () => {
       { ...record, compositeWidth: 800, compositeHeight: 600 },
     ]);
     expect(handleSurfaceResized).toHaveBeenCalledWith(1n, 800, 600, 800, 600);
+  });
+
+  it("opens a desired Surface view when its catalogue record arrives", async () => {
+    const view = surfaceTestView(YAS_SURFACE_CODEC_AV1_V1);
+    const openView = vi.fn().mockResolvedValue(view);
+    const { connection, lifecycle } = surfaceTestConnection(openView);
+    (
+      connection as unknown as {
+        surfaceRecords: Map<bigint, unknown>;
+        surfaceStore: Record<string, unknown>;
+      }
+    ).surfaceRecords.clear();
+    Object.assign(
+      (
+        connection as unknown as {
+          surfaceStore: Record<string, unknown>;
+        }
+      ).surfaceStore,
+      {
+        handleSurfaceCreated: vi.fn(),
+        handleSurfaceResized: vi.fn(),
+        handleSurfaceDestroyed: vi.fn(),
+        handleSurfaceTitle: vi.fn(),
+        handleSurfaceAppId: vi.fn(),
+      },
+    );
+
+    lifecycle.applySurfaceCatalog([
+      {
+        surfaceHandle: 1n,
+        revision: 1n,
+        parentHandle: 0n,
+        appHandle: 0n,
+        lifecycle: 0,
+        compositeWidth: 1280,
+        compositeHeight: 960,
+        logicalWidth32_32: 640n << 32n,
+        logicalHeight32_32: 480n << 32n,
+        applicationId: "brave-browser",
+        title: "Brave",
+        extensions: [],
+      },
+    ]);
+
+    await vi.waitFor(() => expect(openView).toHaveBeenCalledOnce());
+    expect(lifecycle.surfaceViews.has(1n)).toBe(true);
   });
 
   it("opens an unscaled HiDPI Surface view at physical size and display rate", async () => {

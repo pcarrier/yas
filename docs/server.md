@@ -571,7 +571,9 @@ fallback, and Media sequencing and credit rules are unchanged.
 
 1. **Decode**: WebCodecs `AudioDecoder` with `codec: "opus"`, 48 kHz stereo, running in a dedicated Worker that also owns the worklet's `MessagePort` (transferred). Decoded `AudioData` frames (f32 planar PCM) go Worker → audio thread directly, so main-thread stalls from heavy video (decode callbacks, full-screen draws) can't starve the jitter buffer; the main thread only relays the tiny encoded frames. Falls back to inline main-thread decode when Workers or in-worker WebCodecs are unavailable.
 2. **Render**: An `AudioWorkletProcessor` maintains an adaptive jitter buffer — floor 60 ms / 2880 samples, grows one 20 ms frame per sustained underrun (capped at 500 ms), shrinks one frame per 3 s of underrun-free playback. Outputs silence until the buffer fills; re-enters buffering on underrun.
-3. **A/V sync**: The worklet reports its consumed-sample position. The main thread maps this to a server timestamp via a recorded timeline, computes drift against video timestamps, and steers the playback rate within +/-2% to converge. Rate changes are exponentially smoothed (alpha 0.15) to prevent audible wow/flutter.
+3. **A/V latency report**: Decoded PCM keeps its server media timestamp through the Worker and worklet. The worklet reports the next rendered sample on the `AudioContext` clock; `getOutputTimestamp()` maps that point to the browser performance clock. The visible canvas reports its own server timestamp and estimated presentation instant. Their source-time-corrected difference is sent upstream as Media `PLAYOUT_REPORT`.
+4. **Application compensation**: The server takes the maximum report from active viewers and publishes it as PipeWire process latency on the downstream capture stream. PipeWire/Pulse clients such as Chromium and Spotify then receive the remote output cost through their normal latency query and schedule their own video. YAS never delays browser video to compensate for audio.
+5. **Depth servo**: Playback rate is steered within +/-2% from worklet buffer depth to keep the learned jitter target. Rate changes are exponentially smoothed (alpha 0.15) to prevent audible wow/flutter; this controls buffer depth, not A/V presentation.
 
 ```mermaid
 sequenceDiagram
@@ -581,6 +583,8 @@ sequenceDiagram
     S->>C: Media FRAME (Opus)
     C->>C: AudioDecoder → f32 PCM
     C->>C: AudioWorklet jitter buffer
-    Note over C: A/V sync: drift = audioMs - videoMs
-    C->>C: adjust playback rate ±2%
+    C->>C: measure audible audio − visible video
+    C->>S: Media PLAYOUT_REPORT
+    S->>S: publish PipeWire process latency upstream
+    Note over S: application schedules its video; YAS does not hold it
 ```

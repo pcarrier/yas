@@ -788,19 +788,18 @@ describe("YasSurfaceCanvas scroll", () => {
 
     expect(inputOrder).toEqual(["pointer", "axis", "pointer", "axis"]);
     expect(pointers).toEqual([
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 30, y: 40 },
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 31, y: 41 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 30 / 800, y: 40 / 600 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 31 / 800, y: 41 / 600 },
     ]);
     surface.dispose();
   });
 
   /**
-   * The wire fields are unsigned 16-bit. A letterboxed canvas puts real cursor
-   * positions outside the drawn frame, and sending those raw made the server
-   * read ~65533 and mirror it to peers, whose overlay clamped it to the
-   * opposite edge — the ghost cursor teleported across the window.
+   * Letterboxed canvases put real cursor positions outside the visible frame.
+   * Clamp the normalized pointer coordinate at that frame's edge so neither
+   * local input nor its physical-pixel mirror teleports to the opposite edge.
    */
-  it("clamps pointer positions outside the drawn frame into the surface", () => {
+  it("clamps pointer positions outside the drawn frame into unit coordinates", () => {
     // 800x600 frame in an 800x800 box: 100 CSS px of letterbox top and bottom.
     const { surface, canvas, pointers } = attachScrolling({
       frame: [800, 600],
@@ -821,9 +820,9 @@ describe("YasSurfaceCanvas scroll", () => {
     move(400, 750); // below it
 
     expect(pointers).toEqual([
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 400, y: 0 },
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 0, y: 200 },
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 400, y: 599 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 0.5, y: 0 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 0, y: 1 / 3 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 0.5, y: 1 },
     ]);
     expect(pointers.every((p) => p.x >= 0 && p.y >= 0)).toBe(true);
     surface.dispose();
@@ -851,7 +850,36 @@ describe("YasSurfaceCanvas scroll", () => {
     );
 
     expect(pointers).toEqual([
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 1199, y: 899 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 1, y: 1 },
+    ]);
+    surface.dispose();
+  });
+
+  it("does not remap a visible frame when catalogue geometry advances", () => {
+    const { surface, canvas, pointers } = attachScrolling({
+      frame: [800, 600],
+      css: [800, 600],
+      surface: [800, 600],
+    });
+    const move = () =>
+      canvas.dispatchEvent(
+        new MouseEvent("mousemove", {
+          bubbles: true,
+          clientX: 200,
+          clientY: 150,
+        }),
+      );
+
+    move();
+    const internal = surface as unknown as {
+      surface: YasSurface;
+    };
+    internal.surface = { ...internal.surface, width: 1600, height: 1200 };
+    move();
+
+    expect(pointers).toEqual([
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 0.25, y: 0.25 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 0.25, y: 0.25 },
     ]);
     surface.dispose();
   });
@@ -1156,9 +1184,9 @@ describe("YasSurfaceCanvas cross-surface mouse grabs", () => {
       );
 
       expect(pointers).toEqual([
-        { id: 1, type: SURFACE_POINTER_DOWN, button: 0, x: 10, y: 20 },
-        { id: 2, type: SURFACE_POINTER_MOVE, button: 0, x: 30, y: 40 },
-        { id: 2, type: SURFACE_POINTER_UP, button: 0, x: 40, y: 50 },
+        { id: 1, type: SURFACE_POINTER_DOWN, button: 0, x: 0.1, y: 0.2 },
+        { id: 2, type: SURFACE_POINTER_MOVE, button: 0, x: 0.3, y: 0.4 },
+        { id: 2, type: SURFACE_POINTER_UP, button: 0, x: 0.4, y: 0.5 },
       ]);
     } finally {
       first.surface.dispose();
@@ -1243,7 +1271,7 @@ describe("YasSurfaceCanvas touch", () => {
 
     // The move lands where the finger is, ahead of the first axis event.
     expect(pointers).toEqual([
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 40, y: 100 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 40 / 800, y: 100 / 600 },
     ]);
     expect(sent[0].source).toBe(AXIS_SOURCE_FINGER);
 
@@ -1320,8 +1348,8 @@ describe("YasSurfaceCanvas touch", () => {
     canvas.dispatchEvent(touchEvent("touchend", [FINGER], { ongoing: false }));
 
     expect(pointers).toEqual([
-      { type: SURFACE_POINTER_DOWN, button: 2, x: 40, y: 40 },
-      { type: SURFACE_POINTER_UP, button: 2, x: 40, y: 40 },
+      { type: SURFACE_POINTER_DOWN, button: 2, x: 40 / 800, y: 40 / 600 },
+      { type: SURFACE_POINTER_UP, button: 2, x: 40 / 800, y: 40 / 600 },
     ]);
     surface.dispose();
   });
@@ -1337,11 +1365,11 @@ describe("YasSurfaceCanvas touch", () => {
     canvas.dispatchEvent(pointerEvent("pointerup", 40, 120));
 
     expect(pointers).toEqual([
-      { type: SURFACE_POINTER_DOWN, button: 0, x: 40, y: 100 },
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 40, y: 100 },
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 40, y: 120 },
-      { type: SURFACE_POINTER_MOVE, button: 0, x: 40, y: 120 },
-      { type: SURFACE_POINTER_UP, button: 0, x: 40, y: 120 },
+      { type: SURFACE_POINTER_DOWN, button: 0, x: 40 / 800, y: 100 / 600 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 40 / 800, y: 100 / 600 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 40 / 800, y: 120 / 600 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 40 / 800, y: 120 / 600 },
+      { type: SURFACE_POINTER_UP, button: 0, x: 40 / 800, y: 120 / 600 },
     ]);
     surface.dispose();
   });
@@ -1354,8 +1382,8 @@ describe("YasSurfaceCanvas touch", () => {
     canvas.dispatchEvent(touchEvent("touchend", [FINGER], { ongoing: false }));
 
     expect(pointers).toEqual([
-      { type: SURFACE_POINTER_DOWN, button: 2, x: 40, y: 40 },
-      { type: SURFACE_POINTER_UP, button: 2, x: 40, y: 40 },
+      { type: SURFACE_POINTER_DOWN, button: 2, x: 40 / 800, y: 40 / 600 },
+      { type: SURFACE_POINTER_UP, button: 2, x: 40 / 800, y: 40 / 600 },
     ]);
     surface.dispose();
   });

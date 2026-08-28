@@ -413,7 +413,20 @@ and the same process serves the browser. The name is the whole socket
 configuration: `bin/dev-server` clears the supervising server's exported
 `YAS_SOCK` and `TMPDIR`, points `XDG_RUNTIME_DIR` at the login user's runtime
 directory, and lets `--name` resolve the path the way a packaged server does.
-It also builds the binary it execs, so the unit owns its artifact:
+The profiling build is a staged oneshot. Re-running it leaves the current
+server in service while Cargo works; a successful replacement restarts the
+server, while a failed replacement leaves it untouched:
+
+```json
+{
+  "description": "yas profiling server build (${INSTANCE})",
+  "command": ["direnv", "exec", "${STACK_DIR}", "dev-build"],
+  "type": "oneshot",
+  "keep": 3
+}
+```
+
+The server requires that build result:
 
 ```json
 {
@@ -421,7 +434,7 @@ It also builds the binary it execs, so the unit owns its artifact:
     "yas --on local:${INSTANCE} reaches this exact development server.",
     "The server's socket lock replaces an older attempt and removes stale sockets.",
     "--name locates the socket; an explicit YAS_SOCK only restated it.",
-    "bin/dev-server builds the binary it execs, so no oneshot build unit.",
+    "The staged build keeps the old server alive until its replacement succeeds.",
     "YAS_EDGE=1 serves the browser from this process, the way a deployed",
     "server does: one unit, and no socket between browser and terminals.",
     "Readiness is that listener, because the server's own FS STAT refuses a",
@@ -431,6 +444,7 @@ It also builds the binary it execs, so the unit owns its artifact:
     "timeoutStop 15s so AudioPipeline::drop can stop media processes in order."
   ],
   "description": "yas server and edge on :${PORTS+1} (${INSTANCE})",
+  "requires": ["build"],
   "command": ["direnv", "exec", "${STACK_DIR}", "dev-server"],
   "env": {
     "YAS_SERVER_NAME": "${INSTANCE}",
@@ -452,14 +466,14 @@ deployed one does, so the template went away rather than duplicating a
 deployment shape the modules no longer use. `yas edge` is still a command, for
 the fixed-home edge in front of a server that does not host its own.
 
-Five templates in all. Every command points direnv at `${STACK_DIR}`. Direnv
+Six templates in all. Every command points direnv at `${STACK_DIR}`. Direnv
 finds the checkout's ancestor `.envrc`, changes to that checkout, and exposes
 its `bin/` on `PATH`; neither Muster nor the templates infer a worktree root
 from the stack's depth or from the main checkout. The JSON retains only graph,
-variables, probes, and restart policy. There are no `oneshot`s left: a build
-that exactly one unit consumes is a line in that unit's script, not a unit of
-its own with a dependency edge pointing at it. With `server` above, an
-installed checkout runs all five units.
+variables, probes, and restart policy. The build is deliberately a separate
+oneshot because its staged replacement semantics prevent compilation time or a
+failed build from becoming server downtime. With `server` above, an installed
+checkout runs all six units.
 
 A repository is registered with one command after muster is running:
 

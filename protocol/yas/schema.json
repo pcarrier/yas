@@ -3971,6 +3971,15 @@
           "compression": "allowed",
           "datagram": "forbidden",
           "layout": "stream_handle:u64,revision:u64,status:u16,flags:u16,codec_config:bytes_u32,Extensions"
+        },
+        {
+          "name": "PLAYOUT_REPORT",
+          "kind": 35,
+          "direction": "client_to_server",
+          "sensitive": "required",
+          "compression": "allowed",
+          "datagram": "forbidden",
+          "layout": "stream_handle:u64,consumed_sequence:u64,audio_video_delay_ns:u64; measured client-side difference between audible audio and visible video presentation latency"
         }
       ],
       "types": [

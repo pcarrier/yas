@@ -466,7 +466,14 @@ in
           # would clobber coreutils and friends for PTY shells, which
           # inherit the service env.
           path =
-            lib.optionals cfg.audio.enable [
+            # Privileged NixOS programs are exposed through wrappers here,
+            # not through the immutable package in the system profile.  A
+            # login shell prepends this automatically; a system service does
+            # not.  Without it, a yas terminal resolves e.g. `doas` to
+            # /run/current-system/sw/bin/doas, whose store target deliberately
+            # has no setuid bit, instead of /run/wrappers/bin/doas.
+            [ "/run/wrappers" ]
+            ++ lib.optionals cfg.audio.enable [
               pkgs.pipewire
               pkgs.wireplumber
               pkgs.dbus

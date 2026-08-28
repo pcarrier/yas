@@ -1667,9 +1667,8 @@ export class YasTerminalSurface {
     if (!this.container) return;
 
     if (!this._resizable) {
-      // A passive view must not register a container size with the server:
-      // the grid is the minimum across a session's views, so a thumbnail
-      // would pin the live pane to a card.  It still needs the box for
+      // A passive view must not register a container size with the server: a
+      // thumbnail is presentation, not a request to reflow the PTY. It still needs the box for
       // presentation — doRender composites the shared canvas down to roughly
       // this size, leaving CSS a scale it can actually filter — so observe,
       // but stop short of handleResize.
@@ -2024,10 +2023,9 @@ export class YasTerminalSurface {
       if (glCanvas.style.width !== cssW) glCanvas.style.width = cssW;
       if (glCanvas.style.height !== cssH) glCanvas.style.height = cssH;
       if (this._resizable) {
-        // The shared PTY grid is the largest one that fits every live client.
-        // Scale it locally so a smaller peer does not leave this pane drawing
-        // into a fraction of its box. Preserve the cell aspect ratio and
-        // centre the one sub-cell remainder on the unconstrained axis.
+        // The shared PTY grid is the largest rectangle that fits every live
+        // client. Scale it locally to this pane while preserving the cell
+        // aspect ratio and centring the unconstrained axis.
         const cssLeft = `${presentation?.left ?? 0}px`;
         const cssTop = `${presentation?.top ?? 0}px`;
         if (glCanvas.style.left !== cssLeft || glCanvas.style.top !== cssTop) {

@@ -1769,6 +1769,42 @@ impl Decode for FrameAck {
     }
 }
 
+/// Client measurement of the extra audio playout latency relative to video.
+///
+/// The server feeds this back into the virtual output device's latency model,
+/// so applications can perform their normal A/V synchronization without the
+/// remote viewer holding video frames itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayoutReport {
+    pub stream_handle: u64,
+    pub consumed_sequence: u64,
+    pub audio_video_delay_ns: u64,
+}
+
+impl Encode for PlayoutReport {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        handle(self.stream_handle, "zero Media stream handle")?;
+        put_u64(out, self.stream_handle);
+        put_u64(out, self.consumed_sequence);
+        put_u64(out, self.audio_video_delay_ns);
+        Ok(())
+    }
+}
+
+impl Decode for PlayoutReport {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let value = Self {
+            stream_handle: decoder.u64()?,
+            consumed_sequence: decoder.u64()?,
+            audio_video_delay_ns: decoder.u64()?,
+        };
+        decoder.finish()?;
+        handle(value.stream_handle, "zero Media stream handle")?;
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamStatus {
     pub stream_handle: u64,
@@ -2388,6 +2424,11 @@ mod tests {
 
     #[test]
     fn frame_and_portal_are_bounded_and_truncation_safe() {
+        truncations(&PlayoutReport {
+            stream_handle: 1,
+            consumed_sequence: 2,
+            audio_video_delay_ns: 123_456_789,
+        });
         let frame = MediaFrame {
             stream_handle: 1,
             sequence: 2,

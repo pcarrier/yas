@@ -78,21 +78,15 @@ impl FrameAssembler {
             return Err("YAS Terminal chunked frame ended at the wrong length".into());
         }
         // FRAME_CHUNK repeats the view and sequence outside the logical body.
-        // Rebuild the ordinary FRAME payload so its codec validates the
-        // flags, explicit base, and grid payload exactly once.
-        let capacity = self
-            .received
-            .checked_add(8)
-            .ok_or_else(|| "YAS Terminal frame length overflow".to_string())?;
-        let mut bytes = Vec::with_capacity(capacity);
-        bytes.extend_from_slice(&self.view_id.to_le_bytes());
-        bytes.extend_from_slice(&self.sequence.to_le_bytes());
+        // Decode that body without applying the ordinary FRAME's one-chunk
+        // wire-size limit: exceeding it is why this frame was fragmented.
+        let mut bytes = Vec::with_capacity(self.received);
         for chunk in self.chunks.drain(..) {
             bytes.extend(chunk.expect("all chunks were checked"));
         }
         self.next_chunk = 0;
         self.received = 0;
-        terminal::TerminalFrame::decode(&bytes)
+        terminal::TerminalFrame::decode_logical_body(self.view_id, self.sequence, &bytes)
             .map(Some)
             .map_err(wire_error)
     }
@@ -938,6 +932,53 @@ mod tests {
                 },
                 9,
                 4096,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn frame_chunks_reassemble_a_body_larger_than_one_bulk_chunk() {
+        let frame = terminal::TerminalFrame {
+            view_id: 9,
+            frame_sequence: 4,
+            frame_flags: yas_wire::schema::terminal::FRAME_CURSOR as u16,
+            base_sequence: None,
+            grid_payload: vec![0x5a; yas_wire::frame::HARD_MAX_BULK_CHUNK as usize + 1],
+        };
+        let logical = frame.encode_logical_body().unwrap();
+        let middle = logical.len() / 2;
+        let mut assembler = FrameAssembler::default();
+        assert!(
+            assembler
+                .push(
+                    terminal::FrameChunk {
+                        view_id: frame.view_id,
+                        frame_sequence: frame.frame_sequence,
+                        chunk_index: 0,
+                        chunk_count: 2,
+                        logical_frame_len: logical.len() as u32,
+                        chunk: logical[..middle].to_vec(),
+                    },
+                    frame.view_id,
+                    logical.len() as u32,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let decoded = assembler
+            .push(
+                terminal::FrameChunk {
+                    view_id: frame.view_id,
+                    frame_sequence: frame.frame_sequence,
+                    chunk_index: 1,
+                    chunk_count: 2,
+                    logical_frame_len: logical.len() as u32,
+                    chunk: logical[middle..].to_vec(),
+                },
+                frame.view_id,
+                logical.len() as u32,
             )
             .unwrap()
             .unwrap();

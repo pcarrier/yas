@@ -2698,9 +2698,9 @@ struct ClientState {
     /// transport credit.
     surface_schedule_cursor: Option<u16>,
     /// Per-client desired surface sizes (surface_id → (width, height, scale_120, codec_support)).
-    /// Unlike PTY grids, video surfaces can be downscaled per client: the
-    /// server composites for the largest active logical view and serves
-    /// smaller viewers from their own encode targets.
+    /// Video surfaces are downscaled per client: the server composites for the
+    /// largest active logical view and serves smaller viewers from their own
+    /// encode targets.
     /// `scale_120` is the requested presentation scale in 1/120th units:
     /// 60 = 0.5×, 120 = 1×, 240 = 2×. It may be the viewer's DPR or
     /// an exact scale selected independently of DPR.
@@ -2760,14 +2760,35 @@ fn mpris_player_at(
     replay
 }
 
-fn clamp_cursor_rect((x, y, width, height): (i32, i32, i32, i32)) -> (i16, i16, i16, i16) {
+fn clamp_cursor_rect((x, y, width, height): (i32, i32, i32, i32)) -> Option<(i16, i16, i16, i16)> {
+    // Firefox can publish a 0x0 caret while the address bar is acquiring
+    // focus.  That is legal compositor input but not a useful wire cursor
+    // rectangle, whose dimensions are required to be positive.
+    if width <= 0 || height <= 0 {
+        return None;
+    }
     let clamp = |value: i32| value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-    (
-        clamp(x),
-        clamp(y),
-        clamp(width.max(0)),
-        clamp(height.max(0)),
-    )
+    Some((clamp(x), clamp(y), clamp(width), clamp(height)))
+}
+
+#[cfg(test)]
+mod cursor_rect_tests {
+    use super::clamp_cursor_rect;
+
+    #[test]
+    fn zero_and_negative_caret_extents_are_omitted() {
+        assert_eq!(clamp_cursor_rect((10, 20, 0, 12)), None);
+        assert_eq!(clamp_cursor_rect((10, 20, 12, 0)), None);
+        assert_eq!(clamp_cursor_rect((10, 20, -1, 12)), None);
+    }
+
+    #[test]
+    fn positive_caret_rectangles_remain_wire_encodable() {
+        assert_eq!(
+            clamp_cursor_rect((i32::MAX, i32::MIN, i32::MAX, 12)),
+            Some((i16::MAX, i16::MIN, i16::MAX, 12)),
+        );
+    }
 }
 
 /// Percent-encode every byte of `path` outside the RFC 3986 unreserved set
@@ -4780,8 +4801,8 @@ const MAX_SEARCH_QUERY: usize = 1024;
 /// An 8K display at a 4px font is ~540 rows and ~3840 columns, so this is
 /// past any real viewport. It exists because Terminal Resize carries two raw
 /// `u16`s and only rejected zero: a single client asking for 65535x65535
-/// became the mediated size — the minimum across clients, which is its own
-/// when it is the only one — and the terminal grid was allocated at that.
+/// became the mediated size when it was the largest request, and the terminal
+/// grid was allocated at that.
 #[cfg(test)]
 const MAX_VIEW_DIM: u16 = 4096;
 
@@ -5281,8 +5302,7 @@ impl Session {
             #[cfg(target_os = "linux")]
             let session_id = self.next_compositor_id;
             self.next_compositor_id = self.next_compositor_id.wrapping_add(1);
-            // Create the epoch before spawning anything so audio and video
-            // share the same time origin for A/V sync.
+            // Identity for this compositor generation and its audio restart.
             #[cfg(target_os = "linux")]
             let created_at = Instant::now();
             #[cfg(target_os = "linux")]
@@ -5361,7 +5381,6 @@ impl Session {
                             desktop_bus_address.as_deref().unwrap(),
                             bitrate,
                             verbose,
-                            created_at,
                             broadcast,
                         ) {
                             Ok(pipeline) => {
@@ -6025,9 +6044,13 @@ impl Session {
     fn mediated_size_for_pty(&self, pty_id: u16) -> Option<(u16, u16)> {
         let mut mediated = self.native_terminal_views.mediated_size(pty_id);
         for c in self.clients.values() {
-            if let Some((r, cols)) = c.view_sizes.get(&pty_id).copied() {
-                mediated = Some(mediated.map_or((r, cols), |(min_rows, min_cols)| {
-                    (min_rows.min(r), min_cols.min(cols))
+            if let Some((rows, cols)) = c.view_sizes.get(&pty_id).copied() {
+                // A PTY has one grid shared by every viewer.  Pick the
+                // largest rectangle that fits all of them, independently on
+                // each axis.  Passive previews never publish view_sizes, so
+                // a switcher thumbnail cannot shrink the interactive grid.
+                mediated = Some(mediated.map_or((rows, cols), |(fit_rows, fit_cols)| {
+                    (fit_rows.min(rows), fit_cols.min(cols))
                 }));
             }
         }
@@ -8572,7 +8595,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     purpose,
                     cursor_rect,
                 } => {
-                    let cursor_rect = cursor_rect.map(clamp_cursor_rect);
+                    let cursor_rect = cursor_rect.and_then(clamp_cursor_rect);
                     if enabled {
                         cs.surface_text_inputs.insert(
                             surface_id,
@@ -11774,7 +11797,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                         &dbus_address,
                         audio_restart_bitrate,
                         verbose,
-                        epoch,
                         broadcast,
                     )
                 });
@@ -12572,7 +12594,7 @@ mod tests {
     }
 
     #[test]
-    fn mediated_size_uses_per_pty_view_sizes_without_lead() {
+    fn mediated_size_uses_the_largest_grid_that_fits_every_view() {
         let mut session = Session::new();
         let mut c1 = test_client();
         let mut c2 = test_client();
@@ -12581,6 +12603,18 @@ mod tests {
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(session.mediated_size_for_pty(7), Some((24, 100)));
+    }
+
+    #[test]
+    fn mediated_size_fits_crossed_view_aspect_ratios() {
+        let mut session = Session::new();
+        let mut wide = test_client();
+        let mut tall = test_client();
+        wide.view_sizes.insert(7, (20, 200));
+        tall.view_sizes.insert(7, (40, 100));
+        session.clients.insert(1, wide);
+        session.clients.insert(2, tall);
+        assert_eq!(session.mediated_size_for_pty(7), Some((20, 100)));
     }
 
     /// The first resize of a surface goes out immediately. Waiting out the
@@ -17129,8 +17163,7 @@ mod tests {
     }
 
     /// Terminal Resize carries two raw u16s and only rejected zero, so one
-    /// client could name a grid of 4.29 billion cells and — being the
-    /// minimum across clients when it is the only one — have the terminal
+    /// client could name a grid of 4.29 billion cells and have the terminal
     /// allocated at that size.
     #[test]
     fn clamp_view_size_bounds_a_hostile_resize() {

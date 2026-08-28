@@ -2387,7 +2387,7 @@ It does not merge media frames into generic Transfer messages.
 | Class   | Kinds                                                                                                                             |
 | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | Request | WATCH, UNWATCH, OPEN_OUTPUT, ACQUIRE_DEVICE, RELEASE_DEVICE, PORTAL_REPLY, PLAYER_ACTION, CLOSE_STREAM, FETCH_ASSET, PORTAL_CLOSE |
-| Event   | STATE, STATE_ACK, PORTAL_REQUEST, FRAME, FRAME_ACK, STREAM_STATUS                                                                 |
+| Event   | STATE, STATE_ACK, PORTAL_REQUEST, FRAME, FRAME_ACK, PLAYOUT_REPORT, STREAM_STATUS                                                 |
 
 State records describe output devices, viewer-device leases, pending portal
 requests, and normalized MPRIS players. A device lease is a boot-scoped
@@ -2430,6 +2430,15 @@ link, FRAME and STREAM_STATUS share one FIFO so configuration changes and a
 final CLOSED/ERROR status cannot overtake earlier frames. A receiver MUST
 ignore a discardable frame that arrives late from an optional datagram path
 after the stream's final status.
+
+PLAYOUT_REPORT carries the output stream, its last consumed sequence, and the
+client-measured extra audible-audio latency relative to visible video. It is a
+reliable client-to-server Event and is only valid for an acknowledged live
+audio-output stream. The server publishes the maximum active viewer report as
+PipeWire process latency on the downstream capture node. PipeWire propagates
+that logical latency upstream to playback applications, which can select their
+own corresponding video frame. YAS does not hold video frames to perform A/V
+sync.
 
 Portal requests are stateful typed resources rather than opaque subtypes.
 ACCESS request metadata contains a nonzero deadline, optional parent Surface,

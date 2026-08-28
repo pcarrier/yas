@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ChannelOpenOptions } from "@yas-run/core";
 import {
   openSession,
+  SESSION_ARTWORK_READ_CREDIT,
   SESSION_ARTWORK_MAX_BYTES,
   SESSION_ARTWORK_MAX_ENTRIES,
   SESSION_ICON_QUEUE_MAX_BYTES,
@@ -552,7 +553,8 @@ describe("openSession", () => {
     }
   });
 
-  it("reads artwork immediately when an icon path arrives", async () => {
+  it("reads artwork on the next task when an icon path arrives", async () => {
+    vi.useFakeTimers();
     const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:now");
     try {
       const connection = fakeConnection() as ReturnType<
@@ -560,13 +562,18 @@ describe("openSession", () => {
       > & {
         readFiles: NonNullable<Parameters<typeof openSession>[0]["readFiles"]>;
       };
-      const readFiles = vi.fn(async () => [
-        {
-          status: 0,
-          path: "/i/now.png",
-          content: new Uint8Array([1, 2, 3]),
-        },
-      ]);
+      const readFiles = vi.fn(
+        async (
+          _groups: readonly (readonly string[])[],
+          _options?: { flags?: number; maxBytes?: number },
+        ) => [
+          {
+            status: 0,
+            path: "/i/now.png",
+            content: new Uint8Array([1, 2, 3]),
+          },
+        ],
+      );
       connection.readFiles = readFiles;
       const session = await openSession(connection);
       connection.inbound.deliver?.(state([], [{ id: "now", name: "Now" }]));
@@ -574,12 +581,68 @@ describe("openSession", () => {
         encode({ type: "icon", id: "now", path: "/i/now.png" }),
       );
 
+      expect(readFiles).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(0);
       expect(readFiles).toHaveBeenCalledTimes(1);
+      expect(readFiles.mock.calls[0]?.[1]).toEqual({
+        maxBytes: SESSION_ARTWORK_READ_CREDIT,
+      });
       await Promise.resolve();
       expect(session.icon("now")).toBe("blob:now");
       session.close();
     } finally {
       create.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses one bounded receive window for a full visible icon shelf", async () => {
+    vi.useFakeTimers();
+    const create = vi
+      .spyOn(URL, "createObjectURL")
+      .mockImplementation(() => "blob:icon");
+    try {
+      const connection = fakeConnection() as ReturnType<
+        typeof fakeConnection
+      > & {
+        readFiles: NonNullable<Parameters<typeof openSession>[0]["readFiles"]>;
+      };
+      const readFiles = vi.fn(
+        async (
+          groups: readonly (readonly string[])[],
+          _options?: { flags?: number; maxBytes?: number },
+        ) =>
+          (groups[0] ?? []).map((path) => ({
+            status: 0,
+            path,
+            content: new Uint8Array([1, 2, 3]),
+          })),
+      );
+      connection.readFiles = readFiles;
+      const session = await openSession(connection);
+      const ids = Array.from({ length: 48 }, (_, index) => `app-${index}`);
+      connection.inbound.deliver?.(
+        state(
+          [],
+          ids.map((id) => ({ id, name: id })),
+        ),
+      );
+      for (const id of ids) {
+        connection.inbound.deliver?.(
+          encode({ type: "icon", id, path: `/i/${id}.png` }),
+        );
+      }
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(readFiles).toHaveBeenCalledTimes(1);
+      expect(readFiles.mock.calls[0]?.[0]?.[0]).toHaveLength(48);
+      for (const call of readFiles.mock.calls) {
+        expect(call[1]).toEqual({ maxBytes: SESSION_ARTWORK_READ_CREDIT });
+      }
+      session.close();
+    } finally {
+      create.mockRestore();
+      vi.useRealTimers();
     }
   });
 

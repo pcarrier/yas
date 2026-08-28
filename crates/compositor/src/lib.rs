@@ -304,6 +304,12 @@ mod stub {
             /// Browser event `timeStamp` in whole ms; `0` for unknown.
             time_ms: u32,
         },
+        NormalizedPointerMotion {
+            surface_id: u16,
+            x: f64,
+            y: f64,
+            time_ms: u32,
+        },
         PointerButton {
             surface_id: u16,
             button: u32,
@@ -311,6 +317,14 @@ mod stub {
             time_ms: u32,
         },
         PointerButtonAt {
+            surface_id: u16,
+            x: f64,
+            y: f64,
+            button: u32,
+            pressed: bool,
+            time_ms: u32,
+        },
+        NormalizedPointerButtonAt {
             surface_id: u16,
             x: f64,
             y: f64,

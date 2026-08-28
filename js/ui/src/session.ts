@@ -119,6 +119,19 @@ const ICON_ARTWORK_RETRY_MS = 120;
  */
 export const SESSION_MAX_ARTWORK_FILE_BYTES = 1024 * 1024;
 
+/**
+ * Rolling receive window for one native artwork read.
+ *
+ * This is deliberately independent of the number of paths in the query.
+ * `initial_receive_credit` is reserved against the connection's aggregate
+ * receive budget before any bytes arrive, so declaring 48 × the per-file
+ * ceiling made a shelf of tiny icons compete as a 48 MiB transfer with live
+ * terminals and surfaces. FS marks the unanswered tail as exhausted; the
+ * loader already leaves those paths unread and immediately asks for the next
+ * bounded page.
+ */
+export const SESSION_ARTWORK_READ_CREDIT = 2 * 1024 * 1024;
+
 /** Retained supervisor state. The catalog is normally around a thousand rows;
  * these ceilings leave ample headroom without letting one peer own the page. */
 export const SESSION_MAX_APPS = 1024;
@@ -588,6 +601,7 @@ export async function openSession(
   // connectChannel(), but an icon cannot arrive until requestIcons() is
   // available to its caller.
   let loadArtwork: () => Promise<void> = async () => {};
+  let scheduleArtworkLoad: () => void = () => {};
   const mirror = new SessionMirror({
     onIconEvicted: (url) => URL.revokeObjectURL(url),
     onIdsChanged: (ids) => reconcileRequests(ids),
@@ -601,9 +615,10 @@ export async function openSession(
     onData: (payload: Uint8Array) => {
       if (closed) return;
       mirror.apply(payload);
-      // Icon replies carry paths, not bytes. Start the native read as part of
-      // handling the reply instead of waiting for the retry poll below.
-      void loadArtwork();
+      // Icon replies carry paths, not bytes. Gather the path messages from one
+      // supervisor batch before starting FS: reading on the first reply split
+      // every shelf into a one-icon query followed by a much larger one.
+      scheduleArtworkLoad();
     },
     onCredit: () => flushPending(),
     onClosed: (reason: number, detail: string) => {
@@ -731,6 +746,14 @@ export async function openSession(
   // bytes arrive as bytes, and turning them into base64 to hand to an <img> is
   // the work this whole arrangement exists to avoid.
   let loading = false;
+  let artworkCoalescing: ReturnType<typeof setTimeout> | undefined;
+  scheduleArtworkLoad = () => {
+    if (closed || artworkCoalescing !== undefined) return;
+    artworkCoalescing = setTimeout(() => {
+      artworkCoalescing = undefined;
+      void loadArtwork();
+    }, 0);
+  };
   loadArtwork = async () => {
     if (closed || loading || !connection.readFiles) return;
     loading = true;
@@ -744,10 +767,10 @@ export async function openSession(
         const records = await connection.readFiles(
           [wanted.map((entry) => entry.path)],
           {
-            // FS receive credit covers the whole query, not each question.
-            // Giving a 48-file batch one file's 1 MiB allowance truncated the
-            // reply after the first few icons and made the rest look absent.
-            maxBytes: SESSION_MAX_ARTWORK_FILE_BYTES * wanted.length,
+            // A fixed rolling window, not `per-file ceiling × path count`.
+            // Truncated records remain unread below and are retried by the
+            // next loop iteration without reserving tens of MiB up front.
+            maxBytes: SESSION_ARTWORK_READ_CREDIT,
           },
         );
         if (closed) return;
@@ -788,6 +811,8 @@ export async function openSession(
     closed = true;
     if (coalescing !== undefined) clearTimeout(coalescing);
     coalescing = undefined;
+    if (artworkCoalescing !== undefined) clearTimeout(artworkCoalescing);
+    artworkCoalescing = undefined;
     queued.clear();
     queuedBytes = 0;
     pendingCommands.length = 0;

@@ -43,16 +43,18 @@ import {
 import type { YasConnectionOptions } from "./session";
 
 /**
- * Browser receive inventory. Sixteen families publish a catalogue, and each
- * holds a 1 MiB State window while it is watched; Git, FS, and LSP hold a
- * further window per live watched query; a Terminal or Surface view holds its
- * negotiated frame reservation for as long as it is open. The previous 32 MiB
- * budgeted for nine catalogues and one view of each kind, which a workspace
- * with a git panel and a few terminals exhausts -- and an exhausted aggregate
- * is not a soft limit, it refuses the next view outright. Budget the real
- * inventory instead, still far below `YAS_HARD_MAX_BUFFERED`.
+ * Browser receive inventory. Surface views keep a 16-frame window so a 120 Hz
+ * display does not turn browser scheduling into stop-and-wait. At the 4 MiB
+ * protocol frame ceiling that reserves 64 MiB per mounted surface, even though
+ * ordinary AV1 frames are orders of magnitude smaller. A 128 MiB aggregate
+ * therefore refused a second live surface after catalogue watches took their
+ * share, leaving a valid Wayland app behind a permanently black canvas.
+ *
+ * Use the protocol's hard browser cap. This is receive authority, not an eager
+ * allocation; actual queues remain bounded by their family windows. Per-view
+ * limits still cap every retained frame and the aggregate remains finite.
  */
-export const YAS_BROWSER_RECEIVE_MAX_BUFFERED = 128n * 1024n * 1024n;
+export const YAS_BROWSER_RECEIVE_MAX_BUFFERED = 1024n * 1024n * 1024n;
 
 /**
  * Offer every canonical v1 family understood by this browser build. Families

@@ -260,6 +260,8 @@ export interface YasConnectionSnapshot {
   id: ConnectionId;
   status: ConnectionStatus;
   ready: boolean;
+  /** Latest application-level Core PING round trip, refreshed once a second. */
+  rttMs: number | null;
   supportsRestart: boolean;
   supportsCopyRange: boolean;
   supportsCompositor: boolean;

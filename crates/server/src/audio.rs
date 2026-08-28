@@ -1,9 +1,9 @@
-//! Audio capture pipeline: PipeWire spawn → pw-cat pipe → Opus encode.
+//! Audio capture pipeline: PipeWire monitor capture → Opus encode.
 //!
 //! Each compositor instance gets its own PipeWire + pipewire-pulse pair.
-//! Apps connect via PulseAudio; PipeWire mixes into a null sink; pw-cat
-//! captures the monitor source and writes interleaved f32 PCM to stdout.
-//! We read that pipe, frame into 20 ms chunks, and Opus-encode for delivery.
+//! Apps connect via PulseAudio; PipeWire mixes into a null sink and an
+//! in-process monitor stream supplies timestamped interleaved f32 PCM. We
+//! frame it into 20 ms chunks and Opus-encode it for delivery.
 
 use opus::{Application, Channels, Encoder as OpusEncoder};
 use std::collections::{HashMap, VecDeque};
@@ -85,6 +85,10 @@ pub struct AudioBroadcast {
     /// Requested native output bitrates, keyed by the same private backend
     /// owner as `native_subscribers`.
     native_bitrates_kbps: std::sync::Mutex<HashMap<u64, u16>>,
+    /// Client-measured audible-audio latency beyond visible-video latency,
+    /// keyed by backend owner. The shared graph publishes the maximum so an
+    /// application remains synchronized for every active listener.
+    native_playout_delays_ns: std::sync::Mutex<HashMap<u64, u64>>,
     /// Recent frames for catch-up on new subscribers.  Kept in sync with
     /// delivery: every frame delivered to subscribers is first appended
     /// here, so a late-subscribing client gets the same tail.
@@ -101,6 +105,7 @@ impl AudioBroadcast {
         Arc::new(Self {
             native_subscribers: std::sync::Mutex::new(HashMap::new()),
             native_bitrates_kbps: std::sync::Mutex::new(HashMap::new()),
+            native_playout_delays_ns: std::sync::Mutex::new(HashMap::new()),
             ring: std::sync::Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             has_listener: Arc::new(AtomicBool::new(false)),
         })
@@ -120,6 +125,7 @@ impl AudioBroadcast {
             .lock()
             .unwrap()
             .insert(id, bitrate_kbps);
+        self.native_playout_delays_ns.lock().unwrap().insert(id, 0);
         self.has_listener.store(true, Ordering::Release);
     }
 
@@ -127,6 +133,7 @@ impl AudioBroadcast {
     pub fn unsubscribe_native(&self, id: u64) {
         self.native_subscribers.lock().unwrap().remove(&id);
         self.native_bitrates_kbps.lock().unwrap().remove(&id);
+        self.native_playout_delays_ns.lock().unwrap().remove(&id);
         if self.native_subscribers.lock().unwrap().is_empty() {
             self.has_listener.store(false, Ordering::Release);
         }
@@ -134,6 +141,27 @@ impl AudioBroadcast {
 
     pub fn max_native_bitrate_kbps(&self) -> u16 {
         self.native_bitrates_kbps
+            .lock()
+            .unwrap()
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Update one active viewer's measured extra audio latency and return the
+    /// maximum that the shared PipeWire graph must advertise.
+    pub fn set_native_playout_delay_ns(&self, id: u64, delay_ns: u64) -> Option<(bool, u64)> {
+        let mut delays = self.native_playout_delays_ns.lock().unwrap();
+        let previous_max = delays.values().copied().max().unwrap_or(0);
+        let delay = delays.get_mut(&id)?;
+        *delay = delay_ns;
+        let maximum = delays.values().copied().max().unwrap_or(0);
+        Some((maximum != previous_max, maximum))
+    }
+
+    pub fn max_native_playout_delay_ns(&self) -> u64 {
+        self.native_playout_delays_ns
             .lock()
             .unwrap()
             .values()
@@ -470,8 +498,6 @@ impl AudioPipeline {
     /// process*; see the runtime-dir comment below for why that is not
     /// enough on its own.
     /// `bitrate` is the Opus encoder bitrate in bits/sec (0 = default).
-    /// `epoch` is the shared time origin (same `Instant` used by video
-    /// timestamps) so audio and video share a common timebase for A/V sync.
     /// `broadcast` is the shared fan-out state; pass the same `Arc` across
     /// restarts so subscribed clients stay connected to the output.
     pub fn spawn(
@@ -480,7 +506,6 @@ impl AudioPipeline {
         dbus_address: &str,
         bitrate: i32,
         verbose: bool,
-        epoch: Instant,
         broadcast: Arc<AudioBroadcast>,
     ) -> Result<Self, String> {
         // Use a private subdirectory so the PulseAudio socket doesn't
@@ -679,6 +704,12 @@ impl AudioPipeline {
                 return Err(format!("failed to start PipeWire capture: {e}"));
             }
         };
+        let restored_playout_delay_ns = broadcast.max_native_playout_delay_ns();
+        if let Err(error) = capture.set_process_latency_ns(restored_playout_delay_ns) {
+            if verbose {
+                eprintln!("[audio] failed to restore remote playout latency: {error}");
+            }
+        }
 
         if verbose {
             eprintln!(
@@ -724,7 +755,6 @@ impl AudioPipeline {
                     opus_tx,
                     bitrate,
                     verbose_copy,
-                    epoch,
                     bitrate_rx,
                     has_listener_clone,
                 );
@@ -966,6 +996,16 @@ impl AudioPipeline {
         let _ = self.bitrate_tx.send(bitrate);
     }
 
+    /// Publish remote output latency to applications without buffering YAS
+    /// video. PipeWire propagates this value upstream to Pulse/PipeWire
+    /// playback clients, where their own A/V scheduler consumes it.
+    pub fn set_playout_delay_ns(&self, delay_ns: u64) -> Result<(), String> {
+        self.capture
+            .as_ref()
+            .ok_or_else(|| "PipeWire capture stream is unavailable".to_string())?
+            .set_process_latency_ns(delay_ns)
+    }
+
     /// Build the `PULSE_SERVER` value for child process environments.
     pub fn pulse_server_path(&self) -> String {
         let pulse_dir = self.runtime_dir.join("pulse");
@@ -997,15 +1037,11 @@ impl Drop for AudioPipeline {
 /// PipeWire capture (`audio_pw::Capture`), frames into 20 ms windows,
 /// Opus-encodes, and sends to the fan-out channel.
 ///
-/// `epoch` is the shared time origin for A/V sync — the same `Instant`
-/// used by the video pipeline's `created_at`.  Audio timestamps are
-/// `epoch.elapsed().as_millis()`, matching the video frame timestamps.
 fn encoder_task(
-    mut pcm_rx: mpsc::Receiver<Vec<u8>>,
+    mut pcm_rx: mpsc::Receiver<crate::audio_pw::CapturedAudioChunk>,
     tx: mpsc::Sender<OpusFrame>,
     bitrate: i32,
     verbose: bool,
-    epoch: Instant,
     mut bitrate_rx: tokio::sync::watch::Receiver<i32>,
     has_listener: Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -1030,6 +1066,10 @@ fn encoder_task(
 
     let mut pcm_buf = vec![0f32; FRAME_FLOATS];
     let mut byte_buf: Vec<u8> = Vec::with_capacity(FRAME_FLOATS * 4 * 2);
+    // CLOCK_MONOTONIC PTS of byte_buf's first sample. PipeWire capture
+    // quanta (1024 samples) do not align with Opus frames (960 samples), so
+    // carry the first-sample timestamp across the leftover between chunks.
+    let mut buffer_pts_ns: Option<i64> = None;
     let mut opus_out = vec![0u8; MAX_OPUS_PACKET];
 
     loop {
@@ -1060,7 +1100,26 @@ fn encoder_task(
             Some(c) => c,
             None => return Ok(()), // capture closed
         };
-        byte_buf.extend_from_slice(&chunk);
+        let chunk_pts_ns = (chunk.pts_ns != i64::MIN).then_some(chunk.pts_ns);
+        if byte_buf.is_empty() {
+            buffer_pts_ns = chunk_pts_ns;
+        } else if let (Some(start), Some(actual)) = (buffer_pts_ns, chunk_pts_ns) {
+            let buffered_frames = byte_buf.len() / (2 * std::mem::size_of::<f32>());
+            let expected = start.saturating_add(
+                i64::try_from(buffered_frames)
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(1_000_000_000)
+                    / 48_000,
+            );
+            // A full capture quantum disappeared before the encoder. Do not
+            // splice the new samples onto the old tail and assign the splice a
+            // continuous PTS: that under-reports both the gap and A/V delay.
+            if actual.abs_diff(expected) > 1_000_000 {
+                byte_buf.clear();
+                buffer_pts_ns = Some(actual);
+            }
+        }
+        byte_buf.extend_from_slice(&chunk.data);
 
         // Process all complete 20 ms frames in the buffer.
         while byte_buf.len() >= FRAME_FLOATS * 4 {
@@ -1071,7 +1130,7 @@ fn encoder_task(
             // expensive steps.  We still must consume the bytes so the
             // capture's bounded PCM queue keeps accepting newer samples.
             if !has_listener.load(Ordering::Acquire) {
-                byte_buf.drain(..consumed);
+                consume_pcm_prefix(&mut byte_buf, &mut buffer_pts_ns, consumed);
                 continue;
             }
 
@@ -1094,15 +1153,17 @@ fn encoder_task(
                     if verbose {
                         eprintln!("[audio] Opus encode error, skipping frame: {e}");
                     }
-                    byte_buf.drain(..consumed);
+                    consume_pcm_prefix(&mut byte_buf, &mut buffer_pts_ns, consumed);
                     continue;
                 }
             };
 
+            let timestamp = buffer_pts_ns.map_or(0, |pts| pts.div_euclid(1_000_000) as u32);
             let frame = OpusFrame {
-                // Wall-clock ms since the shared epoch — same timebase as
-                // video's `created_at.elapsed().as_millis()` for A/V sync.
-                timestamp: epoch.elapsed().as_millis() as u32,
+                // First-sample CLOCK_MONOTONIC ms from PipeWire. Surface
+                // capture uses that same wrapping u32 domain, so the browser
+                // can finally compare the two paths and report sink latency.
+                timestamp,
                 data: opus_out[..encoded_len].to_vec(),
             };
 
@@ -1120,8 +1181,25 @@ fn encoder_task(
                 }
             }
 
-            byte_buf.drain(..consumed);
+            consume_pcm_prefix(&mut byte_buf, &mut buffer_pts_ns, consumed);
         }
+    }
+}
+
+/// Consume interleaved stereo f32 PCM while advancing its first-sample PTS.
+fn consume_pcm_prefix(bytes: &mut Vec<u8>, pts_ns: &mut Option<i64>, consumed: usize) {
+    bytes.drain(..consumed);
+    let frames = consumed / (2 * std::mem::size_of::<f32>());
+    if let Some(pts) = pts_ns.as_mut() {
+        *pts = pts.saturating_add(
+            i64::try_from(frames)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000_000)
+                / 48_000,
+        );
+    }
+    if bytes.is_empty() {
+        *pts_ns = None;
     }
 }
 
@@ -1176,6 +1254,47 @@ mod tests {
         let frame = rx.try_recv().expect("the one ring frame");
         assert_eq!(frame.timestamp, 7);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shared_playout_latency_tracks_the_slowest_live_viewer() {
+        let broadcast = AudioBroadcast::new();
+        let (first_tx, _first_rx) = mpsc::channel(crate::AUDIO_QUEUE_MAX_FRAMES);
+        let (second_tx, _second_rx) = mpsc::channel(crate::AUDIO_QUEUE_MAX_FRAMES);
+        broadcast.subscribe_native(1, 64, first_tx);
+        broadcast.subscribe_native(2, 64, second_tx);
+
+        assert_eq!(
+            broadcast.set_native_playout_delay_ns(1, 80_000_000),
+            Some((true, 80_000_000)),
+        );
+        assert_eq!(
+            broadcast.set_native_playout_delay_ns(2, 140_000_000),
+            Some((true, 140_000_000)),
+        );
+        assert_eq!(
+            broadcast.set_native_playout_delay_ns(1, 100_000_000),
+            Some((false, 140_000_000)),
+        );
+
+        broadcast.unsubscribe_native(2);
+        assert_eq!(broadcast.max_native_playout_delay_ns(), 100_000_000);
+        broadcast.unsubscribe_native(1);
+        assert_eq!(broadcast.max_native_playout_delay_ns(), 0);
+    }
+
+    #[test]
+    fn pcm_leftover_keeps_the_first_sample_on_the_monotonic_timeline() {
+        let opus_bytes = FRAME_FLOATS * std::mem::size_of::<f32>();
+        let mut bytes = vec![0; opus_bytes + 8];
+        let mut pts = Some(4_321_000_000_000_i64);
+
+        consume_pcm_prefix(&mut bytes, &mut pts, opus_bytes);
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(pts, Some(4_321_020_000_000));
+
+        consume_pcm_prefix(&mut bytes, &mut pts, 8);
+        assert!(pts.is_none());
     }
 
     /// A pid with no `/proc` entry.  Scanning down from `pid_max` keeps us

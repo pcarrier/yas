@@ -1,15 +1,9 @@
 /**
- * What a deeply-buffered output device does to the jitter buffer.
+ * Audio output and sink selection regressions.
  *
- * Everything else in this suite feeds the worklet from a bad network into a
- * well-behaved sink. Bluetooth is the other shape: the network can be
- * perfect and the *sink* is the problem. A Bluetooth device wakes rarely and
- * asks for a large bite of audio at once, so the buffer is drained in bursts
- * and refills between them — and none of the tuning here knows that, because
- * nothing in the pipeline ever consults the output device.
- *
- * These tests hold the producer at a flawless 20 ms cadence and vary only the
- * consumer, so anything they report is self-inflicted.
+ * A deeply buffered physical sink is downstream of the AudioWorklet. Its
+ * latency belongs in the end-to-end A/V report, not in the network jitter
+ * target: adding it there pays the Bluetooth delay twice.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
@@ -93,7 +87,7 @@ function playMinute(burstMs: number) {
   };
 }
 
-describe("output device burst size", () => {
+describe("bursty worklet scheduling", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(1767225600000));
@@ -108,15 +102,15 @@ describe("output device burst size", () => {
     expect(wired.targetMs).toBe(MIN_BUFFER_SAMPLES / 48);
   });
 
-  it("cannot hold a sink that asks in bites bigger than the target", () => {
-    // The default target is 60 ms. A 200 ms bite empties it every time, on a
-    // producer that never missed a frame.
+  it("adapts when render work arrives in batches bigger than the target", () => {
+    // The default target is 60 ms. Simulating a 200 ms scheduling stall
+    // empties it on a producer that otherwise never misses a frame.
     const bt = playMinute(200);
     expect(bt.underruns).toBeGreaterThan(0);
     expect(bt.targetMs).toBeGreaterThan(MIN_BUFFER_SAMPLES / 48);
   });
 
-  it("discards audio it is about to need on a deeply buffered sink", () => {
+  it("bounds accumulated latency after a long scheduling stall", () => {
     // The failure worth naming: between bites the buffer legitimately holds a
     // bite's worth, the latency backstop reads that as runaway lag and cuts
     // it, and the next bite starves on audio that was thrown away. Underruns
@@ -272,83 +266,114 @@ describe("an output device that rejects the switch", () => {
   });
 });
 
-/**
- * The fix: the buffer is told what the sink costs, instead of assuming every
- * sink costs 60 ms.
- *
- * `playMinute` above renders straight into the worklet with no device floor
- * set, which is what a browser reporting no `outputLatency` produces. These
- * repeat the same runs after the floor has been posted, as
- * `applyDeviceFloor()` does once the context has rendered.
- */
-describe("output device floor", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date(1767225600000));
-  });
-  afterEach(() => vi.useRealTimers());
+describe("audio/video output latency reporting", () => {
+  it("does not add physical sink latency to the jitter target", () => {
+    const player = new AudioPlayer();
+    const targetMs = player.bufferStats.targetMs;
+    Object.defineProperty(player, "ctx", {
+      configurable: true,
+      value: {
+        outputLatency: 0.3,
+        baseLatency: 0.01,
+        sampleRate: 48_000,
+      },
+    });
 
-  /** As playMinute, but with the sink's cost declared up front. */
-  function playMinuteWithFloor(burstMs: number, floorMs: number) {
-    const { proc, player } = rig();
-    (
-      player as unknown as {
-        worklet: { port: { postMessage(m: unknown): void } };
-      }
-    ).worklet.port.postMessage({ type: "device-floor", samples: floorMs * 48 });
-    const blocks = Math.round((burstMs * 48) / RENDER_QUANTUM);
-    let silentBlocks = 0;
-    for (let t = 0; t < 60_000; t++) {
-      vi.setSystemTime(new Date(1767225600000 + t));
-      if (t % 20 === 0) {
-        proc.port.onmessage({
-          data: new Float32Array(SAMPLES_PER_20_MS * 2).fill(0.5),
-        });
-      }
-      if (t % burstMs === 0) {
-        for (let b = 0; b < blocks; b++) {
-          const l = new Float32Array(RENDER_QUANTUM);
-          const r = new Float32Array(RENDER_QUANTUM);
-          proc.process([], [[l, r]]);
-          if (l.every((v) => v === 0)) silentBlocks++;
-        }
-      }
-    }
-    const stats = player.bufferStats;
+    expect(player.bufferStats.outputLatencyMs).toBe(300);
+    expect(player.bufferStats.targetMs).toBe(targetMs);
+    Object.defineProperty(player, "ctx", { configurable: true, value: null });
     player.destroy();
-    return {
-      ...stats,
-      silenceMs: Math.round((silentBlocks * RENDER_QUANTUM) / 48),
-    };
-  }
-
-  it("stops a deeply buffered sink from starving and self-skipping", () => {
-    const before = playMinute(300);
-    const after = playMinuteWithFloor(300, 300);
-
-    expect(before.skips).toBeGreaterThan(0);
-    expect(after.skips).toBe(0);
-    expect(after.skippedMs).toBe(0);
-    expect(after.underruns).toBeLessThan(before.underruns);
-    expect(after.rebuffers).toBe(0);
-    expect(after.silenceMs).toBeLessThan(before.silenceMs);
   });
 
-  it("keeps adaptive headroom above the sink's own cost", () => {
-    // The ceiling is measured from the floor, so a 300 ms sink still gets the
-    // full adaptive range a wired one does rather than 100 ms of it.
-    const after = playMinuteWithFloor(300, 300);
-    expect(after.targetMs).toBeGreaterThanOrEqual(300);
-    expect(after.targetMs).toBeLessThanOrEqual(300 + 340);
+  it("reports audible audio behind visible video without holding video", () => {
+    const player = new AudioPlayer();
+    Object.defineProperty(player, "ctx", {
+      configurable: true,
+      value: {
+        getOutputTimestamp: () => ({
+          contextTime: 5,
+          performanceTime: 1_200,
+        }),
+      },
+    });
+    player.noteVideoPresentation(4_900, 1_000);
+    const delays: number[] = [];
+    player.onAudioVideoDelay((sample) => delays.push(sample.delayMs));
+
+    // Source audio is 100 ms newer than the video, but reaches the output
+    // 200 ms later. The remaining 100 ms is the latency applications need to
+    // receive through PipeWire; the browser does not delay its video canvas.
+    player["handleWorkletMessage"]({
+      type: "pos",
+      sourceUs: 5_000_000,
+      contextTime: 5,
+    });
+
+    expect(delays).toEqual([100]);
+    Object.defineProperty(player, "ctx", { configurable: true, value: null });
+    player.destroy();
   });
 
-  it("leaves a low-latency sink exactly where it was", () => {
-    // Every wired device reports well under the 60 ms MIN, so the floor
-    // clamps up to MIN and nothing about wired playback changes.
-    const wired = playMinuteWithFloor(8, 60);
-    const untouched = playMinute(8);
-    expect(wired.targetMs).toBe(untouched.targetMs);
-    expect(wired.underruns).toBe(untouched.underruns);
-    expect(wired.skips).toBe(0);
+  it("accounts for both graph and device latency when output timestamps are unavailable", () => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+    const player = new AudioPlayer();
+    Object.defineProperty(player, "ctx", {
+      configurable: true,
+      value: {
+        currentTime: 5,
+        baseLatency: 0.01,
+        outputLatency: 0.2,
+        // The Web Audio spec permits this zero pair before output begins. It
+        // is not a valid clock mapping and must take the latency fallback.
+        getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 0 }),
+      },
+    });
+    player.noteVideoPresentation(4_900, 1_000);
+    const delays: number[] = [];
+    player.onAudioVideoDelay((sample) => delays.push(sample.delayMs));
+
+    player["handleWorkletMessage"]({
+      type: "pos",
+      sourceUs: 5_000_000,
+      contextTime: 5,
+    });
+
+    // 10 ms AudioContext graph + 200 ms output device - 100 ms newer source.
+    expect(delays).toEqual([110]);
+    Object.defineProperty(player, "ctx", { configurable: true, value: null });
+    player.destroy();
+    now.mockRestore();
+  });
+
+  it("publishes a newly slower sink immediately", () => {
+    const player = new AudioPlayer();
+    let outputPerformanceTime = 1_120;
+    Object.defineProperty(player, "ctx", {
+      configurable: true,
+      value: {
+        getOutputTimestamp: () => ({
+          contextTime: 5,
+          performanceTime: outputPerformanceTime,
+        }),
+      },
+    });
+    player.noteVideoPresentation(4_900, 1_000);
+    const delays: number[] = [];
+    player.onAudioVideoDelay((sample) => delays.push(sample.delayMs));
+    player["handleWorkletMessage"]({
+      type: "pos",
+      sourceUs: 5_000_000,
+      contextTime: 5,
+    });
+    outputPerformanceTime = 1_300;
+    player["handleWorkletMessage"]({
+      type: "pos",
+      sourceUs: 5_000_000,
+      contextTime: 5,
+    });
+
+    expect(delays).toEqual([20, 200]);
+    Object.defineProperty(player, "ctx", { configurable: true, value: null });
+    player.destroy();
   });
 });

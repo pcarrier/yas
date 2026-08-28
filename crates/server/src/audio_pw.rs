@@ -194,22 +194,26 @@ const PW_STREAM_FLAG_RT_PROCESS: u32 = 1 << 4;
 
 const SPA_TYPE_ID: u32 = 3;
 const SPA_TYPE_INT: u32 = 4;
+const SPA_TYPE_LONG: u32 = 5;
 const SPA_TYPE_OBJECT: u32 = 15;
 const SPA_TYPE_RECTANGLE: u32 = 10;
 const SPA_TYPE_FRACTION: u32 = 11;
 const SPA_TYPE_OBJECT_FORMAT: u32 = 0x40003;
 const SPA_TYPE_OBJECT_PARAM_BUFFERS: u32 = 0x40004;
 const SPA_TYPE_OBJECT_PARAM_META: u32 = 0x40005;
+const SPA_TYPE_OBJECT_PARAM_PROCESS_LATENCY: u32 = 0x4000c;
 const SPA_PARAM_ENUM_FORMAT: u32 = 3;
 const SPA_PARAM_FORMAT: u32 = 4;
 const SPA_PARAM_BUFFERS: u32 = 5;
 const SPA_PARAM_META: u32 = 6;
+const SPA_PARAM_PROCESS_LATENCY: u32 = 16;
 const SPA_PARAM_BUFFERS_BUFFERS: u32 = 1;
 const SPA_PARAM_BUFFERS_BLOCKS: u32 = 2;
 const SPA_PARAM_BUFFERS_SIZE: u32 = 3;
 const SPA_PARAM_BUFFERS_STRIDE: u32 = 4;
 const SPA_PARAM_META_TYPE: u32 = 1;
 const SPA_PARAM_META_SIZE: u32 = 2;
+const SPA_PARAM_PROCESS_LATENCY_NS: u32 = 3;
 const SPA_META_HEADER: u32 = 1;
 const SPA_META_HEADER_FLAG_GAP: u32 = 1 << 4;
 const SPA_TIME_INVALID: i64 = i64::MIN;
@@ -237,6 +241,8 @@ type FnPwThreadLoopNew = unsafe extern "C" fn(*const c_char, *const SpaDict) -> 
 type FnPwThreadLoopDestroy = unsafe extern "C" fn(*mut PwThreadLoop);
 type FnPwThreadLoopStart = unsafe extern "C" fn(*mut PwThreadLoop) -> c_int;
 type FnPwThreadLoopStop = unsafe extern "C" fn(*mut PwThreadLoop);
+type FnPwThreadLoopLock = unsafe extern "C" fn(*mut PwThreadLoop);
+type FnPwThreadLoopUnlock = unsafe extern "C" fn(*mut PwThreadLoop);
 type FnPwThreadLoopGetLoop = unsafe extern "C" fn(*mut PwThreadLoop) -> *mut PwLoop;
 type FnPwStreamNewSimple = unsafe extern "C" fn(
     *mut PwLoop,
@@ -269,6 +275,8 @@ struct Syms {
     pw_thread_loop_destroy: FnPwThreadLoopDestroy,
     pw_thread_loop_start: FnPwThreadLoopStart,
     pw_thread_loop_stop: FnPwThreadLoopStop,
+    pw_thread_loop_lock: FnPwThreadLoopLock,
+    pw_thread_loop_unlock: FnPwThreadLoopUnlock,
     pw_thread_loop_get_loop: FnPwThreadLoopGetLoop,
     pw_stream_new_simple: FnPwStreamNewSimple,
     pw_stream_destroy: FnPwStreamDestroy,
@@ -368,6 +376,8 @@ fn syms() -> Option<&'static Syms> {
                 pw_thread_loop_destroy: sym!("pw_thread_loop_destroy", FnPwThreadLoopDestroy),
                 pw_thread_loop_start: sym!("pw_thread_loop_start", FnPwThreadLoopStart),
                 pw_thread_loop_stop: sym!("pw_thread_loop_stop", FnPwThreadLoopStop),
+                pw_thread_loop_lock: sym!("pw_thread_loop_lock", FnPwThreadLoopLock),
+                pw_thread_loop_unlock: sym!("pw_thread_loop_unlock", FnPwThreadLoopUnlock),
                 pw_thread_loop_get_loop: sym!("pw_thread_loop_get_loop", FnPwThreadLoopGetLoop),
                 pw_stream_new_simple: sym!("pw_stream_new_simple", FnPwStreamNewSimple),
                 pw_stream_destroy: sym!("pw_stream_destroy", FnPwStreamDestroy),
@@ -488,6 +498,36 @@ fn build_audio_format_pod_for(format: u32, channels: i32) -> Vec<u64> {
     let mut aligned: Vec<u64> = vec![0u64; bytes.len() / 8];
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), aligned.as_mut_ptr() as *mut u8, bytes.len());
+    }
+    aligned
+}
+
+/// Build a writable ProcessLatency parameter. This is logical latency only:
+/// PipeWire propagates it upstream to playback clients without buffering the
+/// capture stream or delaying YAS video.
+fn build_process_latency_pod(ns: u64) -> Vec<u64> {
+    let ns = i64::try_from(ns).unwrap_or(i64::MAX);
+    let mut body = Vec::with_capacity(32);
+    body.extend_from_slice(&SPA_TYPE_OBJECT_PARAM_PROCESS_LATENCY.to_le_bytes());
+    body.extend_from_slice(&SPA_PARAM_PROCESS_LATENCY.to_le_bytes());
+    body.extend_from_slice(&SPA_PARAM_PROCESS_LATENCY_NS.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&8u32.to_le_bytes());
+    body.extend_from_slice(&SPA_TYPE_LONG.to_le_bytes());
+    body.extend_from_slice(&ns.to_le_bytes());
+
+    let mut bytes = Vec::with_capacity(8 + body.len());
+    bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&SPA_TYPE_OBJECT.to_le_bytes());
+    bytes.extend_from_slice(&body);
+    assert!(bytes.len().is_multiple_of(8));
+    let mut aligned = vec![0u64; bytes.len() / 8];
+    unsafe {
+        ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            aligned.as_mut_ptr().cast::<u8>(),
+            bytes.len(),
+        );
     }
     aligned
 }
@@ -642,7 +682,7 @@ fn build_raw_video_buffers_pod(frame_size: i32, stride: i32) -> Vec<u64> {
 /// callback fires with a dangling pointer).
 struct CaptureState {
     stream: *mut PwStream,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<CapturedAudioChunk>,
     /// Flipped to false on Capture::drop so the callback stops forwarding
     /// before the PipeWire stream is destroyed.
     active: AtomicBool,
@@ -652,6 +692,44 @@ struct CaptureState {
 // callback (while active) and from Drop (after stop).  tx is Send+Sync.
 unsafe impl Send for CaptureState {}
 unsafe impl Sync for CaptureState {}
+
+/// One capture quantum and the CLOCK_MONOTONIC time of its first sample.
+///
+/// Keeping the timestamp beside the bytes is necessary for A/V accounting:
+/// stamping the eventual Opus packet after capture and encode hides the
+/// PipeWire graph/quantum delay from the remote playout report.
+pub(crate) struct CapturedAudioChunk {
+    pub(crate) data: Vec<u8>,
+    pub(crate) pts_ns: i64,
+}
+
+/// Read the negotiated SPA header, falling back to the callback clock minus
+/// the duration of this block when the daemon declined metadata.
+unsafe fn captured_audio_pts_ns(buffer: &SpaBuffer, bytes: usize) -> i64 {
+    unsafe {
+        if buffer.n_metas > 0 && !buffer.metas.is_null() {
+            let metas = std::slice::from_raw_parts(buffer.metas, buffer.n_metas as usize);
+            if let Some(meta) = metas.iter().find(|meta| meta.type_ == SPA_META_HEADER)
+                && !meta.data.is_null()
+                && (meta.size as usize) >= std::mem::size_of::<SpaMetaHeader>()
+            {
+                let header = &*meta.data.cast::<SpaMetaHeader>();
+                if header.flags & SPA_META_HEADER_FLAG_GAP == 0 && header.pts != SPA_TIME_INVALID {
+                    return header.pts;
+                }
+            }
+        }
+    }
+    // Interleaved stereo f32: eight bytes per sample frame.
+    let frames = bytes / 8;
+    let duration_ns = i64::try_from(frames)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000_000)
+        / 48_000;
+    monotonic_now_ns()
+        .unwrap_or(SPA_TIME_INVALID)
+        .saturating_sub(duration_ns)
+}
 
 /// PW thread-loop calls this on every cycle.  RT-safe: no allocations
 /// on the hot path beyond the Vec clone offered to the bounded mpsc.
@@ -687,7 +765,11 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
                         // falls behind, dropping audio is preferable to
                         // retaining an unbounded queue and eventually taking
                         // down the compositor process.
-                        let _ = state.tx.try_send(slice.to_vec());
+                        let pts_ns = captured_audio_pts_ns(sb, size);
+                        let _ = state.tx.try_send(CapturedAudioChunk {
+                            data: slice.to_vec(),
+                            pts_ns,
+                        });
                     }
                 }
             }
@@ -739,7 +821,7 @@ impl Capture {
     pub fn start(
         runtime_dir: &Path,
         target_node: &str,
-    ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), String> {
+    ) -> Result<(Self, mpsc::Receiver<CapturedAudioChunk>), String> {
         let s = syms().ok_or_else(|| "libpipewire-0.3.so.0 not available".to_string())?;
 
         // Point this load of PipeWire at our private daemon.  These are
@@ -760,7 +842,7 @@ impl Capture {
         // At the configured 1024-frame quantum this is roughly 680 ms of
         // stereo F32 audio. It absorbs normal scheduler jitter without
         // allowing a stalled encoder to grow memory without bound.
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(32);
+        let (tx, rx) = mpsc::channel::<CapturedAudioChunk>(32);
 
         unsafe {
             let name = CString::new("yas-capture").unwrap();
@@ -836,8 +918,12 @@ impl Capture {
             (*state).stream = stream;
 
             // Connect with the format POD describing the capture format.
-            let pod = build_audio_format_pod();
-            let mut params: [*const c_void; 1] = [pod.as_ptr() as *const c_void];
+            let format_pod = build_audio_format_pod();
+            let header_pod = build_header_meta_pod();
+            let mut params: [*const c_void; 2] = [
+                format_pod.as_ptr() as *const c_void,
+                header_pod.as_ptr() as *const c_void,
+            ];
             let flags =
                 PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS;
             let rc = (s.pw_stream_connect)(
@@ -856,7 +942,8 @@ impl Capture {
             }
             // POD is referenced only during the connect call — libpipewire
             // copies what it needs.
-            drop(pod);
+            drop(format_pod);
+            drop(header_pod);
 
             if (s.pw_thread_loop_start)(thread_loop) < 0 {
                 (s.pw_stream_disconnect)(stream);
@@ -874,6 +961,32 @@ impl Capture {
                 },
                 rx,
             ))
+        }
+    }
+
+    /// Publish the remote viewer's measured extra audio playout latency.
+    /// Playback clients linked upstream receive it through normal PipeWire /
+    /// PulseAudio latency queries and can choose the corresponding media
+    /// video frame themselves.
+    pub fn set_process_latency_ns(&self, ns: u64) -> Result<(), String> {
+        let s = syms().ok_or_else(|| "libpipewire-0.3.so.0 not available".to_string())?;
+        if self.thread_loop.is_null() || self.stream.is_null() {
+            return Err("PipeWire capture stream is closed".to_string());
+        }
+        let pod = build_process_latency_pod(ns);
+        let mut params = [pod.as_ptr().cast::<c_void>()];
+        let rc = unsafe {
+            (s.pw_thread_loop_lock)(self.thread_loop);
+            let rc = (s.pw_stream_update_params)(self.stream, params.as_mut_ptr(), 1);
+            (s.pw_thread_loop_unlock)(self.thread_loop);
+            rc
+        };
+        if rc < 0 {
+            Err(format!(
+                "pw_stream_update_params(ProcessLatency) failed: {rc}"
+            ))
+        } else {
+            Ok(())
         }
     }
 }
@@ -1948,6 +2061,23 @@ wireplumber.profiles = {
         assert_eq!(word(80), 64 * 48 * 4);
         assert_eq!(word(88), SPA_PARAM_BUFFERS_STRIDE);
         assert_eq!(word(104), 64 * 4);
+    }
+
+    #[test]
+    fn process_latency_pod_carries_nanoseconds() {
+        let pod = build_process_latency_pod(123_456_789);
+        let bytes = unsafe { std::slice::from_raw_parts(pod.as_ptr().cast::<u8>(), pod.len() * 8) };
+        let word =
+            |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(word(4), SPA_TYPE_OBJECT);
+        assert_eq!(word(8), SPA_TYPE_OBJECT_PARAM_PROCESS_LATENCY);
+        assert_eq!(word(12), SPA_PARAM_PROCESS_LATENCY);
+        assert_eq!(word(16), SPA_PARAM_PROCESS_LATENCY_NS);
+        assert_eq!(word(28), SPA_TYPE_LONG);
+        assert_eq!(
+            i64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            123_456_789
+        );
     }
 
     #[test]

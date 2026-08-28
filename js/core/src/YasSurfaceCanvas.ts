@@ -3290,7 +3290,7 @@ export class YasSurfaceCanvas {
     } else if (type === SURFACE_POINTER_UP) {
       this.pressedButtons.delete(button);
     }
-    const point = this.surfaceWirePoint(clientX, clientY, geometry);
+    const point = this.pointerWirePoint(clientX, clientY, geometry);
     if (!point) return;
     conn.sendSurfacePointer(
       this._surfaceId,
@@ -3303,6 +3303,32 @@ export class YasSurfaceCanvas {
   }
 
   /**
+   * Pointer position as fractions of the pixels actually visible in this
+   * canvas.
+   *
+   * This deliberately does not pass through `surface.width`/`height`. Those
+   * catalogue dimensions describe the newest server composite, while the
+   * canvas can still be presenting the previous frame during a resize. Using
+   * them here paired one frame's cursor position with another frame's size and
+   * made the cursor jump after every floating-window resize. The server owns
+   * the current compositor mapping and expands these fractions there.
+   */
+  private pointerWirePoint(
+    clientX: number,
+    clientY: number,
+    geometry?: DrawnGeometry | null,
+  ): { x: number; y: number } | null {
+    const g = geometry ?? this.drawnGeometry();
+    if (!g) return null;
+    const x = (clientX - g.rect.left - g.dx) / g.dw;
+    const y = (clientY - g.rect.top - g.dy) / g.dh;
+    return {
+      x: Math.min(Math.max(x, 0), 1),
+      y: Math.min(Math.max(y, 0), 1),
+    };
+  }
+
+  /**
    * A surface position ready for native Surface encoding.
    *
    * Every one of these coordinates is encoded into an unsigned 16-bit field, so
@@ -3310,8 +3336,9 @@ export class YasSurfaceCanvas {
    * `object-fit: contain` canvas, or a fractional `rect.left` against an integer
    * `clientX` — would be sent as its two's-complement wrap. The server reads
    * ~65535, and since it now mirrors these positions to other viewers, their
-   * overlay clamps the bogus value to the opposite edge. Use this for anything
-   * sent through pointer or drag operations.
+   * overlay clamps the bogus value to the opposite edge. Native drag operations
+   * still use this physical-coordinate path; pointer input uses normalized
+   * visible-frame coordinates so resize epochs cannot be mixed.
    */
   private surfaceWirePoint(
     clientX: number,

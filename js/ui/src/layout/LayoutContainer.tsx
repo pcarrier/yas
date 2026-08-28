@@ -4,8 +4,9 @@
  * What a split does with its children is the manager. `line`/`col`/`tabs`
  * tile; `scroll` lays a strip out wider than the viewport and follows the
  * focus along it; `float` places each child by its own frame. Everything
- * below the root is the same recursion either way, which is why a strip
- * column can be a stack and a floating window can hold a tiling tree.
+ * below a scrolling root is the same recursion, so a strip column can be a
+ * stack. Floating is stricter: each root child is one independent window and
+ * one assignment.
  *
  * Ctrl+B m offers the managers for the same windows from Workspace, and the
  * keys that only mean something with a tree on screen are registered from
@@ -15,6 +16,7 @@ import {
   createSignal,
   createEffect,
   createMemo,
+  onMount,
   onCleanup,
   untrack,
   batch,
@@ -104,16 +106,24 @@ import { registerPrefixAction } from "../keyPrefix";
 import type { SurfaceTouchMode, SurfaceZoomMode } from "../storage";
 import {
   floatingLayerStackingStyle,
+  floatingFrameNodes,
+  floatingDropAppendsWindow,
   floatingPaneIds,
   floatingWindowTitle,
   appendFloatingWindow,
+  reusableFloatingPaneId,
   resizeFloatingRect,
+  rebaseFloatingRect,
   snapFloatingRect,
   type FloatingDragMode,
   type FloatingResizeEdge,
 } from "./floatingWindow";
 import { removePaneFromLayout, showEmptyPaneHint } from "./paneRemoval";
 import { SurfaceIcon } from "../SurfaceIcon";
+import {
+  mergeUniquePaneAssignments,
+  uniquePaneValues,
+} from "./assignmentOwnership";
 
 // The tree context lives in ./treeContext so its identity survives hot
 // reloads of this module (see that file).
@@ -305,9 +315,10 @@ export function LayoutContainer(props: {
   // The backend store carries stable PTY/surface/tab refs. Resolve them to
   // ephemeral live assignments as their remotes arrive, while retaining every
   // unresolved ref separately so a detached remote cannot erase session state.
-  let pendingRefs: Record<string, string> = {
-    ...(props.storedAssignments ?? {}),
-  };
+  let pendingRefs: Record<string, string> = uniquePaneValues(
+    props.storedAssignments ?? {},
+    paneIds(),
+  );
   const [pendingRefsRevision, setPendingRefsRevision] = createSignal(0);
   const [resolvingRefs, setResolvingRefs] = createSignal(
     Object.keys(pendingRefs).length > 0,
@@ -395,7 +406,11 @@ export function LayoutContainer(props: {
     if (pendingRefs[paneId] !== ref) return;
     if (assignment) {
       setLayoutState((prev) => ({
-        assignments: { ...prev.assignments, [paneId]: assignment },
+        assignments: mergeUniquePaneAssignments(
+          prev.assignments,
+          { [paneId]: assignment },
+          paneIds(),
+        ),
       }));
     }
   }
@@ -409,6 +424,7 @@ export function LayoutContainer(props: {
     }
     const live = liveSessions();
     const snap = workspaceState();
+    const liveSurfaceKeys = new Set(props.liveSurfaceKeys ?? []);
     const resolved: Record<string, string> = {};
     let waitingForInitialRemoteState = false;
     for (const [paneId, ref] of entries) {
@@ -422,8 +438,14 @@ export function LayoutContainer(props: {
       }
       if (parsed.kind === "surface") {
         const surfaceId = surfaceIdForWorkspaceRef(parsed);
-        const assignment = surfaceAssignment(parsed.connectionId, surfaceId);
-        resolved[paneId] = assignment;
+        const key = `${parsed.connectionId}:${surfaceId}`;
+        // A stable ref names identity, not liveness. Restoring it while the
+        // connection is ready but its catalogue does not contain the surface
+        // resurrects a destroyed window as a permanent black pane. Keep the
+        // ref for a future reconnect, but only materialize a live assignment.
+        if (liveSurfaceKeys.has(key)) {
+          resolved[paneId] = surfaceAssignment(parsed.connectionId, surfaceId);
+        }
         continue;
       }
       if (parsed.kind === "terminal") {
@@ -469,7 +491,11 @@ export function LayoutContainer(props: {
 
     if (Object.keys(resolved).length > 0) {
       setLayoutState((prev) => ({
-        assignments: { ...prev.assignments, ...resolved },
+        assignments: mergeUniquePaneAssignments(
+          prev.assignments,
+          resolved,
+          paneIds(),
+        ),
       }));
     }
     setResolvingRefs(
@@ -641,7 +667,7 @@ export function LayoutContainer(props: {
     restoreGeneration += 1;
     tabFetchesInFlight.clear();
     settledTabLookups.clear();
-    pendingRefs = { ...(props.storedAssignments ?? {}) };
+    pendingRefs = uniquePaneValues(props.storedAssignments ?? {}, paneIds());
     touchPendingRefs();
     setResolvingRefs(Object.keys(pendingRefs).length > 0);
     const ids = paneIds();
@@ -815,6 +841,13 @@ export function LayoutContainer(props: {
     direction: "horizontal" | "vertical" = "horizontal",
   ) {
     const cur = root();
+    // A floating child is a window, not a miniature tiling workspace. Content
+    // opened through a split-capable caller still gets its own top-level frame;
+    // an empty keyboard split has no meaningful floating representation.
+    if (windowManagerOf(cur) === "floating") {
+      if (value != null) addFloatingWindow(value);
+      return;
+    }
     const path = leafPath(cur, targetPaneId);
     if (path === null) {
       // Can't locate the pane in the tree — fall back to a plain replace.
@@ -877,6 +910,31 @@ export function LayoutContainer(props: {
       setFocusedPaneId(shown);
       return;
     }
+    const current = root();
+    // Closing a floating frame deliberately leaves its top-level leaf in the
+    // live tree. Reuse that stable slot before appending: the pane ids and DOM
+    // owners of every other window then remain untouched for their lifetime.
+    if (current.type === "split" && current.direction === "floating") {
+      const paneId = reusableFloatingPaneId(
+        current,
+        layoutState().assignments,
+        new Set(Object.keys(pendingRefs)),
+      );
+      if (paneId) {
+        batch(() => {
+          setLayoutState((previous) => ({
+            ...previous,
+            assignments: {
+              ...previous.assignments,
+              [paneId]: value,
+            },
+          }));
+          setFocusedPaneId(paneId);
+          raisePane(paneId);
+        });
+        return;
+      }
+    }
     const appended = appendFloatingWindow(root());
     if (!appended) return;
     forgetPendingRef(appended.paneId);
@@ -938,16 +996,59 @@ export function LayoutContainer(props: {
   }
 
   /**
-   * Remove a leaf from the layout. `closeContent=false` parks its occupant;
-   * true closes it. In either case the layout tree itself shrinks, so floating
-   * windows cannot turn into purposeless empty shells and tiled layouts do not
-   * accumulate dead slots.
+   * Remove a displayed pane. `closeContent=false` parks its occupant; true
+   * closes it. Tiled trees shrink normally. Floating roots retain an invisible
+   * reusable slot so removing one window cannot renumber or resize another.
    */
   function removePane(paneId: string, closeContent: boolean) {
     const currentRoot = root();
     const currentPanes = enumeratePanes(currentRoot);
     const previous = layoutState();
     const removed = previous.assignments[paneId] ?? null;
+
+    // A floating frame is a stable live slot. Compacting the root here shifts
+    // positional pane ids, which makes every later terminal/surface reconcile
+    // its owner and size even though its rectangle did not change. Hide the
+    // closed frame by clearing its assignment and keep the leaf for reuse.
+    if (windowManagerOf(currentRoot) === "floating") {
+      const retained = currentPanes.filter(
+        (pane) =>
+          pane.id !== paneId &&
+          (previous.assignments[pane.id] != null ||
+            pendingRefs[pane.id] != null),
+      );
+      if (retained.length === 0) {
+        props.onCollapseToSingle?.(null);
+        if (closeContent) closeAssignment(removed);
+        return;
+      }
+
+      const focusedBefore = untrack(focusedPaneId);
+      const nextFocus =
+        focusedBefore &&
+        focusedBefore !== paneId &&
+        previous.assignments[focusedBefore] != null
+          ? focusedBefore
+          : (retained.find((pane) => previous.assignments[pane.id] != null)
+              ?.id ??
+            retained[0]?.id ??
+            null);
+      batch(() => {
+        forgetPendingRef(paneId);
+        if (untrack(soloedPaneId) === paneId) setSoloedPaneId(null);
+        setRaiseOrder((order) => order.filter((id) => id !== paneId));
+        setLayoutState((state) => ({
+          ...state,
+          assignments: { ...state.assignments, [paneId]: null },
+        }));
+        setFocusedPaneId(nextFocus);
+      });
+      // Publish the stable visual state before a synchronous catalogue/focus
+      // update from the close can arrive.
+      if (closeContent) closeAssignment(removed);
+      return;
+    }
+
     if (closeContent) closeAssignment(removed);
 
     // A layout-mounted container should have at least two leaves, but keep the
@@ -989,15 +1090,41 @@ export function LayoutContainer(props: {
       0,
       currentPanes.findIndex((pane) => pane.id === paneId),
     );
+    const paneIdMap = new Map<string, string>();
+    for (let index = 0; index < survivingPanes.length; index++) {
+      const target = nextPanes[index];
+      if (target) paneIdMap.set(survivingPanes[index].id, target.id);
+    }
+    const focusedBefore = untrack(focusedPaneId);
+    const retainedFocus = focusedBefore
+      ? paneIdMap.get(focusedBefore)
+      : undefined;
     const nextFocus =
+      retainedFocus ??
       nextPanes[Math.min(removedIndex, nextPanes.length - 1)]?.id ??
       nextPanes[0]?.id ??
       null;
+    const nextRaiseOrder = untrack(raiseOrder).flatMap((raisedPaneId) => {
+      const mapped = paneIdMap.get(raisedPaneId);
+      if (mapped) return [mapped];
+
+      // Old nested floating state can use the top-level child id for stacking
+      // while enumeratePanes returns only descendant leaves. Map that frame
+      // through its first surviving leaf and retain the same path depth.
+      const prefix = `${raisedPaneId}.`;
+      const survivorIndex = survivingPanes.findIndex((pane) =>
+        pane.id.startsWith(prefix),
+      );
+      const target = nextPanes[survivorIndex];
+      if (!target) return [];
+      const depth = raisedPaneId.split(".").length;
+      return [target.id.split(".").slice(0, depth).join(".")];
+    });
     batch(() => {
       pendingRefs = nextPending;
       touchPendingRefs();
       setSoloedPaneId(null);
-      setRaiseOrder([]);
+      setRaiseOrder([...new Set(nextRaiseOrder)]);
       setLayoutState(nextAssignments);
       updateRoot(nextRoot);
       setFocusedPaneId(nextFocus);
@@ -1044,7 +1171,12 @@ export function LayoutContainer(props: {
   // own bindings for the same two keys — splitting one pane of a tree and
   // turning a single view into a tree are different operations.
   createEffect(() => {
-    const ids = paneIds();
+    const ids =
+      windowManagerOf(root()) === "floating"
+        ? paneIds().filter(
+            (paneId) => layoutState().assignments[paneId] != null,
+          )
+        : paneIds();
     const fpId = focusedPaneId();
     const cyclePane = (delta: 1 | -1) => {
       if (ids.length === 0) return;
@@ -1155,6 +1287,19 @@ export function LayoutContainer(props: {
     );
   }
 
+  function handleRectsChange(split: LayoutSplit, rects: readonly LayoutRect[]) {
+    updateRoot(
+      replaceSplit(split, {
+        ...split,
+        children: split.children.map((child, index) => ({
+          ...child,
+          rect: clampRect(rects[index] ?? child.rect ?? cascadeRect(index)),
+        })),
+      }),
+      true,
+    );
+  }
+
   function handleColumnWidth(
     split: LayoutSplit,
     index: number,
@@ -1183,8 +1328,31 @@ export function LayoutContainer(props: {
   function chooseWindowManager(manager: WindowManager) {
     const current = root();
     if (windowManagerOf(current) === manager) return;
-    const next = toWindowManager(current, manager);
-    const currentPanes = enumeratePanes(current);
+    let managerSource = current;
+    let currentPanes = enumeratePanes(current);
+    // Floating close leaves reusable empty slots so live windows never get
+    // renumbered. An explicit manager switch is the one safe point to compact
+    // those slots: every visible window is being rebuilt by definition.
+    if (current.type === "split" && current.direction === "floating") {
+      const retained = current.children.flatMap((child, index) => {
+        const paneId = String(index);
+        // An explicit manager change operates on what is visible now. Stable
+        // refs for destroyed/disconnected occupants are useful for reconnect,
+        // but retaining them here turns every hidden floating reuse slot into
+        // an empty tile. Reconnection can restore those resources from the
+        // workspace registry without manufacturing panes for them.
+        return layoutState().assignments[paneId] != null
+          ? [{ child, pane: currentPanes[index] }]
+          : [];
+      });
+      if (retained.length === 0) return;
+      managerSource = {
+        ...current,
+        children: retained.map(({ child }) => child),
+      };
+      currentPanes = retained.flatMap(({ pane }) => (pane ? [pane] : []));
+    }
+    const next = toWindowManager(managerSource, manager);
     const nextPanes = enumeratePanes(next);
     const focusedIndex = Math.max(
       0,
@@ -1365,6 +1533,7 @@ export function LayoutContainer(props: {
     },
     onToggleSolo: toggleSolo,
     onRectChange: handleRectChange,
+    onRectsChange: handleRectsChange,
     onColumnWidth: handleColumnWidth,
     floatingDepth,
     onRaisePane: raisePane,
@@ -1783,11 +1952,20 @@ function LeafPane(props: {
         if (assignment && ctx.onDropTile) {
           e.preventDefault();
           e.stopPropagation();
-          ctx.onDropTile(
-            assignment,
-            props.paneId,
-            paneDragSource(e) ?? undefined,
-          );
+          const sourcePaneId = paneDragSource(e) ?? undefined;
+          // A parked item is not being moved from another pane. In floating
+          // mode it therefore becomes an independent window even when the
+          // pointer lands over an existing frame; treating that frame as an
+          // ordinary pane target replaces its occupant and briefly renders
+          // the displaced terminal both there and in the dock.
+          if (
+            ctx.windowManager === "floating" &&
+            floatingDropAppendsWindow(sourcePaneId)
+          ) {
+            ctx.onAddFloatingWindow(assignment);
+          } else {
+            ctx.onDropTile(assignment, props.paneId, sourcePaneId);
+          }
         }
       }}
     >
@@ -2037,10 +2215,9 @@ function LeafPane(props: {
 /**
  * The scrolling and floating managers.
  *
- * Both are one level of the same tree the tiling manager renders, so a child
- * is still a `PaneNode` and can still be a split — a strip column is a stack
- * when you divide it, and a floating window can hold a tiling tree. Only the
- * placement of the root's children differs.
+ * Both use the same renderer as the tiling manager. A scrolling child may be
+ * a stack; a floating child remains a single leaf so one frame has exactly one
+ * assignment. `floatingPaneIds` still handles old nested state defensively.
  */
 function ManagedSplit(props: {
   split: LayoutSplit;
@@ -2229,6 +2406,44 @@ function FloatingLayer(props: {
     index: number;
     rect: LayoutRect;
   } | null>(null);
+  let previousLayerBox: DOMRect | null = null;
+  let layerResizeFrame = 0;
+  onMount(() => {
+    previousLayerBox = layer.getBoundingClientRect();
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(layerResizeFrame);
+      layerResizeFrame = requestAnimationFrame(() => {
+        layerResizeFrame = 0;
+        const next = layer.getBoundingClientRect();
+        const previous = previousLayerBox;
+        previousLayerBox = next;
+        if (
+          !previous ||
+          dragging() ||
+          (previous.left === next.left &&
+            previous.top === next.top &&
+            previous.width === next.width &&
+            previous.height === next.height)
+        )
+          return;
+        ctx.onRectsChange(
+          props.split,
+          props.split.children.map((child, index) =>
+            rebaseFloatingRect(
+              clampRect(child.rect ?? cascadeRect(index)),
+              previous,
+              next,
+            ),
+          ),
+        );
+      });
+    });
+    observer.observe(layer);
+    onCleanup(() => {
+      observer.disconnect();
+      cancelAnimationFrame(layerResizeFrame);
+    });
+  });
 
   const rectOf = (child: LayoutChild, index: number): LayoutRect => {
     const live = dragging();
@@ -2263,9 +2478,16 @@ function FloatingLayer(props: {
       // percentages.
       const snapX = percentOf(12, box.width);
       const snapY = percentOf(12, box.height);
+      const neighbors = props.split.children.flatMap((child, at) => {
+        if (at === index) return [];
+        const occupied = floatingPaneIds(child.node, [...props.path, at]).some(
+          (paneId) => props.assignments[paneId] != null,
+        );
+        return occupied ? [rectOf(child, at)] : [];
+      });
       setDragging({
         index,
-        rect: snapFloatingRect(next, mode, snapX, snapY),
+        rect: snapFloatingRect(next, mode, snapX, snapY, neighbors),
       });
     };
     const done = () => {
@@ -2308,10 +2530,15 @@ function FloatingLayer(props: {
         ctx.onAddFloatingWindow(value);
       }}
     >
-      <Index each={props.split.children}>
-        {(child, index) => {
-          const paneIds = () =>
-            floatingPaneIds(child().node, [...props.path, index]);
+      {/* Key floating windows by the node inside each layout child. The child
+          wrapper is rewritten whenever its rect is rebased, so keying by the
+          wrapper remounts every terminal/surface once per viewport resize.
+          The node survives both rect changes and sibling removal, while still
+          disposing exactly the subtree that is actually removed. */}
+      <For each={floatingFrameNodes(props.split.children)}>
+        {(node, index) => {
+          const child = () => props.split.children[index()];
+          const paneIds = () => floatingPaneIds(node, [...props.path, index()]);
           const paneId = () => {
             const ids = paneIds();
             const focused = props.focusedPaneId;
@@ -2319,7 +2546,7 @@ function FloatingLayer(props: {
             return (
               ids.find((id) => props.assignments[id] != null) ??
               ids[0] ??
-              props.paneIdAt(index)
+              props.paneIdAt(index())
             );
           };
           const assignment = () => props.assignments[paneId()] ?? null;
@@ -2332,8 +2559,8 @@ function FloatingLayer(props: {
           const rect = () =>
             soloed()
               ? { x: 0, y: 0, width: 100, height: 100 }
-              : rectOf(child(), index);
-          const focused = () => props.holdsFocus(index);
+              : rectOf(child(), index());
+          const focused = () => props.holdsFocus(index());
           const title = () => {
             const value = assignment();
             return value
@@ -2427,17 +2654,17 @@ function FloatingLayer(props: {
                   // never behind the one you last dragged.
                   "z-index":
                     (focused() ? 1_000 : 0) +
-                    ctx.floatingDepth(props.paneIdAt(index)),
+                    ctx.floatingDepth(props.paneIdAt(index())),
                 }}
                 onPointerDown={() => {
-                  ctx.onRaisePane(props.paneIdAt(index));
+                  ctx.onRaisePane(props.paneIdAt(index()));
                   ctx.onFocusPane(paneId());
                 }}
               >
                 <div
                   role="presentation"
                   onPointerDown={(event) => {
-                    if (!soloed()) drag(event, index, rect(), "move");
+                    if (!soloed()) drag(event, index(), rect(), "move");
                   }}
                   style={{
                     height: `${scale().md * 2}px`,
@@ -2527,11 +2754,11 @@ function FloatingLayer(props: {
                 </div>
                 <div style={{ flex: 1, position: "relative", "min-height": 0 }}>
                   <PaneNode
-                    node={child().node}
+                    node={node}
                     assignments={props.assignments}
                     focusedPaneId={props.focusedPaneId}
                     visible={props.visible && !hidden()}
-                    path={[...props.path, index]}
+                    path={[...props.path, index()]}
                   />
                 </div>
                 <Show when={!soloed()}>
@@ -2541,7 +2768,7 @@ function FloatingLayer(props: {
                         role="presentation"
                         aria-label={`Resize ${handle.edge}`}
                         onPointerDown={(event) =>
-                          drag(event, index, rect(), handle.edge)
+                          drag(event, index(), rect(), handle.edge)
                         }
                         style={{
                           position: "absolute",
@@ -2558,7 +2785,7 @@ function FloatingLayer(props: {
             </Show>
           );
         }}
-      </Index>
+      </For>
     </div>
   );
 }

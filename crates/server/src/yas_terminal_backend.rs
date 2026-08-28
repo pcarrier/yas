@@ -188,9 +188,10 @@ impl Registry {
             .values()
             .filter(|view| view.pty_id == pty_id)
             .map(|view| (view.rows, view.cols))
-            .reduce(|(rows, cols), (next_rows, next_cols)| {
-                (rows.min(next_rows), cols.min(next_cols))
-            })
+            // Render the largest requested logical grid and let each view
+            // scale it locally. Component-wise minima combine unrelated
+            // portrait/landscape offers into a grid no viewer requested.
+            .max_by_key(|(rows, cols)| (u32::from(*rows) * u32::from(*cols), *rows, *cols))
     }
 
     /// Update one view, returning whether its grid geometry changed.
@@ -441,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_size_is_mediated_across_every_native_view() {
+    fn terminal_size_uses_the_largest_native_view() {
         let (frames, _frame_rx) = mpsc::channel(2);
         let mut registry = Registry::default();
         let large = registry
@@ -451,9 +452,9 @@ mod tests {
             .register(7, 24, 100, 60, frames)
             .expect("small Terminal view");
 
-        assert_eq!(registry.mediated_size(7), Some((24, 100)));
+        assert_eq!(registry.mediated_size(7), Some((40, 160)));
         assert_eq!(registry.configure(large, 20, 120, 60), Some(true));
-        assert_eq!(registry.mediated_size(7), Some((20, 100)));
+        assert_eq!(registry.mediated_size(7), Some((24, 100)));
         let unchanged_guard = current_guard(&registry, large);
         assert_eq!(registry.configure(large, 20, 120, 60), Some(false));
         assert!(unchanged_guard.is_current());

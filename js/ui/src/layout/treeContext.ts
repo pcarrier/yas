@@ -109,6 +109,8 @@ export interface LayoutTreeCtx {
   ) => void;
   /** Move or resize one floating window, in percent of the viewport. */
   onRectChange: (split: LayoutSplit, index: number, rect: LayoutRect) => void;
+  /** Rebase every floating window atomically after its viewport changes. */
+  onRectsChange: (split: LayoutSplit, rects: readonly LayoutRect[]) => void;
   /** Set one scrolling column's width, as a fraction of the viewport. */
   onColumnWidth: (split: LayoutSplit, index: number, weight: number) => void;
   /**

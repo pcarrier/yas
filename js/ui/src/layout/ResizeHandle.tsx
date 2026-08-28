@@ -5,6 +5,9 @@ const HANDLE_SIZE = 2;
 export function ResizeHandle(props: {
   direction: "horizontal" | "vertical";
   onDrag: (fraction: number) => void;
+  /** Element whose full extent defines the reported fraction. Useful when
+   * the handle lives in an absolutely-positioned overlay. */
+  measureElement?: () => HTMLElement | null;
 }) {
   const [active, setActive] = createSignal(false);
   const [hover, setHover] = createSignal(false);
@@ -19,11 +22,12 @@ export function ResizeHandle(props: {
 
     const isHoriz = props.direction === "horizontal";
     startPos = isHoriz ? e.clientX : e.clientY;
-    const parent = (e.target as HTMLElement).parentElement;
-    containerSize = parent
+    const container =
+      props.measureElement?.() ?? (e.target as HTMLElement).parentElement;
+    containerSize = container
       ? isHoriz
-        ? parent.clientWidth
-        : parent.clientHeight
+        ? container.clientWidth
+        : container.clientHeight
       : 1;
 
     const onMove = (me: PointerEvent) => {

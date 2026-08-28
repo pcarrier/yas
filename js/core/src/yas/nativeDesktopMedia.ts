@@ -169,6 +169,7 @@ export class YasNativeDesktopClientLifecycle {
   private removeFrame: (() => void) | null = null;
   private removeFrameAck: (() => void) | null = null;
   private removeStreamStatus: (() => void) | null = null;
+  private removeAudioVideoDelay: (() => void) | null = null;
   private readonly clientListeners = new Set<{
     listener: (catalog: YasClientList) => void;
     onError?: (error: Error) => void;
@@ -192,6 +193,8 @@ export class YasNativeDesktopClientLifecycle {
   private pendingAudioOperation: (() => void | Promise<void>) | null = null;
   private audioOutputDrain: Promise<void> | null = null;
   private desiredAudioBitrate: number | null = null;
+  private lastPlayoutReportAt = 0;
+  private lastPlayoutDelayNs: bigint | null = null;
   private desktopInitial = true;
   private desktopGeneration = 0;
   private pendingDesktop: YasDesktopSnapshot | null = null;
@@ -270,6 +273,7 @@ export class YasNativeDesktopClientLifecycle {
         [g.YAS_CLASS_REQUEST, g.YAS_MEDIA_CLOSE_STREAM],
         [g.YAS_CLASS_EVENT, g.YAS_MEDIA_FRAME, true],
         [g.YAS_CLASS_EVENT, g.YAS_MEDIA_FRAME_ACK],
+        [g.YAS_CLASS_EVENT, g.YAS_MEDIA_PLAYOUT_REPORT],
         [g.YAS_CLASS_EVENT, g.YAS_MEDIA_STREAM_STATUS, true],
       ]);
     this.desktop = this.supportsDesktop
@@ -288,6 +292,10 @@ export class YasNativeDesktopClientLifecycle {
     options.mprisStore.setNativeController(
       this.media ? this.mprisController() : null,
     );
+    this.removeAudioVideoDelay =
+      options.audioPlayer.onAudioVideoDelay?.((sample) =>
+        this.reportAudioVideoDelay(sample.delayMs),
+      ) ?? null;
   }
 
   async start(): Promise<void> {
@@ -360,6 +368,7 @@ export class YasNativeDesktopClientLifecycle {
     this.removeFrame?.();
     this.removeFrameAck?.();
     this.removeStreamStatus?.();
+    this.removeAudioVideoDelay?.();
     this.removeDesktop = null;
     this.removeClient = null;
     this.removeMedia = null;
@@ -367,6 +376,7 @@ export class YasNativeDesktopClientLifecycle {
     this.removeFrame = null;
     this.removeFrameAck = null;
     this.removeStreamStatus = null;
+    this.removeAudioVideoDelay = null;
     // Disposal is also reached from session invalidation, after the transport
     // can no longer carry UNWATCH. Local teardown is authoritative here; the
     // wire cleanup is best-effort and must not become an unhandled rejection.
@@ -475,6 +485,8 @@ export class YasNativeDesktopClientLifecycle {
         consumedSequence: 0n,
         reassembly: null,
       };
+      this.lastPlayoutReportAt = 0;
+      this.lastPlayoutDelayNs = null;
       this.media!.sendFrameAck({
         streamHandle: result.streamHandle,
         consumedSequence: 0n,
@@ -1497,6 +1509,35 @@ export class YasNativeDesktopClientLifecycle {
     }
   }
 
+  private reportAudioVideoDelay(delayMs: number): void {
+    const output = this.audioOutput;
+    if (
+      !output ||
+      !this.media ||
+      output.consumedSequence === 0n ||
+      !Number.isFinite(delayMs)
+    )
+      return;
+    const now = monotonicNow();
+    const delayNs = BigInt(
+      Math.round(Math.max(0, Math.min(2_000, delayMs)) * 1_000_000),
+    );
+    if (now - this.lastPlayoutReportAt < 200) return;
+    if (
+      this.lastPlayoutDelayNs !== null &&
+      absBigInt(delayNs - this.lastPlayoutDelayNs) < 2_000_000n &&
+      now - this.lastPlayoutReportAt < 2_000
+    )
+      return;
+    this.lastPlayoutReportAt = now;
+    this.lastPlayoutDelayNs = delayNs;
+    this.media.sendPlayoutReport({
+      streamHandle: output.streamHandle,
+      consumedSequence: output.consumedSequence,
+      audioVideoDelayNs: delayNs,
+    });
+  }
+
   private queueAudio(operation: () => void | Promise<void>): void {
     const generation = this.audioOutputGeneration;
     // Audio controls describe desired state. Keep at most the in-flight
@@ -1526,6 +1567,8 @@ export class YasNativeDesktopClientLifecycle {
   private async closeAudioOutput(): Promise<void> {
     const output = this.audioOutput;
     this.audioOutput = null;
+    this.lastPlayoutReportAt = 0;
+    this.lastPlayoutDelayNs = null;
     if (output?.reassembly) output.reassembly.lease.release();
     this.options.audioPlayer.reset();
     if (output && this.media)
@@ -2377,4 +2420,8 @@ function safePngDimensions(
   )
     return null;
   return dimensions;
+}
+
+function absBigInt(value: bigint): bigint {
+  return value < 0n ? -value : value;
 }

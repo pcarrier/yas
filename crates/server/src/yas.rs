@@ -54,8 +54,8 @@ use super::yas_shutdown::{
     Coordinator as ShutdownCoordinator, Notice as ShutdownNotice, Resolution as ShutdownResolution,
 };
 use super::{
-    AppState, ConnectionCancellation, ConnectionOrigin, ConnectionRegistration,
-    NativeClientIdentity, NativeYasSubscriptions, begin_server_shutdown,
+    AppState, CachedSurfaceTextInput, ConnectionCancellation, ConnectionOrigin,
+    ConnectionRegistration, NativeClientIdentity, NativeYasSubscriptions, begin_server_shutdown,
     composite_link::DatagramLink,
 };
 
@@ -4829,6 +4829,25 @@ fn surface_cursor_extension(cursor: &yas_surface::CursorState) -> Option<Extensi
     cursor.extension().ok()
 }
 
+fn surface_text_input_extension(text_input: &CachedSurfaceTextInput) -> Option<Extension> {
+    yas_surface::TextInputState {
+        enabled: true,
+        requested: false,
+        content_hint: text_input.hint,
+        content_purpose: text_input.purpose,
+        cursor_rect: text_input
+            .cursor_rect
+            .map(|(x, y, width, height)| yas_surface::CursorRect {
+                x: i32::from(x),
+                y: i32::from(y),
+                width: i32::from(width),
+                height: i32::from(height),
+            }),
+    }
+    .extension()
+    .ok()
+}
+
 async fn surface_catalogue_snapshot(state: &AppState) -> SurfaceCatalogue {
     let mut session = state.session.lock().await;
     let Some(compositor) = session.compositor.as_ref() else {
@@ -4885,25 +4904,10 @@ async fn surface_catalogue_snapshot(state: &AppState) -> SurfaceCatalogue {
             {
                 extensions.push(extension);
             }
-            if let Some(text_input) = compositor.surface_text_inputs.get(&surface_id) {
-                extensions.push(
-                    yas_surface::TextInputState {
-                        enabled: true,
-                        requested: false,
-                        content_hint: text_input.hint,
-                        content_purpose: text_input.purpose,
-                        cursor_rect: text_input.cursor_rect.map(|(x, y, width, height)| {
-                            yas_surface::CursorRect {
-                                x: i32::from(x),
-                                y: i32::from(y),
-                                width: i32::from(width),
-                                height: i32::from(height),
-                            }
-                        }),
-                    }
-                    .extension()
-                    .expect("cached Surface text input state is valid"),
-                );
+            if let Some(text_input) = compositor.surface_text_inputs.get(&surface_id)
+                && let Some(extension) = surface_text_input_extension(text_input)
+            {
+                extensions.push(extension);
             }
             extensions.sort_unstable_by_key(|extension| extension.tag);
             let record = yas_surface::SurfaceRecord {
@@ -4978,9 +4982,9 @@ fn fixed_to_f64(value: i64) -> f64 {
     value as f64 / 4_294_967_296.0
 }
 
-fn fixed_to_surface_coordinate(value: i64) -> u16 {
-    let integral = value >> 32;
-    u16::try_from(integral.clamp(0, i64::from(u16::MAX))).unwrap_or(0)
+fn fixed_to_unit_coordinate(value: i64) -> Option<f64> {
+    let coordinate = fixed_to_f64(value);
+    (0.0..=1.0).contains(&coordinate).then_some(coordinate)
 }
 
 fn monotonic_millis(monotonic_ns: u64) -> u32 {
@@ -9345,13 +9349,13 @@ impl Session {
                     Some(super::yas_surface_backend::Input::Pointer {
                         phase,
                         button,
-                        // Coordinates name the compositor's native physical
-                        // surface, not this subscriber's encoded view.  A 1x
-                        // viewer of a surface composited at 2x deliberately
-                        // receives a half-sized encode; clamping here to that
-                        // view made its pointer stop halfway across the app.
-                        x: fixed_to_surface_coordinate(value.x_32_32),
-                        y: fixed_to_surface_coordinate(value.y_32_32),
+                        // Coordinates are fractions of the frame the browser
+                        // presented. The compositor expands them against its
+                        // current authoritative mapping; doing that in the
+                        // browser paired stale pixels with live catalogue
+                        // dimensions during a resize.
+                        x: fixed_to_unit_coordinate(value.x_32_32).ok_or(())?,
+                        y: fixed_to_unit_coordinate(value.y_32_32).ok_or(())?,
                         time_ms: monotonic_millis(value.client_monotonic_ns),
                     }),
                 )
@@ -12736,6 +12740,48 @@ impl Session {
                     }
                     *acknowledged_sequence = value.consumed_sequence;
                     *credit_frames = value.desired_credit_frames.min(64);
+                    Ok(())
+                }
+                yas_media::event_kind::PLAYOUT_REPORT => {
+                    if transport_datagram {
+                        return Err(());
+                    }
+                    let value = yas_media::PlayoutReport::decode(&frame.payload).map_err(|_| ())?;
+                    let (backend_owner, acknowledged_sequence) = {
+                        let native = self.native.as_ref().ok_or(())?;
+                        let Some(MediaStream::Output {
+                            acknowledged_sequence,
+                            ..
+                        }) = native.media.streams.get(&value.stream_handle)
+                        else {
+                            return Err(());
+                        };
+                        (native.media.backend_owner, *acknowledged_sequence)
+                    };
+                    if value.consumed_sequence == 0
+                        || value.consumed_sequence > acknowledged_sequence
+                    {
+                        return Err(());
+                    }
+                    // A corrupt or hostile viewer must not make applications
+                    // schedule seconds of old video. The browser applies the
+                    // same bound before sending; enforce it at authority too.
+                    let delay_ns = value.audio_video_delay_ns.min(2_000_000_000);
+                    let state = self.services.app_state.as_ref().ok_or(())?;
+                    let mut shared = state.session.lock().await;
+                    let compositor = shared.compositor.as_mut().ok_or(())?;
+                    let Some((changed, maximum)) = compositor
+                        .audio_broadcast
+                        .set_native_playout_delay_ns(backend_owner, delay_ns)
+                    else {
+                        return Err(());
+                    };
+                    if changed
+                        && let Some(pipeline) = compositor.audio_pipeline.as_ref()
+                        && let Err(error) = pipeline.set_playout_delay_ns(maximum)
+                    {
+                        eprintln!("[audio] failed to publish remote playout latency: {error}");
+                    }
                     Ok(())
                 }
                 _ => Err(()),
@@ -25067,14 +25113,19 @@ impl Session {
             let state = self.services.app_state.as_ref().ok_or(())?;
             let mut shared = state.session.lock().await;
             if let Some(compositor) = shared.compositor.as_mut() {
+                let previous_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 compositor.audio_broadcast.unsubscribe_native(owner);
                 let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
+                let max_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 if let Some(pipeline) = compositor.audio_pipeline.as_ref() {
                     pipeline.set_bitrate(if max_kbps == 0 {
                         super::audio::DEFAULT_BITRATE
                     } else {
                         i32::from(max_kbps) * 1_000
                     });
+                    if max_delay != previous_delay {
+                        let _ = pipeline.set_playout_delay_ns(max_delay);
+                    }
                 }
             }
             Ok(())
@@ -27071,7 +27122,20 @@ impl Session {
                 }
             }
             if let Some(compositor) = shared.compositor.as_mut() {
+                let previous_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 compositor.audio_broadcast.unsubscribe_native(owner);
+                let max_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
+                let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
+                if let Some(pipeline) = compositor.audio_pipeline.as_ref() {
+                    pipeline.set_bitrate(if max_kbps == 0 {
+                        super::audio::DEFAULT_BITRATE
+                    } else {
+                        i32::from(max_kbps) * 1_000
+                    });
+                    if max_delay != previous_delay {
+                        let _ = pipeline.set_playout_delay_ns(max_delay);
+                    }
+                }
                 compositor.media_input.disconnect(owner);
                 compositor.native_media_input_events.remove(&owner);
                 compositor.native_mpris_results.remove(&owner);
@@ -28118,6 +28182,11 @@ fn family_descriptors(
                 advertised_operation(
                     family::MEDIA,
                     Class::Event,
+                    yas_media::event_kind::PLAYOUT_REPORT,
+                ),
+                advertised_operation(
+                    family::MEDIA,
+                    Class::Event,
                     yas_media::event_kind::STREAM_STATUS,
                 ),
             ],
@@ -28741,7 +28810,9 @@ const fn read_only_accepts(family_id: u16, class: Class, kind: u16) -> bool {
         ),
         (family::MEDIA, Class::Event) => matches!(
             kind,
-            yas_media::event_kind::STATE_ACK | yas_media::event_kind::FRAME_ACK
+            yas_media::event_kind::STATE_ACK
+                | yas_media::event_kind::FRAME_ACK
+                | yas_media::event_kind::PLAYOUT_REPORT
         ),
         (family::FONT, Class::Request) => matches!(
             kind,
@@ -35768,6 +35839,16 @@ mod tests {
     const TEST_PEER_MAX_BUFFERED: u64 = 32 * 1024 * 1024;
 
     #[test]
+    fn malformed_cached_text_input_state_cannot_abort_a_snapshot() {
+        let cached = CachedSurfaceTextInput {
+            hint: 0,
+            purpose: 0,
+            cursor_rect: Some((10, 20, 0, 12)),
+        };
+        assert!(surface_text_input_extension(&cached).is_none());
+    }
+
+    #[test]
     fn surface_logical_size_scales_to_physical_pixels() {
         assert_eq!(
             positive_fixed_to_physical_u16(800_i64 << 32, 240),
@@ -35781,14 +35862,12 @@ mod tests {
     }
 
     #[test]
-    fn surface_pointer_is_not_clamped_to_a_downscaled_view() {
-        // A 400-wide 1x encode can be presenting a 1200-wide native surface
-        // composited for another 3x viewer.  The browser maps the centered
-        // presentation back into native coordinates before encoding input;
-        // the per-view video size must not truncate that coordinate.
-        assert_eq!(fixed_to_surface_coordinate(1199_i64 << 32), 1199);
-        assert_eq!(fixed_to_surface_coordinate(-1_i64 << 32), 0);
-        assert_eq!(fixed_to_surface_coordinate(i64::MAX), u16::MAX);
+    fn surface_pointer_accepts_only_normalized_frame_positions() {
+        assert_eq!(fixed_to_unit_coordinate(0), Some(0.0));
+        assert_eq!(fixed_to_unit_coordinate(1_i64 << 31), Some(0.5));
+        assert_eq!(fixed_to_unit_coordinate(1_i64 << 32), Some(1.0));
+        assert_eq!(fixed_to_unit_coordinate(-1), None);
+        assert_eq!(fixed_to_unit_coordinate((1_i64 << 32) + 1), None);
     }
 
     #[test]
@@ -45076,6 +45155,7 @@ mod tests {
             (Class::Request, yas_media::request_kind::PORTAL_REPLY),
             (Class::Event, yas_media::event_kind::FRAME),
             (Class::Event, yas_media::event_kind::FRAME_ACK),
+            (Class::Event, yas_media::event_kind::PLAYOUT_REPORT),
             (Class::Event, yas_media::event_kind::PORTAL_REQUEST),
         ] {
             assert!(descriptor.operations.iter().any(|operation| {
@@ -45337,6 +45417,53 @@ mod tests {
             },
         )
         .await;
+        write_event(
+            &mut client,
+            &codec,
+            family::MEDIA,
+            yas_media::event_kind::PLAYOUT_REPORT,
+            &yas_media::PlayoutReport {
+                stream_handle: opened.stream_handle,
+                consumed_sequence: audio.sequence,
+                audio_video_delay_ns: 87_000_000,
+            },
+        )
+        .await;
+        write_request(
+            &mut client,
+            &codec,
+            family::CORE,
+            yas_wire::core::request_kind::PING,
+            91,
+            &Ping {
+                sender_monotonic_ns: 0,
+            },
+        )
+        .await;
+        assert_eq!(
+            next_result(
+                &mut client,
+                &codec,
+                family::CORE,
+                yas_wire::core::request_kind::PING,
+                91,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
+        assert_eq!(
+            state
+                .session
+                .lock()
+                .await
+                .compositor
+                .as_ref()
+                .unwrap()
+                .audio_broadcast
+                .max_native_playout_delay_ns(),
+            87_000_000
+        );
 
         {
             let mut shared = state.session.lock().await;
@@ -45492,6 +45619,18 @@ mod tests {
                 .unwrap()
                 .audio_broadcast
                 .max_native_bitrate_kbps(),
+            0,
+        );
+        assert_eq!(
+            state
+                .session
+                .lock()
+                .await
+                .compositor
+                .as_ref()
+                .unwrap()
+                .audio_broadcast
+                .max_native_playout_delay_ns(),
             0,
         );
 

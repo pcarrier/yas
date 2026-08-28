@@ -967,6 +967,42 @@ describe("SurfaceStore surface dimensions", () => {
     store.destroy();
   });
 
+  it("replaces the surface object when resize changes input geometry", () => {
+    const store = new SurfaceStore();
+    store.handleSurfaceCreated(1, 0, 800, 600, "t", "a");
+    const before = store.getSurfaces().get(1)!;
+
+    store.handleSurfaceResized(1, 1200, 900, 600, 450);
+
+    const after = store.getSurfaces().get(1)!;
+    expect(after).not.toBe(before);
+    expect(after).toMatchObject({
+      width: 1200,
+      height: 900,
+      logicalWidth: 600,
+      logicalHeight: 450,
+    });
+    store.destroy();
+  });
+
+  it("accumulates one-pixel resize steps against the last published geometry", () => {
+    const store = new SurfaceStore();
+    store.handleSurfaceCreated(1, 0, 800, 600, "t", "a");
+    store.handleSurfaceResized(1, 800, 600, 800, 600);
+    let changes = 0;
+    const unsub = store.onChange(() => changes++);
+
+    store.handleSurfaceResized(1, 801, 601, 801, 601);
+    expect(store.getSurface(1)).toMatchObject({ width: 800, height: 600 });
+    expect(changes).toBe(0);
+
+    store.handleSurfaceResized(1, 802, 602, 802, 602);
+    expect(store.getSurface(1)).toMatchObject({ width: 802, height: 602 });
+    expect(changes).toBe(1);
+    unsub();
+    store.destroy();
+  });
+
   it("keeps the known logical size when a server sends none", () => {
     // Absent is not 0×0.  Clobbering it would tell every view the window
     // has no size, and 0 is the one value that cannot be drawn.
@@ -997,7 +1033,7 @@ describe("SurfaceStore surface dimensions", () => {
     // ahead of the replayed create.  Dropping it is permanent: the
     // compositor only emits a resize when the size changes, and nothing
     // re-announces the current one — the surface would keep the stale
-    // dimensions, and pointer coordinates are scaled by them.
+    // dimensions used by presentation and compositor-space metadata.
     const store = new SurfaceStore();
     store.handleSurfaceResized(1, 1409, 941, 838, 560);
     store.handleSurfaceCreated(1, 0, 838, 708, "t", "a");

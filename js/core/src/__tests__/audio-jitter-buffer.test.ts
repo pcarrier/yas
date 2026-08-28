@@ -212,13 +212,14 @@ describe("audio pre-worklet staging", () => {
   it("keeps the newest bounded tail while the worklet loads", () => {
     const player = new AudioPlayer();
     const inner = player as unknown as {
-      buffer: Float32Array[];
+      buffer: { pcm: Float32Array; timestampUs: number }[];
       onDecodedFrame(frame: AudioData): void;
     };
 
     for (let value = 0; value < MAX_STAGING_FRAMES + 4; value++) {
       const frame = {
         numberOfFrames: 1,
+        timestamp: value * 1_000,
         copyTo(destination: Float32Array) {
           destination[0] = value;
         },
@@ -228,8 +229,9 @@ describe("audio pre-worklet staging", () => {
     }
 
     expect(inner.buffer).toHaveLength(MAX_STAGING_FRAMES);
-    expect(inner.buffer[0][0]).toBe(4);
-    expect(inner.buffer[MAX_STAGING_FRAMES - 1][0]).toBe(
+    expect(inner.buffer[0].pcm[0]).toBe(4);
+    expect(inner.buffer[0].timestampUs).toBe(4_000);
+    expect(inner.buffer[MAX_STAGING_FRAMES - 1].pcm[0]).toBe(
       MAX_STAGING_FRAMES + 3,
     );
     player.destroy();

@@ -18,9 +18,4 @@ else
   unset XDG_RUNTIME_DIR
 fi
 
-# The binary is this unit's own artifact, so build it here rather than as a
-# oneshot another unit waits on: one log and one restart for "the development
-# server" instead of a dependency edge that reads like a service.
-./bin/dev-build
-
 exec ./target/profiling/yas server --verbose --name "$YAS_SERVER_NAME"

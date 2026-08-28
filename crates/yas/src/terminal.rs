@@ -3478,6 +3478,35 @@ impl TerminalFrame {
         Ok(out)
     }
 
+    /// Decode a logical FRAME body reassembled from one or more
+    /// `FRAME_CHUNK` events.
+    ///
+    /// Unlike [`Decode::decode`], this deliberately does not impose the
+    /// single-wire-frame bulk-chunk limit. The caller already bounded and
+    /// assembled the chunks; rejecting the result for being larger than one
+    /// chunk would make fragmentation unusable for exactly the frames that
+    /// need it.
+    pub fn decode_logical_body(view_id: u32, frame_sequence: u32, input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let frame_flags = decoder.u16()?;
+        let base_sequence =
+            if frame_flags & crate::schema::terminal::FRAME_EXPLICIT_BASE as u16 != 0 {
+                Some(decoder.u32()?)
+            } else {
+                None
+            };
+        let value = Self {
+            view_id,
+            frame_sequence,
+            frame_flags,
+            base_sequence,
+            grid_payload: decoder.rest().to_vec(),
+        };
+        decoder.finish()?;
+        value.validate_logical()?;
+        Ok(value)
+    }
+
     pub fn decode_grid_codec1(
         &self,
         max_decoded_frame: u32,
@@ -3511,20 +3540,7 @@ impl Decode for TerminalFrame {
         let mut decoder = Decoder::new(input);
         let view_id = decoder.u32()?;
         let frame_sequence = decoder.u32()?;
-        let frame_flags = decoder.u16()?;
-        let base_sequence =
-            if frame_flags & crate::schema::terminal::FRAME_EXPLICIT_BASE as u16 != 0 {
-                Some(decoder.u32()?)
-            } else {
-                None
-            };
-        let value = Self {
-            view_id,
-            frame_sequence,
-            frame_flags,
-            base_sequence,
-            grid_payload: decoder.rest().to_vec(),
-        };
+        let value = Self::decode_logical_body(view_id, frame_sequence, decoder.rest())?;
         decoder.finish()?;
         value.validate()?;
         Ok(value)

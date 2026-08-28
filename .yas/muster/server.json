@@ -12,9 +12,9 @@
     "and retrying that loops forever.",
     "timeoutStop 15s so AudioPipeline::drop can kill dbus/pipewire/pw-cat in order.",
     "",
-    "bin/dev-server builds the binary it then execs, rather than waiting on a",
-    "oneshot build unit: the artifact belongs to this unit alone, so one log",
-    "and one restart cover the whole of `the development server`.",
+    "The staged build dependency keeps this server running while a replacement",
+    "binary compiles. Muster restarts this unit only after that build succeeds;",
+    "a failed replacement leaves the current server in service.",
     "",
     "YAS_EDGE=1 serves the browser from this process, which is how a deployed",
     "server does it (nix/nixos-module.nix, nix/darwin-module.nix): one unit to",
@@ -37,6 +37,7 @@
     "start timeout while the server it was watching was up and healthy."
   ],
   "description": "Yas server and edge on :${PORTS+1} (${INSTANCE})",
+  "requires": ["build"],
   "command": ["direnv", "exec", "${STACK_DIR}", "dev-server"],
   "env": {
     "YAS_SERVER_NAME": "${INSTANCE}",

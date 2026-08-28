@@ -241,8 +241,7 @@ export interface YasMediaPortalScreenCastRequestMetadata {
 }
 
 export type YasMediaPortalRequestMetadata =
-  | YasMediaPortalAccessRequestMetadata
-  | YasMediaPortalScreenCastRequestMetadata;
+  YasMediaPortalAccessRequestMetadata | YasMediaPortalScreenCastRequestMetadata;
 
 export type YasMediaPortalReplyMetadata =
   | { kind: "empty" }
@@ -291,6 +290,12 @@ export interface YasMediaFrameAck {
   consumedSequence: bigint;
   queueDepth: number;
   desiredCreditFrames: number;
+}
+
+export interface YasMediaPlayoutReport {
+  streamHandle: bigint;
+  consumedSequence: bigint;
+  audioVideoDelayNs: bigint;
 }
 
 export interface YasMediaStreamStatus {
@@ -1208,6 +1213,31 @@ export function decodeMediaFrameAck(bytes: Uint8Array): YasMediaFrameAck {
   };
   cursor.end("Media FRAME_ACK");
   encodeMediaFrameAck(value);
+  return value;
+}
+
+export function encodeMediaPlayoutReport(
+  value: YasMediaPlayoutReport,
+): Uint8Array {
+  requireHandle(value.streamHandle, "Media stream");
+  return new YasWriter()
+    .u64(value.streamHandle)
+    .u64(value.consumedSequence)
+    .u64(value.audioVideoDelayNs)
+    .finish();
+}
+
+export function decodeMediaPlayoutReport(
+  bytes: Uint8Array,
+): YasMediaPlayoutReport {
+  const cursor = new YasCursor(bytes);
+  const value = {
+    streamHandle: cursor.u64("Media stream"),
+    consumedSequence: cursor.u64("Media consumed sequence"),
+    audioVideoDelayNs: cursor.u64("Media audio/video delay"),
+  };
+  cursor.end("Media PLAYOUT_REPORT");
+  encodeMediaPlayoutReport(value);
   return value;
 }
 
@@ -2196,6 +2226,14 @@ export class YasMediaClient {
       g.YAS_FAMILY_MEDIA,
       g.YAS_MEDIA_FRAME_ACK,
       encodeMediaFrameAck(value),
+    );
+  }
+
+  sendPlayoutReport(value: YasMediaPlayoutReport): void {
+    this.connection.sendEvent(
+      g.YAS_FAMILY_MEDIA,
+      g.YAS_MEDIA_PLAYOUT_REPORT,
+      encodeMediaPlayoutReport(value),
     );
   }
 

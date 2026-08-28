@@ -865,6 +865,9 @@ export class SurfaceStore {
   private decoders = new Map<SurfaceId, DecoderEntry>();
   private canvases = new Map<SurfaceId, CanvasEntry>();
   private frameListeners = new Set<SurfaceFrameCallback>();
+  private presentationClockListeners = new Set<
+    (sample: { sourceMs: number; clientMs: number }) => void
+  >();
   private cursorShapes = new Map<SurfaceId, string>();
   private cursorImages = new Map<SurfaceId, SurfaceCursorImage>();
   private remoteInputs = new Map<SurfaceId, RemoteSurfaceInput>();
@@ -994,8 +997,7 @@ export class SurfaceStore {
    * congestion.
    */
   private _ackSender:
-    | ((surfaceId: SurfaceId, decoderQueueDepth: number) => void)
-    | null = null;
+    ((surfaceId: SurfaceId, decoderQueueDepth: number) => void) | null = null;
 
   /**
    * Callback to request a keyframe from the server (re-subscribe).
@@ -1269,6 +1271,14 @@ export class SurfaceStore {
   onFrame(listener: SurfaceFrameCallback): () => void {
     this.frameListeners.add(listener);
     return () => this.frameListeners.delete(listener);
+  }
+
+  /** Observe source PTS mapped to estimated visible presentation time. */
+  onPresentationClock(
+    listener: (sample: { sourceMs: number; clientMs: number }) => void,
+  ): () => void {
+    this.presentationClockListeners.add(listener);
+    return () => this.presentationClockListeners.delete(listener);
   }
 
   onChange(listener: SurfaceEventCallback): () => void {
@@ -1613,10 +1623,10 @@ export class SurfaceStore {
     const surface = this.surfaces.get(surfaceId);
     // Frame dimensions are the *stream* size, which the server downscales
     // per client (per_client_encode_target), while surface.width/height
-    // must stay the *native* composite size from SurfaceResized — pointer
-    // coordinates are scaled by surface.width, so overwriting it with a
-    // downscaled stream size makes every pointer position land short of
-    // the cursor.  Frame dims only seed a surface still at the 0×0 the
+    // must stay the *native* composite size from SurfaceResized. Presentation,
+    // cursor artwork, remote-pointer mirroring, and direct touch all consume
+    // that native metadata; replacing it with a per-view downscale makes them
+    // disagree. Frame dims only seed a surface still at the 0×0 the
     // compositor reports in SurfaceCreated before the first buffer commit.
     if (
       surface &&
@@ -2057,16 +2067,34 @@ export class SurfaceStore {
           (surface.logicalWidth === 0 ||
             Math.abs(surface.logicalWidth - logicalWidth) > 1 ||
             Math.abs(surface.logicalHeight - logicalHeight) > 1));
+      // Keep the last *published* geometry as the comparison baseline. If we
+      // silently stored every one-pixel step, a continuous 1 px-at-a-time
+      // resize would forever compare equal to the tolerance and never emit;
+      // mounted canvases would retain the geometry from the start of the drag
+      // while pointer coordinates kept following the server.
+      if (!significant) return;
       const resolutionChanged =
         surface.width !== width || surface.height !== height;
-      surface.width = width;
-      surface.height = height;
-      // An omitted or invalid logical size leaves the last known value in
-      // place rather than clobbering it with a bogus 0.
-      if (logicalWidth > 0 && logicalHeight > 0) {
-        surface.logicalWidth = logicalWidth;
-        surface.logicalHeight = logicalHeight;
-      }
+      // Surface objects are change tokens for mounted canvases. Replacing the
+      // value makes a resize trigger a fresh layout/input geometry pass;
+      // mutating it in place made `prev !== current` stay false and left the
+      // canvas box from before the resize under the new pointer dimensions.
+      const resized = {
+        ...surface,
+        width,
+        height,
+        // An omitted or invalid logical size leaves the last known value in
+        // place rather than clobbering it with a bogus 0.
+        logicalWidth:
+          logicalWidth > 0 && logicalHeight > 0
+            ? logicalWidth
+            : surface.logicalWidth,
+        logicalHeight:
+          logicalWidth > 0 && logicalHeight > 0
+            ? logicalHeight
+            : surface.logicalHeight,
+      };
+      this.surfaces.set(surfaceId, resized);
       // Only the physical size reaches the decoder.  A logical-only
       // change is a presentation change — the stream keeps arriving at
       // the same resolution, so tearing the presenter down and spending a
@@ -2092,7 +2120,7 @@ export class SurfaceStore {
           }
         }
       }
-      if (significant) this.emitChange();
+      this.emitChange();
     }
   }
 
@@ -2180,6 +2208,7 @@ export class SurfaceStore {
       this._visibilityHandler = null;
     }
     this.reset();
+    this.presentationClockListeners.clear();
   }
 
   private clearRemoteInput(surfaceId: SurfaceId): void {
@@ -2665,6 +2694,7 @@ export class SurfaceStore {
     // presented ≈ output; a gap between them is the judder this scheduler
     // exists to remove.
     this._diag.presented++;
+    const sourceMs = frame.timestamp / 1_000;
     try {
       const ce = this.canvases.get(surfaceId);
       if (ce) {
@@ -2689,6 +2719,17 @@ export class SurfaceStore {
         listener(surfaceId);
       } catch {
         // Prevent a single broken listener from blocking others.
+      }
+    }
+    // Canvas has no physical-presentation timestamp. rAF/draw submission is
+    // just ahead of the next scanout, so half the measured refresh interval
+    // is the least-biased estimate available to web clients.
+    const clientMs = performance.now() + this.refreshMs / 2;
+    if (Number.isFinite(sourceMs)) {
+      for (const listener of this.presentationClockListeners) {
+        try {
+          listener({ sourceMs, clientMs });
+        } catch {}
       }
     }
     // Frame listeners synchronously copy the shared backing canvas into

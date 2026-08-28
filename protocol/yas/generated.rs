@@ -1759,6 +1759,7 @@ pub const PORTAL_REQUEST: u16 = 0x0010;
 pub const FRAME: u16 = 0x0020;
 pub const FRAME_ACK: u16 = 0x0021;
 pub const STREAM_STATUS: u16 = 0x0022;
+pub const PLAYOUT_REPORT: u16 = 0x0023;
 }
 pub const KIND_AUDIO_OUTPUT: u64 = 0;
 pub const KIND_MICROPHONE: u64 = 1;
@@ -1898,6 +1899,7 @@ super::OperationMetadata { name: "PORTAL_REQUEST", class: 0, kind: 16, direction
 super::OperationMetadata { name: "FRAME", class: 0, kind: 32, direction: 2, sensitive: 1, compression: 2, datagram: 3, layout: "stream_handle:u64,sequence:u64,capture_time:u64,presentation_time:u64,codec_version:u16,flags:u16,fragment_index:u16,fragment_count:u16,complete_len:u32,payload:remaining; audio capture_time and nonzero presentation_time are sample positions at the selected MediaFormat.sample_rate from the server media-session epoch, while video values are nanoseconds from that same epoch; presentation_time 0 means use capture_time" },
 super::OperationMetadata { name: "FRAME_ACK", class: 0, kind: 33, direction: 2, sensitive: 1, compression: 0, datagram: 0, layout: "stream_handle:u64,consumed_sequence:u64,queue_depth:u16,desired_credit_frames:u16" },
 super::OperationMetadata { name: "STREAM_STATUS", class: 0, kind: 34, direction: 1, sensitive: 1, compression: 0, datagram: 0, layout: "stream_handle:u64,revision:u64,status:u16,flags:u16,codec_config:bytes_u32,Extensions" },
+super::OperationMetadata { name: "PLAYOUT_REPORT", class: 0, kind: 35, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "stream_handle:u64,consumed_sequence:u64,audio_video_delay_ns:u64; measured client-side difference between audible audio and visible video presentation latency" },
 ];
 pub static TYPES: &[super::TypeMetadata] = &[
 super::TypeMetadata { name: "media_format", layout: "codec:u16,channels:u16,sample_rate:u32,width:u32,height:u32,frame_rate_milli:u32,Extensions" },
@@ -4751,6 +4753,7 @@ GoldenVector { name: "yas.media.event.portal_request.header", hex: "2300100008" 
 GoldenVector { name: "yas.media.event.frame.header", hex: "2300200008" },
 GoldenVector { name: "yas.media.event.frame_ack.header", hex: "2300210008" },
 GoldenVector { name: "yas.media.event.stream_status.header", hex: "2300220008" },
+GoldenVector { name: "yas.media.event.playout_report.header", hex: "2300230008" },
 GoldenVector { name: "yas.font.request.watch.header", hex: "240000000101000000" },
 GoldenVector { name: "yas.font.request.unwatch.header", hex: "240001000101000000" },
 GoldenVector { name: "yas.font.request.describe.header", hex: "240002000101000000" },

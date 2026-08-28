@@ -184,6 +184,7 @@ export function RemotesOverlay(props: {
             <For each={props.remotes}>
               {(remote, index) => {
                 const status = () => props.statuses?.get(remote.name) ?? null;
+                const rtt = () => connectionFor(remote.name)?.rttMs ?? null;
                 const statusColor = () => {
                   const current = status();
                   return current
@@ -324,6 +325,9 @@ export function RemotesOverlay(props: {
                         {remote.uri}
                         <Show when={statusText()}>
                           {(text) => <> · {text()}</>}
+                        </Show>
+                        <Show when={status() === "connected" && rtt() !== null}>
+                          {` · ${Math.round(rtt()!)} ms`}
                         </Show>
                       </span>
                     </div>

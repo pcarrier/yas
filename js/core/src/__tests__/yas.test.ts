@@ -210,6 +210,7 @@ import {
   decodeChannelConnect,
   decodeChannelListen,
   decodeMediaFetchAsset,
+  decodeMediaPlayoutReport,
   decodeMediaPortalReply,
   decodeMediaPortalRequest,
   decodeMediaPortalClose,
@@ -371,6 +372,7 @@ import {
   encodeChannelConnect,
   encodeChannelListen,
   encodeMediaFetchAsset,
+  encodeMediaPlayoutReport,
   encodeMediaPortalReply,
   encodeMediaPortalRequest,
   encodeMediaPortalClose,
@@ -1184,6 +1186,17 @@ describe("YAS v1", () => {
     transport.pushDatagram(transport.sentDatagrams.at(-1)!);
     expect(frames).toEqual([1n]);
     expect(transport.status).toBe("connected");
+  });
+
+  it("round-trips a client audio/video playout report", () => {
+    const report = {
+      streamHandle: 7n,
+      consumedSequence: 41n,
+      audioVideoDelayNs: 87_000_000n,
+    };
+    expect(decodeMediaPlayoutReport(encodeMediaPlayoutReport(report))).toEqual(
+      report,
+    );
   });
 
   it("advances the anchored server monotonic clock after HELLO", async () => {
@@ -2685,7 +2698,7 @@ describe("YAS v1", () => {
     );
     leases.push(connection.receiveBudget.reserve(4n * 1024n * 1024n));
     leases.push(connection.receiveBudget.reserve(4n * 1024n * 1024n));
-    leases.push(connection.receiveBudget.reserve(104n * 1024n * 1024n));
+    leases.push(connection.receiveBudget.reserve(1000n * 1024n * 1024n));
     expect(() => connection.receiveBudget.reserve(1n)).toThrow(/exhausted/);
     for (const lease of leases) lease.release();
 
@@ -2693,7 +2706,7 @@ describe("YAS v1", () => {
     mutable.resizeExact(YAS_BROWSER_RECEIVE_MAX_BUFFERED);
     expect(() => connection.receiveBudget.reserve(1n)).toThrow(/exhausted/);
     mutable.resizeExact(4n * 1024n * 1024n);
-    connection.receiveBudget.reserveExact(124n * 1024n * 1024n).release();
+    connection.receiveBudget.reserveExact(1020n * 1024n * 1024n).release();
     mutable.release();
   });
 

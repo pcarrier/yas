@@ -112,28 +112,6 @@ const FLOOR_DECAY_STABLE_SAMPLES = 1_440_000; // 30 s at 48 kHz
  */
 export const MAX_LEARNED_FLOOR_SAMPLES = 9600; // 200 ms at 48 kHz
 
-/**
- * Ceiling on the floor taken from the *output device*.
- *
- * The learned floor above is what the link turned out to need. This is the
- * other half: what the sink needs, which no amount of network health can
- * reduce. A device with a deep buffer does not consume audio smoothly — it
- * wakes rarely and asks for everything at once, and a buffer holding less
- * than one of those bites empties on every single one. Bluetooth is the case
- * that matters: 150–300 ms is ordinary there against 5–20 ms wired.
- *
- * The floor is taken from `AudioContext.outputLatency`, which is an upper
- * bound on a bite rather than the bite itself — the safe direction to err,
- * and the reason wired playback is untouched: every wired sink reports well
- * under the 60 ms MIN, so its floor stays exactly where it was. Only a device
- * whose own latency already exceeds MIN moves at all, and for that device the
- * added latency is not really added: it was already paying it downstream.
- *
- * Capped so that a bogus or pathological reading cannot walk playback into
- * seconds of latency the way an uncapped adaptive target once did.
- */
-export const MAX_DEVICE_FLOOR_SAMPLES = 19200; // 400 ms at 48 kHz
-
 // -- A/V sync constants ----------------------------------------------------
 
 /** How often the worklet reports its consumed-sample position (in samples). */
@@ -260,7 +238,8 @@ const FADE_SAMPLES = 64;
  * rate.  Silence is output on underrun.
  *
  * Messages IN:
- *   Float32Array        — PCM frame to enqueue
+ *   { type: "pcm", pcm: Float32Array, timestampUs: number }
+ *                       — timestamped PCM frame to enqueue
  *   "flush"             — clear buffer
  *   { type: "rate", value: number } — set playback rate (default 1.0)
  *
@@ -272,7 +251,7 @@ export const WORKLET_SRC = /* js */ `
 class YasAudioProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.buffer = [];       // queue of Float32Array PCM chunks [L..L, R..R]
+    this.buffer = [];       // queue of { pcm: Float32Array, timestampUs }
     this.offset = 0;        // integer sample offset into current chunk
     this.frac = 0;          // fractional sample position [0, 1)
     this.rate = 1.0;        // playback rate (1.0 = normal)
@@ -283,7 +262,6 @@ class YasAudioProcessor extends AudioWorkletProcessor {
     this.bufferTarget = ${MIN_BUFFER_SAMPLES}; // adaptive: grows on underrun, shrinks on stability
     this.stableSamples = 0; // consumed samples of underrun-free playback (drives shrinking)
     this.learnedFloor = ${MIN_BUFFER_SAMPLES}; // slow-decaying memory of the headroom this link needed
-    this.deviceFloor = ${MIN_BUFFER_SAMPLES};  // headroom the *sink* needs; set from outputLatency, never decays
     this.floorStableSamples = 0; // drives the floor's own, much slower decay
     this.underruns = 0;     // consecutive underruns, drives adaptive buffer growth
     this.fadeGain = 0;      // applied output gain (0..1), ramps to mask underrun clicks
@@ -299,11 +277,9 @@ class YasAudioProcessor extends AudioWorkletProcessor {
         this.buffered = 0;
         this.buffering = true;
         this.underruns = 0;
-        // Back to the floor, not to MIN: a flush discards audio, not the
-        // sink it was going to be played on.
-        this.bufferTarget = this.deviceFloor;
+        this.bufferTarget = ${MIN_BUFFER_SAMPLES};
         this.stableSamples = 0;
-        this.learnedFloor = this.deviceFloor;
+        this.learnedFloor = ${MIN_BUFFER_SAMPLES};
         this.floorStableSamples = 0;
         this.fadeGain = 0;
       } else if (e.data && e.data.type === "skip") {
@@ -312,7 +288,8 @@ class YasAudioProcessor extends AudioWorkletProcessor {
         const requested = e.data.samples | 0;
         let toSkip = requested;
         while (toSkip > 0 && this.buffer.length > 0) {
-          const pcm = this.buffer[0];
+          const chunk = this.buffer[0];
+          const pcm = chunk.pcm;
           const half = pcm.length / 2;
           const remaining = half - this.offset;
           if (remaining <= toSkip) {
@@ -343,21 +320,15 @@ class YasAudioProcessor extends AudioWorkletProcessor {
         });
       } else if (e.data && e.data.type === "rate") {
         this.rate = e.data.value;
-      } else if (e.data && e.data.type === "device-floor") {
-        // What the sink needs. Raise immediately rather than waiting for an
-        // underrun to teach it: the first bite off a deep device arrives
-        // before any adaptation could have happened, and it is the one that
-        // would glitch.
-        this.deviceFloor = e.data.samples | 0;
-        if (this.bufferTarget < this.deviceFloor) {
-          this.bufferTarget = this.deviceFloor;
-        }
-        if (this.learnedFloor < this.deviceFloor) {
-          this.learnedFloor = this.deviceFloor;
-        }
       } else {
-        this.buffer.push(e.data);
-        this.buffered += e.data.length / 2; // half = per-channel sample count
+        // Keep accepting bare Float32Arrays for an inline/embedder built
+        // against the pre-timeline API. They play normally but cannot
+        // participate in end-to-end A/V latency measurement.
+        const chunk = e.data && e.data.type === "pcm"
+          ? e.data
+          : { pcm: e.data, timestampUs: NaN };
+        this.buffer.push(chunk);
+        this.buffered += chunk.pcm.length / 2; // half = per-channel sample count
         // No cap enforced here: dropping on arrival would discard the
         // newest audio and keep the stalest.  The main thread watches
         // the buffered depth in the position reports and posts "skip"
@@ -376,14 +347,11 @@ class YasAudioProcessor extends AudioWorkletProcessor {
     return this.buffered - this.offset;
   }
 
-  // The adaptive ceiling exists to bound the latency this buffer *adds*, so
-  // it is measured from the floor rather than from zero. A sink that costs
-  // 300 ms on its own would otherwise be left with 100 ms of adaptive room
-  // where a wired one gets 340 — least headroom exactly where the jitter is
-  // worst.
+  // The adaptive ceiling bounds the latency this buffer adds. Physical output
+  // latency is downstream of the AudioWorklet and must not be counted here:
+  // doing so adds Bluetooth latency a second time.
   ceiling() {
-    return this.deviceFloor +
-      ${MAX_BUFFER_TARGET_SAMPLES - MIN_BUFFER_SAMPLES};
+    return ${MAX_BUFFER_TARGET_SAMPLES};
   }
 
   process(_inputs, outputs) {
@@ -407,7 +375,8 @@ class YasAudioProcessor extends AudioWorkletProcessor {
     }
 
     if (!this.buffering) while (written < needed && this.buffer.length > 0) {
-      const pcm = this.buffer[0];
+      const chunk = this.buffer[0];
+      const pcm = chunk.pcm;
       const half = pcm.length / 2;
       if (half <= 0) {
         this.buffer.shift();
@@ -439,7 +408,7 @@ class YasAudioProcessor extends AudioWorkletProcessor {
         outR[written] = r0 + t * (pcm[half + i1] - r0);
       } else if (this.buffer.length > 1) {
         // At chunk boundary — interpolate with first sample of next chunk
-        const next = this.buffer[1];
+        const next = this.buffer[1].pcm;
         const nextHalf = next.length / 2;
         if (nextHalf > 0) {
           const t = this.frac;
@@ -523,7 +492,7 @@ class YasAudioProcessor extends AudioWorkletProcessor {
           // one proved necessary.
           this.learnedFloor = Math.min(
             Math.max(this.learnedFloor, this.bufferTarget),
-            Math.max(${MAX_LEARNED_FLOOR_SAMPLES}, this.deviceFloor)
+            ${MAX_LEARNED_FLOOR_SAMPLES}
           );
           this.floorStableSamples = 0;
         }
@@ -552,14 +521,11 @@ class YasAudioProcessor extends AudioWorkletProcessor {
         this.floorStableSamples += needed;
         if (
           this.floorStableSamples >= ${FLOOR_DECAY_STABLE_SAMPLES} &&
-          this.learnedFloor > this.deviceFloor
+          this.learnedFloor > ${MIN_BUFFER_SAMPLES}
         ) {
-          // Decays to the *device* floor, not to MIN. What the link needed is
-          // forgotten once it behaves; what the sink needs is not something it
-          // can stop needing.
           this.learnedFloor = Math.max(
             this.learnedFloor - ${SAMPLES_PER_20_MS},
-            this.deviceFloor
+            ${MIN_BUFFER_SAMPLES}
           );
           this.floorStableSamples = 0;
         }
@@ -592,6 +558,16 @@ class YasAudioProcessor extends AudioWorkletProcessor {
         value: totalPos,
         target: this.bufferTarget,
         buffered: this.depth(),
+        sourceUs: this.buffer.length > 0 && Number.isFinite(this.buffer[0].timestampUs)
+          ? this.buffer[0].timestampUs + this.offset * 1000000 /
+            (typeof sampleRate === "number" ? sampleRate : 48000)
+          : NaN,
+        // The source position above is the next sample after this render
+        // quantum. \`currentFrame + needed\` names that same point on the
+        // AudioContext timeline, so the main thread can map it through
+        // getOutputTimestamp() to the instant it reaches the speakers.
+        contextTime: (typeof currentFrame === "number" ? currentFrame + needed : totalPos) /
+          (typeof sampleRate === "number" ? sampleRate : 48000),
       });
     }
 
@@ -665,6 +641,7 @@ function onDecodedFrame(frame) {
   lastDecodedAt = now;
   // Extract f32-planar samples: [L...L, R...R] — the worklet's format.
   const n = frame.numberOfFrames;
+  const timestampUs = frame.timestamp;
   const pcm = new Float32Array(n * 2);
   try {
     const left = new Float32Array(n);
@@ -682,14 +659,15 @@ function onDecodedFrame(frame) {
     }
   }
   frame.close();
+  const chunk = { type: "pcm", pcm, timestampUs };
   if (port) {
-    port.postMessage(pcm, [pcm.buffer]);
+    port.postMessage(chunk, [pcm.buffer]);
   } else {
     // AudioWorklet.addModule() can be slow on iPadOS.  Bound startup latency
     // by retaining the newest frames, not the oldest frames from when setup
     // began.
     if (pending.length >= ${MAX_STAGING_FRAMES}) pending.shift();
-    pending.push(pcm);
+    pending.push(chunk);
   }
   sendStats(now);
 }
@@ -723,7 +701,8 @@ self.onmessage = (e) => {
     port = d.port;
     port.onmessage = (ev) =>
       self.postMessage({ type: "worklet-msg", data: ev.data });
-    for (const pcm of pending) port.postMessage(pcm, [pcm.buffer]);
+    for (const chunk of pending)
+      port.postMessage(chunk, [chunk.pcm.buffer]);
     pending = [];
   } else if (d.type === "detach") {
     if (port) {
@@ -746,7 +725,20 @@ self.onmessage = (e) => {
 };
 `;
 
-// -- Timeline entry for mapping samples → server timestamps ----------------
+interface TimestampedPcm {
+  readonly type: "pcm";
+  readonly pcm: Float32Array;
+  readonly timestampUs: number;
+}
+
+export interface AudioVideoDelaySample {
+  /** Extra audible-audio latency relative to visible video. */
+  readonly delayMs: number;
+  readonly audioSourceMs: number;
+  readonly videoSourceMs: number;
+  readonly audioClientMs: number;
+  readonly videoClientMs: number;
+}
 
 export class AudioPlayer {
   private ctx: AudioContext | null = null;
@@ -768,9 +760,18 @@ export class AudioPlayer {
   private _destroyed = false;
 
   /** Pending decoded PCM frames waiting to be posted to the worklet. */
-  private buffer: Float32Array[] = [];
+  private buffer: TimestampedPcm[] = [];
 
   private listeners = new Set<() => void>();
+  private audioVideoDelayListeners = new Set<
+    (sample: AudioVideoDelaySample) => void
+  >();
+  private latestVideoPresentation: {
+    sourceMs: number;
+    clientMs: number;
+    observedAtMs: number;
+  } | null = null;
+  private smoothedAudioVideoDelayMs: number | null = null;
 
   /**
    * True while an `initAudioContext()` call is in flight.  Guards against
@@ -795,8 +796,6 @@ export class AudioPlayer {
   private smoothedRate = 1.0;
   /** Worklet's current adaptive bufferTarget (samples), mirrored from reports. */
   private currentBufferTarget = MIN_BUFFER_SAMPLES;
-  /** Floor imposed by the output device (samples), from its reported latency. */
-  private deviceFloorSamples = MIN_BUFFER_SAMPLES;
   /** Last observed buffered depth (samples, from pos reports) — feeds the drift servo. */
   private lastBufferedSamples = 0;
   /** Timestamp (ms) of the last `skip` posted to the worklet; gates SKIP_COOLDOWN_MS. */
@@ -884,21 +883,14 @@ export class AudioPlayer {
     outputLatencyMs: number;
     baseLatencyMs: number;
     sampleRate: number;
-    deviceFloorMs: number;
   } {
-    // Nothing in the jitter buffer consults the output device, and on a sink
-    // that buffers deeply — Bluetooth above all — that is the difference
-    // between a working link and a broken one: the device asks for audio in
-    // large infrequent bites, so a 60 ms target cannot survive one bite and
-    // the depth *between* bites reads as runaway latency to the skip
-    // backstop. The buffer's numbers are unreadable without knowing which
-    // kind of sink produced them, so report the sink alongside them.
+    // Output latency is downstream of the worklet jitter buffer. Report it
+    // for A/V diagnosis, but never feed it back into the buffer target.
     const ctx = this.ctx as (AudioContext & { outputLatency?: number }) | null;
     return {
       outputLatencyMs: Math.round((ctx?.outputLatency ?? 0) * 1000),
       baseLatencyMs: Math.round((ctx?.baseLatency ?? 0) * 1000),
       sampleRate: Math.round(ctx?.sampleRate ?? 0),
-      deviceFloorMs: Math.round(this.deviceFloorSamples / 48),
       targetMs: Math.round(this.currentBufferTarget / 48),
       peakMs: Math.round(this.stats.peakTargetSamples / 48),
       // Received counts headers arriving on this thread; decoded counts what
@@ -1015,6 +1007,21 @@ export class AudioPlayer {
   onChange(fn: () => void): () => void {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
+  }
+
+  onAudioVideoDelay(fn: (sample: AudioVideoDelaySample) => void): () => void {
+    this.audioVideoDelayListeners.add(fn);
+    return () => this.audioVideoDelayListeners.delete(fn);
+  }
+
+  /** Record a frame submitted to the visible canvas on the client clock. */
+  noteVideoPresentation(sourceMs: number, clientMs: number): void {
+    if (!Number.isFinite(sourceMs) || !Number.isFinite(clientMs)) return;
+    this.latestVideoPresentation = {
+      sourceMs,
+      clientMs,
+      observedAtMs: performance.now(),
+    };
   }
 
   private emit(): void {
@@ -1284,35 +1291,10 @@ export class AudioPlayer {
       this.worker = null;
     }
     this.listeners.clear();
+    this.audioVideoDelayListeners.clear();
   }
 
   // -- Internal: rate servo -------------------------------------------------
-
-  /**
-   * Tell the worklet how much headroom this output device needs.
-   *
-   * `outputLatency` is not available until the context has actually rendered
-   * — it reads 0 immediately after construction on every engine that reports
-   * it at all — so this is called again from the health check rather than
-   * only at setup, and re-posts whenever the reading moves by more than a
-   * frame. That also covers the device being swapped underneath us.
-   *
-   * Safari reports neither `outputLatency` nor a useful `baseLatency`, so it
-   * keeps the old fixed floor: no worse than before, but not fixed either.
-   */
-  private applyDeviceFloor(): void {
-    const ctx = this.ctx as (AudioContext & { outputLatency?: number }) | null;
-    if (!ctx || !this.worklet) return;
-    const seconds = ctx.outputLatency || ctx.baseLatency || 0;
-    const floor = Math.min(
-      Math.max(Math.round(seconds * 48000), MIN_BUFFER_SAMPLES),
-      MAX_DEVICE_FLOOR_SAMPLES,
-    );
-    if (Math.abs(floor - this.deviceFloorSamples) < SAMPLES_PER_20_MS) return;
-    this.deviceFloorSamples = floor;
-    if (this.currentBufferTarget < floor) this.currentBufferTarget = floor;
-    this.postToWorklet({ type: "device-floor", samples: floor });
-  }
 
   private resetSync(): void {
     this.framesReceived = 0;
@@ -1321,6 +1303,8 @@ export class AudioPlayer {
     this.currentBufferTarget = MIN_BUFFER_SAMPLES;
     this.lastBufferedSamples = 0;
     this.lastSkipAt = 0;
+    this.latestVideoPresentation = null;
+    this.smoothedAudioVideoDelayMs = null;
     this.resetDecoderState();
   }
 
@@ -1509,11 +1493,6 @@ export class AudioPlayer {
 
     const now = Date.now();
 
-    // The sink's latency is only knowable once it has rendered, and it can
-    // change under us when a device is swapped, so it is re-read here rather
-    // than trusted from setup time.
-    this.applyDeviceFloor();
-
     // Check if the auto-reset rate limit allows a reset right now.
     const canAutoReset = now - this.lastAutoResetAt > 10_000;
 
@@ -1610,10 +1589,6 @@ export class AudioPlayer {
     // matches it would be skipped as already applied and the rebuilt context
     // would keep playing on the default.
     this._sinkDeviceId = "";
-    // The next context may land on a different device, so the old sink's
-    // floor must not be inherited — applyDeviceFloor() re-derives it once the
-    // new one has rendered.
-    this.deviceFloorSamples = MIN_BUFFER_SAMPLES;
     this.resetSync();
   }
 
@@ -1692,11 +1667,6 @@ export class AudioPlayer {
         outputChannelCount: [2],
       });
       this.worklet.connect(this.gain);
-      // Usually a no-op this early — outputLatency is 0 until the context has
-      // rendered — but a context that reports it up front should not have to
-      // wait for the first health check to get its floor.
-      this.applyDeviceFloor();
-
       // Detect worklet processor crashes.  When process() throws, the
       // worklet fires processorerror and stops processing audio
       // permanently.  Reset the pipeline immediately.
@@ -1721,8 +1691,8 @@ export class AudioPlayer {
         };
 
         // Flush any frames that arrived before the worklet was ready.
-        for (const pcm of this.buffer) {
-          this.worklet.port.postMessage(pcm, [pcm.buffer]);
+        for (const chunk of this.buffer) {
+          this.worklet.port.postMessage(chunk, [chunk.pcm.buffer]);
         }
         this.buffer = [];
       }
@@ -1762,6 +1732,9 @@ export class AudioPlayer {
       if (typeof d.buffered === "number") {
         this.lastBufferedSamples = d.buffered;
       }
+      if (typeof d.sourceUs === "number" && typeof d.contextTime === "number") {
+        this.measureAudioVideoDelay(d.sourceUs, d.contextTime);
+      }
       this.onWorkletPosition();
     } else if (d.type === "event") {
       if (typeof d.target === "number") {
@@ -1799,6 +1772,89 @@ export class AudioPlayer {
         this.lastBufferedSamples = d.buffered;
         this.onWorkletPosition();
       }
+    }
+  }
+
+  private measureAudioVideoDelay(
+    audioSourceUs: number,
+    audioContextTime: number,
+  ): void {
+    const video = this.latestVideoPresentation;
+    const ctx = this.ctx as
+      | (AudioContext & {
+          outputLatency?: number;
+          getOutputTimestamp?: () => {
+            contextTime: number;
+            performanceTime: number;
+          };
+        })
+      | null;
+    if (
+      !video ||
+      !ctx ||
+      !Number.isFinite(audioSourceUs) ||
+      !Number.isFinite(audioContextTime) ||
+      performance.now() - video.observedAtMs > 1_000
+    )
+      return;
+
+    let audioClientMs: number;
+    const output = ctx.getOutputTimestamp?.();
+    const outputContextTime = output?.contextTime;
+    const outputPerformanceTime = output?.performanceTime;
+    if (
+      typeof outputContextTime === "number" &&
+      Number.isFinite(outputContextTime) &&
+      outputContextTime > 0 &&
+      typeof outputPerformanceTime === "number" &&
+      Number.isFinite(outputPerformanceTime) &&
+      outputPerformanceTime > 0
+    ) {
+      audioClientMs =
+        outputPerformanceTime + (audioContextTime - outputContextTime) * 1_000;
+    } else {
+      // Worklet contextTime is at the graph boundary. baseLatency covers the
+      // AudioDestinationNode-to-host handoff; outputLatency covers the host
+      // buffer-to-acoustic-output path (including Bluetooth). They are
+      // successive stages, not alternatives. A valid getOutputTimestamp()
+      // already maps to acoustic output and therefore needs neither added.
+      const sinkLatency =
+        Math.max(0, ctx.baseLatency || 0) +
+        Math.max(0, ctx.outputLatency || 0);
+      audioClientMs =
+        performance.now() +
+        Math.max(0, audioContextTime - ctx.currentTime) * 1_000 +
+        sinkLatency * 1_000;
+    }
+
+    const audioSourceMs = audioSourceUs / 1_000;
+    const sourceDeltaMs = wrappingU32DeltaMs(audioSourceMs, video.sourceMs);
+    // Samples this far apart no longer describe the same point in the live
+    // pipeline. Wait for the next visible frame rather than publishing a
+    // transport stall as device latency.
+    if (Math.abs(sourceDeltaMs) > 1_000) return;
+    const measured = Math.max(
+      0,
+      Math.min(2_000, audioClientMs - video.clientMs - sourceDeltaMs),
+    );
+    this.smoothedAudioVideoDelayMs =
+      this.smoothedAudioVideoDelayMs === null
+        ? measured
+        : measured > this.smoothedAudioVideoDelayMs
+          ? measured
+          : this.smoothedAudioVideoDelayMs +
+            (measured - this.smoothedAudioVideoDelayMs) * 0.15;
+    const sample: AudioVideoDelaySample = {
+      delayMs: this.smoothedAudioVideoDelayMs,
+      audioSourceMs,
+      videoSourceMs: video.sourceMs,
+      audioClientMs,
+      videoClientMs: video.clientMs,
+    };
+    for (const listener of this.audioVideoDelayListeners) {
+      try {
+        listener(sample);
+      } catch {}
     }
   }
 
@@ -1895,6 +1951,7 @@ export class AudioPlayer {
     this.lastDecodedAt = Date.now();
     // Extract f32-planar samples: [L...L, R...R].
     const n = frame.numberOfFrames;
+    const timestampUs = frame.timestamp;
     const pcm = new Float32Array(n * 2);
     try {
       // Copy each plane into its half of the buffer.
@@ -1915,15 +1972,24 @@ export class AudioPlayer {
     }
 
     frame.close();
+    const chunk: TimestampedPcm = { type: "pcm", pcm, timestampUs };
 
     if (this.worklet) {
       // Transfer the buffer to the audio thread (zero-copy).
-      this.worklet.port.postMessage(pcm, [pcm.buffer]);
+      this.worklet.port.postMessage(chunk, [pcm.buffer]);
     } else {
       // Worklet not ready yet.  Keep the newest bounded tail so a slow
       // AudioWorklet.addModule() does not start playback far behind live.
       if (this.buffer.length >= MAX_STAGING_FRAMES) this.buffer.shift();
-      this.buffer.push(pcm);
+      this.buffer.push(chunk);
     }
   }
+}
+
+/** Signed shortest delta between millisecond positions carried modulo u32. */
+function wrappingU32DeltaMs(a: number, b: number): number {
+  const aWhole = Math.floor(a);
+  const bWhole = Math.floor(b);
+  const whole = ((aWhole - bWhole + 0x8000_0000) >>> 0) - 0x8000_0000;
+  return whole + (a - aWhole) - (b - bWhole);
 }

@@ -47,8 +47,7 @@ export function cardAspectRatio(
 /**
  * Per-surface signature of everything the thumbnail UI reads.
  *
- * `SurfaceStore` mutates a surface's dimensions in place, and Solid does not
- * track property access on plain objects, so a child reading
+ * Solid does not track property access on plain objects, so a child reading
  * `props.surface.logicalWidth` only picks up a new value when its item gets a
  * fresh object reference. This signature is what decides that, so every field
  * a card renders has to appear in it — a dimension left out here is a card that

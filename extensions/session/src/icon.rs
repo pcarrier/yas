@@ -20,8 +20,9 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 /// The pixel size a raster icon is ranked against.
@@ -93,6 +94,54 @@ pub fn candidates(dirs: &[String], name: &str) -> Vec<String> {
     for dir in dirs {
         out.push(format!("{dir}/{name}.svg"));
         out.push(format!("{dir}/{name}.png"));
+    }
+    out
+}
+
+/// Best drawable path for every icon name in an already-indexed search path.
+///
+/// Input order preserves XDG root precedence. Directories are then ranked by
+/// size, and SVG wins over PNG within one directory, matching [`candidates`]
+/// without issuing a STAT for every absent name/path combination.
+pub fn path_index(paths: &[String]) -> BTreeMap<String, String> {
+    let mut parents = Vec::<String>::new();
+    for path in paths {
+        let Some((parent, _)) = path.rsplit_once('/') else {
+            continue;
+        };
+        if !parents.iter().any(|known| known == parent) {
+            parents.push(parent.to_string());
+        }
+    }
+    let borrowed: Vec<&str> = parents.iter().map(String::as_str).collect();
+    let ranks: BTreeMap<String, usize> = rank_directories(&borrowed)
+        .into_iter()
+        .enumerate()
+        .map(|(rank, parent)| (parent, rank))
+        .collect();
+    let mut ordered = paths
+        .iter()
+        .filter_map(|path| {
+            let (parent, file) = path.rsplit_once('/')?;
+            let (name, format_rank) = if let Some(name) = file.strip_suffix(".svg") {
+                (name, 0u8)
+            } else if let Some(name) = file.strip_suffix(".png") {
+                (name, 1u8)
+            } else {
+                return None;
+            };
+            is_lookup_name(name).then_some((
+                *ranks.get(parent)?,
+                format_rank,
+                name.to_string(),
+                path.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(directory_rank, format_rank, _, _)| (*directory_rank, *format_rank));
+    let mut out = BTreeMap::new();
+    for (_, _, name, path) in ordered {
+        out.entry(name).or_insert(path);
     }
     out
 }
@@ -283,6 +332,28 @@ mod tests {
         assert!(candidates(&dirs, "a b").is_empty());
         assert!(candidates(&dirs, "../../etc/passwd").is_empty());
         assert!(candidates(&[], "x").is_empty());
+    }
+
+    #[test]
+    fn indexed_paths_keep_size_root_and_format_precedence() {
+        let paths = vec![
+            "/user/hicolor/48x48/apps/chat.png".to_string(),
+            "/user/hicolor/scalable/apps/chat.png".to_string(),
+            "/user/hicolor/scalable/apps/chat.svg".to_string(),
+            "/system/hicolor/scalable/apps/chat.png".to_string(),
+            "/system/pixmaps/player.png".to_string(),
+            "/system/pixmaps/not-an-icon.txt".to_string(),
+        ];
+        let indexed = path_index(&paths);
+        assert_eq!(
+            indexed.get("chat").map(String::as_str),
+            Some("/user/hicolor/scalable/apps/chat.svg")
+        );
+        assert_eq!(
+            indexed.get("player").map(String::as_str),
+            Some("/system/pixmaps/player.png")
+        );
+        assert!(!indexed.contains_key("not-an-icon"));
     }
 
     /// Both layouts in the wild, plus the flat roots that have no category.
