@@ -4865,16 +4865,6 @@ async fn surface_catalogue_snapshot(state: &AppState) -> SurfaceCatalogue {
             } else {
                 info.logical_height
             };
-            let buffer_scale = if info.logical_width != 0
-                && info.logical_height != 0
-                && info.width % info.logical_width == 0
-                && info.height % info.logical_height == 0
-                && info.width / info.logical_width == info.height / info.logical_height
-            {
-                (info.width / info.logical_width).max(1)
-            } else {
-                1
-            };
             let mut extensions = Vec::new();
             if let Some((active_surface, revision)) = compositor.surface_activation
                 && active_surface == surface_id
@@ -4921,7 +4911,8 @@ async fn surface_catalogue_snapshot(state: &AppState) -> SurfaceCatalogue {
                 },
                 app_handle: 0,
                 lifecycle: 0,
-                buffer_scale,
+                composite_width: u32::from(info.width.max(1)),
+                composite_height: u32::from(info.height.max(1)),
                 logical_width_32_32: i64::from(logical_width) << 32,
                 logical_height_32_32: i64::from(logical_height) << 32,
                 application_id: info
@@ -12621,14 +12612,9 @@ impl Session {
                     .send_sensitive_result(&frame, Status::ResourceExhausted, Vec::new())
                     .await;
             }
-            let Some(record) = media.catalogue.players.get(&request.player_handle) else {
+            if !media.catalogue.players.contains_key(&request.player_handle) {
                 return self
                     .send_sensitive_result(&frame, Status::NotFound, Vec::new())
-                    .await;
-            };
-            if record.revision != request.revision {
-                return self
-                    .send_sensitive_result(&frame, Status::Conflict, Vec::new())
                     .await;
             }
             let Some(player_id) = media.player_backend_id(request.player_handle) else {
@@ -14235,10 +14221,6 @@ impl Session {
             {
                 return Err(Status::NotFound);
             }
-            let resized = session.resize_pty(pty_id, rows, cols);
-            if resized {
-                session.native_terminal_views.refresh_backend(pty_id);
-            }
             let Some(handle) = session.native_terminal_views.register(
                 pty_id,
                 rows,
@@ -14248,6 +14230,13 @@ impl Session {
             ) else {
                 return Err(Status::ResourceExhausted);
             };
+            let (effective_rows, effective_cols) = session
+                .mediated_size_for_pty(pty_id)
+                .expect("newly registered Terminal view mediates a size");
+            let resized = session.resize_pty(pty_id, effective_rows, effective_cols);
+            if resized {
+                session.native_terminal_views.refresh_backend(pty_id);
+            }
             if let Some(pty) = session.ptys.get_mut(&pty_id) {
                 pty.mark_dirty();
             }
@@ -14384,23 +14373,29 @@ impl Session {
         let state = self.native.as_ref().ok_or(())?.state.clone();
         let resized = {
             let mut session = state.session.lock().await;
-            if !session.native_terminal_views.configure(
+            let geometry_changed = session.native_terminal_views.configure(
                 backend_view,
                 next_rows,
                 next_cols,
                 next_max_fps,
-            ) {
-                None
-            } else {
-                let resized = session.resize_pty(pty_id, next_rows, next_cols);
+            );
+            if let Some(geometry_changed) = geometry_changed {
+                let (effective_rows, effective_cols) = session
+                    .mediated_size_for_pty(pty_id)
+                    .expect("configured Terminal view mediates a size");
+                let resized = session.resize_pty(pty_id, effective_rows, effective_cols);
                 if resized {
                     session.native_terminal_views.refresh_backend(pty_id);
                 }
-                if let Some(pty) = session.ptys.get_mut(&pty_id) {
-                    pty.mark_dirty();
+                if geometry_changed || resized {
+                    if let Some(pty) = session.ptys.get_mut(&pty_id) {
+                        pty.mark_dirty();
+                    }
+                    state.delivery_notify.notify_one();
                 }
-                state.delivery_notify.notify_one();
                 Some(resized)
+            } else {
+                None
             }
         };
         let missing = resized.is_none();
@@ -14491,13 +14486,20 @@ impl Session {
             return self.send_result(&frame, Status::Ok, Vec::new()).await;
         };
         let backend_view = view.backend_view;
+        let pty_id = view.pty_id;
         let state = terminal.state.clone();
-        state
-            .session
-            .lock()
-            .await
-            .native_terminal_views
-            .remove(backend_view);
+        let resized = {
+            let mut session = state.session.lock().await;
+            session.native_terminal_views.remove(backend_view);
+            let resized = session
+                .mediated_size_for_pty(pty_id)
+                .is_some_and(|(rows, cols)| session.resize_pty(pty_id, rows, cols));
+            if resized {
+                session.native_terminal_views.refresh_backend(pty_id);
+                state.delivery_notify.notify_one();
+            }
+            resized
+        };
         let view = self
             .native
             .as_mut()
@@ -14508,8 +14510,18 @@ impl Session {
         // CLOSE_VIEW is Control while Terminal frames are Data. Drain this
         // view's already-queued frames so the scheduler cannot write one
         // beyond the successful lifetime boundary.
-        self.drain_terminal_frame_receipts(view.last_frame_written.into_iter().collect())
-            .await?;
+        let mut receipts = view.last_frame_written.into_iter().collect::<Vec<_>>();
+        if resized {
+            receipts.extend(
+                self.native
+                    .as_mut()
+                    .into_iter()
+                    .flat_map(|terminal| terminal.views.values_mut())
+                    .filter(|view| view.pty_id == pty_id)
+                    .filter_map(|view| view.last_frame_written.take()),
+            );
+        }
+        self.drain_terminal_frame_receipts(receipts).await?;
         self.send_result(&frame, Status::Ok, Vec::new()).await
     }
 
@@ -27262,7 +27274,7 @@ impl Drop for Session {
             let backend_views = terminal
                 .views
                 .values()
-                .map(|view| view.backend_view)
+                .map(|view| (view.backend_view, view.pty_id))
                 .collect::<Vec<_>>();
             if !backend_views.is_empty()
                 && let Ok(runtime) = tokio::runtime::Handle::try_current()
@@ -27270,8 +27282,25 @@ impl Drop for Session {
                 let state = terminal.state.clone();
                 runtime.spawn(async move {
                     let mut session = state.session.lock().await;
-                    for handle in backend_views {
+                    let affected = backend_views
+                        .iter()
+                        .map(|(_, pty_id)| *pty_id)
+                        .collect::<BTreeSet<_>>();
+                    for (handle, _) in backend_views {
                         session.native_terminal_views.remove(handle);
+                    }
+                    let mut resized = false;
+                    for pty_id in affected {
+                        let Some((rows, cols)) = session.mediated_size_for_pty(pty_id) else {
+                            continue;
+                        };
+                        if session.resize_pty(pty_id, rows, cols) {
+                            session.native_terminal_views.refresh_backend(pty_id);
+                            resized = true;
+                        }
+                    }
+                    if resized {
+                        state.delivery_notify.notify_one();
                     }
                 });
             }
@@ -32400,6 +32429,7 @@ fn media_player_record(
         position_us: player.position_us.max(0),
         duration_us: player.length_us.max(-1),
         identity: truncate_utf8(&player.identity, u16::MAX as usize),
+        desktop_entry: truncate_utf8(&player.desktop_entry, u16::MAX as usize),
         title: truncate_utf8(&player.title, u16::MAX as usize),
         artist: truncate_utf8(&player.artists.join(", "), u16::MAX as usize),
         album: truncate_utf8(&player.album, u16::MAX as usize),
@@ -35381,7 +35411,8 @@ fn maximal_surface_record(surface_handle: u64, revision: u64) -> yas_surface::Su
         parent_handle: u64::MAX,
         app_handle: u64::MAX,
         lifecycle: u8::MAX,
-        buffer_scale: u16::MAX,
+        composite_width: u32::MAX,
+        composite_height: u32::MAX,
         logical_width_32_32: i64::MAX,
         logical_height_32_32: i64::MAX,
         application_id: "a".repeat(u16::MAX as usize),
@@ -37613,7 +37644,8 @@ mod tests {
                 parent_handle: 0,
                 app_handle: 0,
                 lifecycle: 0,
-                buffer_scale: 1,
+                composite_width: 640,
+                composite_height: 360,
                 logical_width_32_32: 640_i64 << 32,
                 logical_height_32_32: 360_i64 << 32,
                 application_id: "yas.test".to_owned(),

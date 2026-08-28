@@ -160,10 +160,9 @@ describe("YasSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
-  // Hotspot and extent arrive in the same (logical) units, so one factor has to
-  // place both. Scaling only the offset put the hotspot a full cursor-width off
-  // the artwork on every HiDPI surface.
-  it("scales a custom remote cursor's hotspot and extent together", () => {
+  // The hotspot is logical but the PNG dimensions are buffer pixels. The
+  // cursor's own scale normalizes its artwork before the surface scale places it.
+  it("normalizes a high-DPI custom cursor before placing it", () => {
     const { surface, container } = attachCanvas();
     setSurfaceInfo(surface, { width: 1280, height: 960, lw: 640, lh: 480 });
     surface.setDisplaySize(1280, 960, 240);
@@ -184,6 +183,7 @@ describe("YasSurfaceCanvas layout", () => {
       hotspotY: 5,
       width: 32,
       height: 24,
+      scale120: 240,
     };
     internal.updateRemotePointerOverlay();
 
@@ -191,8 +191,8 @@ describe("YasSurfaceCanvas layout", () => {
     // cursorScale = 1280 / 640 = 2.
     expect(image?.getAttribute("x")).toBe("92");
     expect(image?.getAttribute("y")).toBe("190");
-    expect(image?.getAttribute("width")).toBe("64");
-    expect(image?.getAttribute("height")).toBe("48");
+    expect(image?.getAttribute("width")).toBe("32");
+    expect(image?.getAttribute("height")).toBe("24");
     surface.dispose();
   });
 
@@ -379,22 +379,20 @@ describe("YasSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
-  it("draws a surface a high-DPI viewer sized at 1x, not zoomed", () => {
+  it("fills each viewer even when another viewer determined logical size", () => {
     // A 400×300 pane at 3x and a 1600×1200 pane at 1x watching one surface:
     // mediation gives it the smaller logical size at the higher scale, so it
-    // composites 1200×900.  Filling the 1x pane with that frame would show
-    // the same window three times larger than the client that asked for it
-    // sees it; 400×300 device px is the size the window actually is.
+    // composites 1200×900. This viewer still scales that shared frame to its
+    // own box; logical-size mediation must not turn into client letterboxing.
     const { surface, canvas } = attachCanvas();
     setSurfaceInfo(surface, { width: 1200, height: 900, lw: 400, lh: 300 });
     canvas.width = 1200;
     canvas.height = 900;
     surface.setDisplaySize(1600, 1200, 120);
-    expect(canvas.style.width).toBe("400px");
-    expect(canvas.style.height).toBe("300px");
-    // Centred: the pane keeps the leftover as letterbox on both sides.
-    expect(canvas.style.left).toBe("600px");
-    expect(canvas.style.top).toBe("450px");
+    expect(canvas.style.width).toBe("1600px");
+    expect(canvas.style.height).toBe("1200px");
+    expect(canvas.style.left).toBe("0px");
+    expect(canvas.style.top).toBe("0px");
     surface.dispose();
   });
 

@@ -121,6 +121,8 @@ export interface LayoutTreeCtx {
   floatingDepth: (paneId: string) => number;
   /** Bring a floating window forward. */
   onRaisePane: (paneId: string) => void;
+  /** Add a parked assignment as an independent floating window. */
+  onAddFloatingWindow: (assignment: string) => void;
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;

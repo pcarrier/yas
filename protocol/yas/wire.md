@@ -347,7 +347,7 @@ Every Request kind has a correlated Result with the same family and kind.
 
 | Name | Required layout |
 | --- | --- |
-| `surface_record` | surface_handle:u64,revision:u64,parent_handle:u64,app_handle:u64,lifecycle:u8,reserved:u8=0,buffer_scale:u16,logical_width_32_32:i64,logical_height_32_32:i64,application_id:string_u16,title:string_u16,Extensions |
+| `surface_record` | surface_handle:u64,revision:u64,parent_handle:u64,app_handle:u64,lifecycle:u8,reserved:u8=0,composite_width:u32,composite_height:u32,logical_width_32_32:i64,logical_height_32_32:i64,application_id:string_u16,title:string_u16,Extensions |
 | `view_result` | view_id:u32,codec_version:u16,max_inflight_frames:u16,max_encoded_frame:u32,max_decoded_frame:u32,first_sequence:u64,Extensions |
 | `cursor_state` | kind:u8,reserved:[u8;3]=0; NAMED name:string_u16, HIDDEN empty, CUSTOM hotspot_x:i32,hotspot_y:i32,width:u32,height:u32,scale_120:u16,reserved:u16=0,png:bytes_u32 (at most 32768 bytes) |
 | `text_input_state` | flags:u16,reserved:u16=0,content_hint:u32,content_purpose:u32; when HAS_CURSOR_RECT x:i32,y:i32,width:i32,height:i32 |
@@ -468,7 +468,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | `0x0003` | `ACQUIRE_DEVICE` | `client_to_server` | `required` | `allowed` | `forbidden` | device_handle:u64,operation_id:[u8;16],kind:u8,reserved:[u8;3]=0,lease_duration_ns:u64,format_count:u16,repeated MediaFormat,Extensions; ResultPrefix + lease_handle:u64,stream_handle:u64,expires_server_ns:u64,selected_format:MediaFormat |
 | `0x0004` | `RELEASE_DEVICE` | `client_to_server` | `required` | `allowed` | `forbidden` | lease_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix |
 | `0x0005` | `PORTAL_REPLY` | `client_to_server` | `required` | `allowed` | `forbidden` | portal_handle:u64,revision:u64,operation_id:[u8;16],kind:u16,decision:u8,reserved:u8=0,metadata:bytes_u32 containing kind/decision-specific PortalReplyMetadata,Extensions; ResultPrefix; DENY and CANCEL require empty metadata |
-| `0x0006` | `PLAYER_ACTION` | `client_to_server` | `required` | `allowed` | `forbidden` | player_handle:u64,revision:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix |
+| `0x0006` | `PLAYER_ACTION` | `client_to_server` | `required` | `allowed` | `forbidden` | player_handle:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix |
 | `0x0007` | `CLOSE_STREAM` | `client_to_server` | `required` | `allowed` | `forbidden` | stream_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix |
 | `0x0008` | `FETCH_ASSET` | `client_to_server` | `required` | `allowed` | `forbidden` | content_hash:[u8;32],initial_receive_credit:u64,Extensions; ResultPrefix + InlineOrTransfer |
 | `0x0009` | `PORTAL_CLOSE` | `client_to_server` | `required` | `allowed` | `forbidden` | portal_handle:u64,revision:u64,operation_id:[u8;16],Extensions; ResultPrefix; idempotent by operation_id; closes pending or granted portal and releases every granted stream |
@@ -525,7 +525,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | `portal_reply_metadata` | GRANT ACCESS uses PortalAccessGrantMetadata; GRANT SCREENCAST uses PortalScreenCastGrantMetadata; DENY and CANCEL are exactly zero bytes |
 | `portal_granted_metadata` | GRANTED ACCESS uses PortalAccessGrantMetadata; GRANTED SCREENCAST uses PortalScreenCastGrantedMetadata with allocated stream handles |
 | `portal_record_metadata` | PENDING uses kind-specific request metadata; GRANTED uses PortalGrantedMetadata; DENIED, CANCELLED, and WITHDRAWN are exactly zero bytes |
-| `player_record` | player_handle:u64,revision:u64,state:u16,flags:u16,position_us:i64,duration_us:i64,identity:string_u16,title:string_u16,artist:string_u16,album:string_u16,Extensions |
+| `player_record` | player_handle:u64,revision:u64,state:u16,flags:u16,position_us:i64,duration_us:i64,identity:string_u16,desktop_entry:string_u16,title:string_u16,artist:string_u16,album:string_u16,Extensions |
 | `state_entity_body` | entity_kind:u16,reserved:u16=0; ADD/REPLACE complete device_record,lease_record,portal_record,or player_record; PATCH entity handle:u64,revision:u64,Extensions; REMOVE entity handle:u64,revision:u64 |
 | `asset_delivery` | InlineOrTransfer with Desktop-like content-addressed asset; inline at most 32768, Transfer family Media kind 1 version 1 |
 | `family_limits` | ordered optional extensions: tags 1..14 encode max devices:u32,leases/session:u32,streams/session:u32,portals/session:u32,players:u32,formats:u32,inline metadata bytes:u32,inline asset bytes:u32,portal metadata bytes:u32,portal string bytes:u32,portal body bytes:u32,portal choices:u32,portal choice options:u32,screencast candidates:u32; all tags are present in a selected family descriptor |

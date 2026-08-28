@@ -37,6 +37,7 @@ describe("YAS Media typed portal metadata", () => {
       positionUs: 3n,
       durationUs: 9n,
       identity: "player",
+      desktopEntry: "player",
       title: "track",
       artist: "artist",
       album: "album",

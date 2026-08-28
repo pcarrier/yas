@@ -1077,6 +1077,7 @@ pub const STATE_ACTIVATION_REVISION_EXTENSION: u64 = 1;
 pub const STATE_CURSOR_EXTENSION: u64 = 2;
 pub const STATE_TEXT_INPUT_EXTENSION: u64 = 3;
 pub const RESIZE_SCALE_120_EXTENSION: u64 = 4;
+pub const STATE_MAXIMIZE_REQUEST_EXTENSION: u64 = 5;
 pub const MAX_INLINE_CURSOR_BYTES: u64 = 32768;
 pub const CURSOR_NAMED: u64 = 0;
 pub const CURSOR_HIDDEN: u64 = 1;
@@ -1264,7 +1265,7 @@ super::OperationMetadata { name: "FRAME", class: 0, kind: 32, direction: 1, sens
 super::OperationMetadata { name: "REMOTE_INPUT", class: 0, kind: 33, direction: 1, sensitive: 1, compression: 0, datagram: 0, layout: "surface_handle:u64,seat_handle:u64,expires_server_ns:u64,input_kind:u8,reserved:u8=0,contact_count:u16,repeated contact_id:u32,x_32_32:i64,y_32_32:i64; POINTER requires exactly one contact with contact_id=0, TOUCH permits 0..MAX_REMOTE_CONTACTS unique contacts" },
 ];
 pub static TYPES: &[super::TypeMetadata] = &[
-super::TypeMetadata { name: "surface_record", layout: "surface_handle:u64,revision:u64,parent_handle:u64,app_handle:u64,lifecycle:u8,reserved:u8=0,buffer_scale:u16,logical_width_32_32:i64,logical_height_32_32:i64,application_id:string_u16,title:string_u16,Extensions" },
+super::TypeMetadata { name: "surface_record", layout: "surface_handle:u64,revision:u64,parent_handle:u64,app_handle:u64,lifecycle:u8,reserved:u8=0,composite_width:u32,composite_height:u32,logical_width_32_32:i64,logical_height_32_32:i64,application_id:string_u16,title:string_u16,Extensions" },
 super::TypeMetadata { name: "view_result", layout: "view_id:u32,codec_version:u16,max_inflight_frames:u16,max_encoded_frame:u32,max_decoded_frame:u32,first_sequence:u64,Extensions" },
 super::TypeMetadata { name: "cursor_state", layout: "kind:u8,reserved:[u8;3]=0; NAMED name:string_u16, HIDDEN empty, CUSTOM hotspot_x:i32,hotspot_y:i32,width:u32,height:u32,scale_120:u16,reserved:u16=0,png:bytes_u32 (at most 32768 bytes)" },
 super::TypeMetadata { name: "text_input_state", layout: "flags:u16,reserved:u16=0,content_hint:u32,content_purpose:u32; when HAS_CURSOR_RECT x:i32,y:i32,width:i32,height:i32" },
@@ -1286,6 +1287,7 @@ super::ConstantMetadata { name: "STATE_ACTIVATION_REVISION_EXTENSION", value: 1 
 super::ConstantMetadata { name: "STATE_CURSOR_EXTENSION", value: 2 },
 super::ConstantMetadata { name: "STATE_TEXT_INPUT_EXTENSION", value: 3 },
 super::ConstantMetadata { name: "RESIZE_SCALE_120_EXTENSION", value: 4 },
+super::ConstantMetadata { name: "STATE_MAXIMIZE_REQUEST_EXTENSION", value: 5 },
 super::ConstantMetadata { name: "MAX_INLINE_CURSOR_BYTES", value: 32768 },
 super::ConstantMetadata { name: "CURSOR_NAMED", value: 0 },
 super::ConstantMetadata { name: "CURSOR_HIDDEN", value: 1 },
@@ -1884,7 +1886,7 @@ super::OperationMetadata { name: "OPEN_OUTPUT", class: 1, kind: 2, direction: 0,
 super::OperationMetadata { name: "ACQUIRE_DEVICE", class: 1, kind: 3, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "device_handle:u64,operation_id:[u8;16],kind:u8,reserved:[u8;3]=0,lease_duration_ns:u64,format_count:u16,repeated MediaFormat,Extensions; ResultPrefix + lease_handle:u64,stream_handle:u64,expires_server_ns:u64,selected_format:MediaFormat" },
 super::OperationMetadata { name: "RELEASE_DEVICE", class: 1, kind: 4, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "lease_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix" },
 super::OperationMetadata { name: "PORTAL_REPLY", class: 1, kind: 5, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "portal_handle:u64,revision:u64,operation_id:[u8;16],kind:u16,decision:u8,reserved:u8=0,metadata:bytes_u32 containing kind/decision-specific PortalReplyMetadata,Extensions; ResultPrefix; DENY and CANCEL require empty metadata" },
-super::OperationMetadata { name: "PLAYER_ACTION", class: 1, kind: 6, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "player_handle:u64,revision:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix" },
+super::OperationMetadata { name: "PLAYER_ACTION", class: 1, kind: 6, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "player_handle:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix" },
 super::OperationMetadata { name: "CLOSE_STREAM", class: 1, kind: 7, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "stream_handle:u64,operation_id:[u8;16],Extensions; ResultPrefix" },
 super::OperationMetadata { name: "FETCH_ASSET", class: 1, kind: 8, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "content_hash:[u8;32],initial_receive_credit:u64,Extensions; ResultPrefix + InlineOrTransfer" },
 super::OperationMetadata { name: "PORTAL_CLOSE", class: 1, kind: 9, direction: 0, sensitive: 1, compression: 0, datagram: 0, layout: "portal_handle:u64,revision:u64,operation_id:[u8;16],Extensions; ResultPrefix; idempotent by operation_id; closes pending or granted portal and releases every granted stream" },
@@ -1912,7 +1914,7 @@ super::TypeMetadata { name: "portal_screencast_granted_metadata", layout: "strea
 super::TypeMetadata { name: "portal_reply_metadata", layout: "GRANT ACCESS uses PortalAccessGrantMetadata; GRANT SCREENCAST uses PortalScreenCastGrantMetadata; DENY and CANCEL are exactly zero bytes" },
 super::TypeMetadata { name: "portal_granted_metadata", layout: "GRANTED ACCESS uses PortalAccessGrantMetadata; GRANTED SCREENCAST uses PortalScreenCastGrantedMetadata with allocated stream handles" },
 super::TypeMetadata { name: "portal_record_metadata", layout: "PENDING uses kind-specific request metadata; GRANTED uses PortalGrantedMetadata; DENIED, CANCELLED, and WITHDRAWN are exactly zero bytes" },
-super::TypeMetadata { name: "player_record", layout: "player_handle:u64,revision:u64,state:u16,flags:u16,position_us:i64,duration_us:i64,identity:string_u16,title:string_u16,artist:string_u16,album:string_u16,Extensions" },
+super::TypeMetadata { name: "player_record", layout: "player_handle:u64,revision:u64,state:u16,flags:u16,position_us:i64,duration_us:i64,identity:string_u16,desktop_entry:string_u16,title:string_u16,artist:string_u16,album:string_u16,Extensions" },
 super::TypeMetadata { name: "state_entity_body", layout: "entity_kind:u16,reserved:u16=0; ADD/REPLACE complete device_record,lease_record,portal_record,or player_record; PATCH entity handle:u64,revision:u64,Extensions; REMOVE entity handle:u64,revision:u64" },
 super::TypeMetadata { name: "asset_delivery", layout: "InlineOrTransfer with Desktop-like content-addressed asset; inline at most 32768, Transfer family Media kind 1 version 1" },
 super::TypeMetadata { name: "family_limits", layout: "ordered optional extensions: tags 1..14 encode max devices:u32,leases/session:u32,streams/session:u32,portals/session:u32,players:u32,formats:u32,inline metadata bytes:u32,inline asset bytes:u32,portal metadata bytes:u32,portal string bytes:u32,portal body bytes:u32,portal choices:u32,portal choice options:u32,screencast candidates:u32; all tags are present in a selected family descriptor" },

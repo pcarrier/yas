@@ -31,18 +31,20 @@ function sameItem(a: KeyedItem, b: KeyedItem): boolean {
 
 /**
  * Reuse previous section/item objects whose visible content is unchanged.
- * Sections match by position and title; items match by `key`, so a reorder
- * reuses item objects inside a fresh section (Solid moves the rows instead of
- * remounting them).
+ * Sections match by title rather than position: a transient section inserted
+ * above Terminals must not remount every terminal canvas below it. Items match
+ * by `key`, so a reorder reuses item objects inside a fresh section (Solid
+ * moves the rows instead of remounting them).
  */
 export function stabilizeSections<T extends KeyedItem>(
   prev: KeyedSection<T>[] | undefined,
   next: KeyedSection<T>[],
 ): KeyedSection<T>[] {
   if (!prev) return next;
-  return next.map((section, i) => {
-    const old = prev[i];
-    if (!old || old.title !== section.title) return section;
+  const previousByTitle = new Map(prev.map((section) => [section.title, section]));
+  return next.map((section) => {
+    const old = previousByTitle.get(section.title);
+    if (!old) return section;
     const oldByKey = new Map(old.items.map((item) => [item.key, item]));
     const items = section.items.map((item) => {
       const oldItem = oldByKey.get(item.key);

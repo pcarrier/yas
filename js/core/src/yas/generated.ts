@@ -490,6 +490,7 @@ export const YAS_SURFACE_STATE_ACTIVATION_REVISION_EXTENSION = 1 as const;
 export const YAS_SURFACE_STATE_CURSOR_EXTENSION = 2 as const;
 export const YAS_SURFACE_STATE_TEXT_INPUT_EXTENSION = 3 as const;
 export const YAS_SURFACE_RESIZE_SCALE_120_EXTENSION = 4 as const;
+export const YAS_SURFACE_STATE_MAXIMIZE_REQUEST_EXTENSION = 5 as const;
 export const YAS_SURFACE_MAX_INLINE_CURSOR_BYTES = 32768 as const;
 export const YAS_SURFACE_CURSOR_NAMED = 0 as const;
 export const YAS_SURFACE_CURSOR_HIDDEN = 1 as const;
@@ -5055,7 +5056,7 @@ export const YAS_SCHEMA = {
       "types": [
         {
           "name": "surface_record",
-          "layout": "surface_handle:u64,revision:u64,parent_handle:u64,app_handle:u64,lifecycle:u8,reserved:u8=0,buffer_scale:u16,logical_width_32_32:i64,logical_height_32_32:i64,application_id:string_u16,title:string_u16,Extensions"
+          "layout": "surface_handle:u64,revision:u64,parent_handle:u64,app_handle:u64,lifecycle:u8,reserved:u8=0,composite_width:u32,composite_height:u32,logical_width_32_32:i64,logical_height_32_32:i64,application_id:string_u16,title:string_u16,Extensions"
         },
         {
           "name": "view_result",
@@ -5090,6 +5091,10 @@ export const YAS_SCHEMA = {
         {
           "name": "RESIZE_SCALE_120_EXTENSION",
           "value": 4
+        },
+        {
+          "name": "STATE_MAXIMIZE_REQUEST_EXTENSION",
+          "value": 5
         },
         {
           "name": "MAX_INLINE_CURSOR_BYTES",
@@ -6690,7 +6695,7 @@ export const YAS_SCHEMA = {
           "sensitive": "required",
           "compression": "allowed",
           "datagram": "forbidden",
-          "layout": "player_handle:u64,revision:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix"
+          "layout": "player_handle:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix"
         },
         {
           "name": "CLOSE_STREAM",
@@ -6843,7 +6848,7 @@ export const YAS_SCHEMA = {
         },
         {
           "name": "player_record",
-          "layout": "player_handle:u64,revision:u64,state:u16,flags:u16,position_us:i64,duration_us:i64,identity:string_u16,title:string_u16,artist:string_u16,album:string_u16,Extensions"
+          "layout": "player_handle:u64,revision:u64,state:u16,flags:u16,position_us:i64,duration_us:i64,identity:string_u16,desktop_entry:string_u16,title:string_u16,artist:string_u16,album:string_u16,Extensions"
         },
         {
           "name": "state_entity_body",

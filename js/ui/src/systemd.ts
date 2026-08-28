@@ -451,6 +451,13 @@ export function unitStates(
   return [...states].sort();
 }
 
+/** True only after every scope announced by the watcher has completed once. */
+export function systemdUnitsReady(
+  scopes: ReadonlyMap<string, SystemdScopeState>,
+): boolean {
+  return scopes.size > 0 && [...scopes.values()].every((scope) => scope.ready);
+}
+
 /** A journal query that never answers must not hold a promise forever. */
 const QUERY_TIMEOUT_MS = 20_000;
 
@@ -483,6 +490,25 @@ export async function openSystemdUnits(
 ): Promise<SystemdUnitsHandle> {
   const mirror = new SystemdUnitsMirror(options.onChange);
   let channel: ChannelMessageHandle | null = null;
+  // CONNECT completes before the listener's initial CREDIT necessarily
+  // reaches this peer.  Control requests are tiny, but `send` is deliberately
+  // synchronous and returns false while that credit is still zero.  Dropping
+  // the initial `resync` leaves the mirror with only later deltas, which looks
+  // like systemd reported a small arbitrary subset of its units.
+  const outbound: string[] = [];
+  const flushOutbound = (): void => {
+    if (!channel) return;
+    while (outbound.length > 0) {
+      if (!channel.send(outbound[0]!)) return;
+      outbound.shift();
+    }
+  };
+  const send = (payload: string): boolean => {
+    if (!channel) return false;
+    if (outbound.length === 0 && channel.send(payload)) return true;
+    outbound.push(payload);
+    return true;
+  };
 
   // Queries are correlated by id and answered in chunks; state messages carry
   // no id and belong to the mirror. Keeping the two apart here leaves the
@@ -553,6 +579,7 @@ export async function openSystemdUnits(
   };
 
   const channelHandle = await connection.connectChannel(SYSTEMD_CHANNEL, {
+    onCredit: flushOutbound,
     onData: (payload: Uint8Array) => {
       let message: unknown;
       try {
@@ -568,6 +595,7 @@ export async function openSystemdUnits(
     },
     onClosed: (reason: number, detail: string) => {
       channel = null;
+      outbound.length = 0;
       for (const [id, waiting] of pending) {
         clearTimeout(waiting.timer);
         waiting.reject(new Error(detail || `channel closed (${reason})`));
@@ -601,10 +629,10 @@ export async function openSystemdUnits(
         reject(new Error("journal query timed out"));
       }, QUERY_TIMEOUT_MS);
       pending.set(id, { entries: [], resolve, reject, timer });
-      if (!channel.send(JSON.stringify({ ...body, id }))) {
+      if (!send(JSON.stringify({ ...body, id }))) {
         pending.delete(id);
         clearTimeout(timer);
-        reject(new Error("channel is not accepting requests"));
+        reject(new Error("channel is closed"));
       }
     });
 
@@ -612,7 +640,7 @@ export async function openSystemdUnits(
   // snapshots, so a filter change needs no separate resync. The watcher sends
   // only `hello` until asked, so one request is always required.
   const request = (line: string): void => {
-    channel?.send(line);
+    send(line);
   };
   if (options.scopes?.length) request(`scopes ${options.scopes.join(",")}`);
   if (options.prefix) request(`filter ${options.prefix}`);
@@ -647,7 +675,7 @@ export async function openSystemdUnits(
       follows.set(id, sink);
       // `boot`, `limit` and `direction` are a page's vocabulary: a tail runs
       // from a cursor to whatever arrives next, in the boot doing the writing.
-      const started = channel?.send(
+      const started = send(
         JSON.stringify({
           type: "follow",
           id,
@@ -665,7 +693,7 @@ export async function openSystemdUnits(
       return {
         close: () => {
           if (!follows.delete(id)) return;
-          channel?.send(JSON.stringify({ type: "unfollow" }));
+          send(JSON.stringify({ type: "unfollow" }));
         },
       };
     },
@@ -676,6 +704,7 @@ export async function openSystemdUnits(
     close: () => {
       channelHandle.close();
       channel = null;
+      outbound.length = 0;
     },
   };
 }

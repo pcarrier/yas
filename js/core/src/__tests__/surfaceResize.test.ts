@@ -106,6 +106,23 @@ describe("driveSurfaceResize", () => {
     expect(displaySizes).toEqual([[800, 600, 240, 240]]);
   });
 
+  it("does not let a CSS-sized device-pixel box overwrite HiDPI", () => {
+    vi.stubGlobal("devicePixelRatio", 2);
+    const { target, displaySizes } = fakeTarget();
+    driveSurfaceResize(target, container(400, 300));
+    displaySizes.length = 0;
+
+    const entry = {
+      contentRect: { width: 400, height: 300 },
+      // Seen in Chromium configurations that expose the field without
+      // applying the emulated/native device scale to its values.
+      devicePixelContentBoxSize: [{ inlineSize: 400, blockSize: 300 }],
+    } as ResizeObserverEntry;
+    for (const callback of callbacks) callback([entry], null as never);
+
+    expect(displaySizes).toEqual([[800, 600, 240, 240]]);
+  });
+
   it("sends the first size at wire speed and settles on the last", () => {
     const { target, resizes } = fakeTarget();
     driveSurfaceResize(target, container(800, 600));

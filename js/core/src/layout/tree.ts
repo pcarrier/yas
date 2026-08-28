@@ -416,10 +416,11 @@ export function assignSessionsToPanes(
 
 /** Carry the occupants of an existing layout into a replacement layout.
  *
- * Content migrates in pane traversal order. Live terminal sessions are
- * deduplicated, while non-session content is kept verbatim. Crucially, this
- * does not append other live sessions: panes added by the replacement layout
- * stay empty until the user puts something in them. */
+ * Content migrates in pane traversal order. Every assignment has one visual
+ * owner, so duplicate records left by an old restore or a racy drag collapse
+ * to their first pane. Crucially, this does not append other live sessions:
+ * panes added by the replacement layout stay empty until the user puts
+ * something in them. */
 export function carryAssignmentsToPanes({
   currentPanes,
   nextPanes,
@@ -432,16 +433,17 @@ export function carryAssignmentsToPanes({
   liveSessionIds: readonly string[];
 }): LayoutAssignments {
   const live = new Set(liveSessionIds);
-  const seenSessions = new Set<string>();
+  const seen = new Set<string>();
   const carried: string[] = [];
 
   for (const pane of currentPanes) {
     const value = previous.assignments[pane.id];
-    if (value == null) continue;
+    if (value == null || seen.has(value)) continue;
     if (isContentAssignment(value)) {
+      seen.add(value);
       carried.push(value);
-    } else if (live.has(value) && !seenSessions.has(value)) {
-      seenSessions.add(value);
+    } else if (live.has(value)) {
+      seen.add(value);
       carried.push(value);
     }
   }
@@ -489,10 +491,10 @@ export function buildCandidateOrder({
  * holding the dragged value — a layout change mid-drag must not evict
  * whatever else got there since.
  *
- * Surface assignments are unique views, so recover their source from the
+ * Every assignment is a unique visual owner. Recover its source from the
  * current assignments if a browser omits the secondary source-pane drag MIME
- * (or if that pane id went stale). Generic tile drops deliberately remain
- * copies/opens when they have no valid source marker.
+ * (or if that pane id went stale); otherwise a dropped terminal, surface, or
+ * panel becomes two floating windows.
  */
 export function assignmentsAfterDrop(
   prev: Readonly<Record<string, string | null>>,
@@ -508,11 +510,9 @@ export function assignmentsAfterDrop(
     prev[fromPaneId] === value;
   const sourcePaneId = markedSourceIsCurrent
     ? fromPaneId
-    : isSurfaceAssignment(value)
-      ? validPaneIds.find(
-          (paneId) => paneId !== targetPaneId && prev[paneId] === value,
-        )
-      : undefined;
+    : validPaneIds.find(
+        (paneId) => paneId !== targetPaneId && prev[paneId] === value,
+      );
   const swap = sourcePaneId !== undefined;
   if (prev[targetPaneId] === value && !swap) return null;
   const next: Record<string, string | null> = {
@@ -560,10 +560,15 @@ export function reconcileAssignments({
   const known = new Set(knownSessionIds);
   const liveSurfaces = liveSurfaceKeys ? new Set(liveSurfaceKeys) : null;
   const assignments: Record<string, string | null> = {};
+  const seen = new Set<string>();
 
   for (const pane of panes) {
     const value = previous.assignments[pane.id];
-    if (isSurfaceAssignment(value)) {
+    if (value != null && seen.has(value)) {
+      assignments[pane.id] = null;
+      continue;
+    }
+    if (value != null && isSurfaceAssignment(value)) {
       if (liveSurfaces) {
         const parsed = parseSurfaceAssignment(value);
         const key =
@@ -571,6 +576,7 @@ export function reconcileAssignments({
         if (key != null && liveSurfaces.has(key)) {
           // Surface is live — keep.
           assignments[pane.id] = value;
+          seen.add(value);
         } else if (
           parsed &&
           readyConnectionIds &&
@@ -580,12 +586,14 @@ export function reconcileAssignments({
           // preserve the assignment so it survives until the connection
           // is fully ready (or re-added).
           assignments[pane.id] = value;
+          seen.add(value);
         } else {
           // Surface is gone and its connection is present+ready — clear.
           assignments[pane.id] = null;
         }
       } else {
         assignments[pane.id] = value;
+        seen.add(value);
       }
       continue;
     }
@@ -594,7 +602,12 @@ export function reconcileAssignments({
       // session for the same underlying PTY (reconnect gave it a new ID).
       const replacement = sessionReplacements?.get(value);
       if (replacement && live.has(replacement)) {
-        assignments[pane.id] = replacement;
+        if (seen.has(replacement)) {
+          assignments[pane.id] = null;
+        } else {
+          assignments[pane.id] = replacement;
+          seen.add(replacement);
+        }
         continue;
       }
       // Session's connection is absent or still reconnecting — preserve
@@ -604,12 +617,14 @@ export function reconcileAssignments({
         const connId = sessionConnectionIds.get(value);
         if (connId != null && !readyConnectionIds.has(connId)) {
           assignments[pane.id] = value;
+          seen.add(value);
           continue;
         }
       }
     }
     const keep = value != null && (live.has(value) || !known.has(value));
     assignments[pane.id] = keep ? value : null;
+    if (keep) seen.add(value);
   }
 
   return { assignments };

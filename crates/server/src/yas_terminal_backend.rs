@@ -183,16 +183,38 @@ impl Registry {
         self.views.retain(|_, view| view.pty_id != pty_id);
     }
 
-    pub(crate) fn configure(&mut self, handle: u64, rows: u16, cols: u16, max_fps: u16) -> bool {
-        let Some(view) = self.views.get_mut(&handle) else {
-            return false;
-        };
-        view.invalidate();
+    pub(crate) fn mediated_size(&self, pty_id: u16) -> Option<(u16, u16)> {
+        self.views
+            .values()
+            .filter(|view| view.pty_id == pty_id)
+            .map(|view| (view.rows, view.cols))
+            .reduce(|(rows, cols), (next_rows, next_cols)| {
+                (rows.min(next_rows), cols.min(next_cols))
+            })
+    }
+
+    /// Update one view, returning whether its grid geometry changed.
+    ///
+    /// `None` means the view disappeared. Repeating an identical configure is
+    /// deliberately `Some(false)`: reconnect bookkeeping must not invalidate
+    /// a frame and create a render/configure feedback loop.
+    pub(crate) fn configure(
+        &mut self,
+        handle: u64,
+        rows: u16,
+        cols: u16,
+        max_fps: u16,
+    ) -> Option<bool> {
+        let view = self.views.get_mut(&handle)?;
+        let geometry_changed = view.rows != rows || view.cols != cols;
+        if geometry_changed {
+            view.invalidate();
+            view.force_frame = true;
+        }
         view.rows = rows;
         view.cols = cols;
         view.max_fps = max_fps.max(1);
-        view.force_frame = true;
-        true
+        Some(geometry_changed)
     }
 
     pub(crate) fn reset(&mut self, handle: u64) -> bool {
@@ -363,7 +385,7 @@ mod tests {
             .expect("Terminal view handle");
 
         let before_configure = current_guard(&registry, view);
-        assert!(registry.configure(view, 30, 100, 30));
+        assert_eq!(registry.configure(view, 30, 100, 30), Some(true));
         assert!(!before_configure.is_current());
 
         let before_reset = current_guard(&registry, view);
@@ -419,6 +441,29 @@ mod tests {
     }
 
     #[test]
+    fn terminal_size_is_mediated_across_every_native_view() {
+        let (frames, _frame_rx) = mpsc::channel(2);
+        let mut registry = Registry::default();
+        let large = registry
+            .register(7, 40, 160, 60, frames.clone())
+            .expect("large Terminal view");
+        let small = registry
+            .register(7, 24, 100, 60, frames)
+            .expect("small Terminal view");
+
+        assert_eq!(registry.mediated_size(7), Some((24, 100)));
+        assert_eq!(registry.configure(large, 20, 120, 60), Some(true));
+        assert_eq!(registry.mediated_size(7), Some((20, 100)));
+        let unchanged_guard = current_guard(&registry, large);
+        assert_eq!(registry.configure(large, 20, 120, 60), Some(false));
+        assert!(unchanged_guard.is_current());
+        registry.remove(small);
+        assert_eq!(registry.mediated_size(7), Some((20, 120)));
+        registry.remove(large);
+        assert_eq!(registry.mediated_size(7), None);
+    }
+
+    #[test]
     fn final_view_stays_quiescent_across_presentation_updates_until_restart() {
         let (frames, _frame_rx) = mpsc::channel(1);
         let mut registry = Registry::default();
@@ -427,7 +472,7 @@ mod tests {
             .expect("Terminal view handle");
         registry.views.get_mut(&view).unwrap().final_sent = true;
 
-        assert!(registry.configure(view, 30, 100, 30));
+        assert_eq!(registry.configure(view, 30, 100, 30), Some(true));
         assert!(registry.reset(view));
         assert_eq!(registry.scroll_absolute(view, 4), Some(4));
         registry.refresh_backend(7);

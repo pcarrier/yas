@@ -3,6 +3,7 @@ import {
   filterUnits,
   openSystemdUnits,
   SystemdUnitsMirror,
+  systemdUnitsReady,
   unitStates,
   type SystemdChange,
 } from "../systemd";
@@ -37,6 +38,7 @@ describe("SystemdUnitsMirror", () => {
     // A snapshot is only visible once its last chunk lands: half a unit table
     // is worse than the previous one.
     expect(mirror.scopes.get("system")?.units.size).toBe(0);
+    expect(systemdUnitsReady(mirror.scopes)).toBe(false);
 
     mirror.apply(
       JSON.stringify({
@@ -50,6 +52,7 @@ describe("SystemdUnitsMirror", () => {
     );
     const scope = mirror.scopes.get("system")!;
     expect(scope.ready).toBe(true);
+    expect(systemdUnitsReady(mirror.scopes)).toBe(true);
     expect([...scope.units.keys()]).toEqual(["a.service", "b.service"]);
     expect(scope.updatedAt).toBe(3);
   });
@@ -190,6 +193,47 @@ function fakeChannel() {
       deliver?.(encoder.encode(JSON.stringify(message))),
   };
 }
+
+function creditBlockedChannel() {
+  const sent: string[] = [];
+  let accepting = false;
+  let credit: (() => void) | undefined;
+  return {
+    sent,
+    connection: {
+      connectChannel: async (_name: string, options: any) => {
+        credit = options.onCredit;
+        return {
+          send: (payload: Uint8Array | string) => {
+            if (!accepting) return false;
+            sent.push(
+              typeof payload === "string"
+                ? payload
+                : new TextDecoder().decode(payload),
+            );
+            return true;
+          },
+          close: () => {},
+        };
+      },
+    },
+    grantCredit: () => {
+      accepting = true;
+      credit?.();
+    },
+  };
+}
+
+describe("channel credit", () => {
+  it("sends the initial resync after CONNECT credit arrives", async () => {
+    const peer = creditBlockedChannel();
+    await openSystemdUnits(peer.connection as never);
+    expect(peer.sent).toEqual([]);
+
+    peer.grantCredit();
+    expect(peer.sent).toEqual(["resync"]);
+  });
+});
 
 const entry = (cursor: string, message: string) => ({
   cursor,

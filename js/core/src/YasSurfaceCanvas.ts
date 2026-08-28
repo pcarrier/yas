@@ -1438,8 +1438,6 @@ export class YasSurfaceCanvas {
   /** Source frame size of the last presentation pass, so the observer can recompute the
    *  reduction without going back to the store. */
   private _lastFrameSize: { width: number; height: number } | null = null;
-  /** Reused result for presentationBox(); callers consume it synchronously. */
-  private readonly _presentationBox = { width: 0, height: 0 };
   /** Last layout applied by applyLayout(), to skip redundant style writes. */
   private _lastLayout: {
     left: number;
@@ -2128,47 +2126,6 @@ export class YasSurfaceCanvas {
    * do track the container (see {@link _presentBox}) but only to pick a
    * halving chain in presentFromStore, never to place the canvas.
    */
-  /**
-   * The box, in this view's device pixels, the surface may be drawn into:
-   * the pane, but never larger than the surface's own logical size at this
-   * view's requested scale. Null for views that don't size their own box.
-   *
-   * The server mediates one surface across all its viewers at the
-   * *highest* scale any of them asked for (see `mediated_size_for_surface`),
-   * so a small 3x pane and a large 1x pane settle on a small window
-   * composited at 3x.  Filling the 1x pane with that frame would show the
-   * window at 3x zoom — the same window drawn three times too big on the
-   * client that never asked for a high-DPI anything.  Capping at
-   * `logical × own scale` draws it at the requested size and lets the
-   * rest of the pane letterbox.
-   *
-   * The cap only bites when it clears the pane by more than rounding
-   * noise.  The viewer that *is* sizing the surface gets a cap within a
-   * pixel or two of its own pane — mediation rounds the logical size onto
-   * the even 4:2:0 grid — and snapping those back to the pane keeps its
-   * stream landing on the pane exactly rather than a hairline inside it.
-   */
-  private presentationBox(): { width: number; height: number } | null {
-    const ds = this._displaySize;
-    if (!ds || !ds.scale120) return null;
-    const lw = this.surface?.logicalWidth ?? 0;
-    const lh = this.surface?.logicalHeight ?? 0;
-    const box = this._presentationBox;
-    // Before a valid logical resize is reported, the pane is the only size
-    // available for presentation.
-    if (lw <= 0 || lh <= 0) {
-      box.width = ds.width;
-      box.height = ds.height;
-      return box;
-    }
-    const SNAP = 3;
-    const capW = Math.round((lw * ds.scale120) / 120);
-    const capH = Math.round((lh * ds.scale120) / 120);
-    box.width = capW < ds.width - SNAP ? capW : ds.width;
-    box.height = capH < ds.height - SNAP ? capH : ds.height;
-    return box;
-  }
-
   private applyLayout(): void {
     this.layoutCanvasBox();
     // The IME capture element is placed in client coordinates, so every box
@@ -2213,7 +2170,12 @@ export class YasSurfaceCanvas {
     const fw = canvas.width;
     const fh = canvas.height;
     if (fw === 0 || fh === 0) return;
-    const box = this.presentationBox() ?? ds;
+    // The pane is the presentation box. Surface logical size is negotiated
+    // across viewers and can lag a live floating resize; capping to that stale
+    // value made the picture occupy a smaller fraction of the window the more
+    // the frame grew. Fit the newest decoded frame to this client's box while
+    // the compositor catches up with a sharper frame.
+    const box = ds;
     // Rounding, not flooring, and clamped to the box: a stream that is the
     // box's aspect to within the grid it was rounded onto has to land on
     // the box exactly, not a pixel inside it.
@@ -2572,14 +2534,20 @@ export class YasSurfaceCanvas {
       glyph.style.display = "none";
       image.style.display = "";
       image.setAttribute("href", cursor.url);
-      // Hotspot and extent are both logical (the server divides the buffer's
-      // pixel size by the cursor's own `buffer_scale`), so one factor takes
-      // both into the physical-pixel viewBox. Scaling only the offset put the
-      // hotspot a full cursor-width off the artwork on any HiDPI surface.
+      // The hotspot is logical, while the PNG extent is raw buffer pixels.
+      // Normalize the latter by the cursor surface's own buffer scale, then
+      // map both logical quantities into this surface's physical viewBox.
       image.setAttribute("x", String(x - cursor.hotspotX * cursorScale));
       image.setAttribute("y", String(y - cursor.hotspotY * cursorScale));
-      image.setAttribute("width", String(cursor.width * cursorScale));
-      image.setAttribute("height", String(cursor.height * cursorScale));
+      const cursorBufferScale = Math.max(120, cursor.scale120 ?? 120) / 120;
+      image.setAttribute(
+        "width",
+        String((cursor.width / cursorBufferScale) * cursorScale),
+      );
+      image.setAttribute(
+        "height",
+        String((cursor.height / cursorBufferScale) * cursorScale),
+      );
     } else {
       image.style.display = "none";
       glyph.style.display = "";
@@ -2659,7 +2627,7 @@ export class YasSurfaceCanvas {
     // A view that is *handed* a box — a dock thumbnail — is about to be
     // minified by the compositor instead, so bring the frame down to roughly
     // the box in whole halves first and leave CSS a scale it can filter.
-    const box = this._displaySize ? this.presentationBox() : this._presentBox;
+    const box = this._displaySize ?? this._presentBox;
     const n = box ? halvings(src.width, src.height, box.width, box.height) : 0;
     this._presentHalvings = n;
     const w = halve(src.width, n);

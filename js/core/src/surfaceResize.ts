@@ -72,19 +72,19 @@ function fallbackScale120(): number {
   return Math.round((globalThis.devicePixelRatio || 1) * 120);
 }
 
-/** An entry's content box in device pixels, or null when it does not report
- *  one.  Deliberately the exact `devicePixelContentBoxSize` here, unlike
- *  `downscale.devicePixelBox`: a pane wants the size it will actually be
- *  rasterised at, and the octave quantisation that makes the approximation
- *  fine for a thumbnail does not apply. */
+/** An entry's content box in the device pixels the browser rasterises.
+ *
+ * `devicePixelContentBoxSize` is not authoritative in practice: some Chromium
+ * configurations expose the field but report CSS-pixel extents through it.
+ * Trusting that overwrote a correct initial 2x measurement with 1x on the
+ * observer's first callback, leaving a HiDPI surface half-size and centred.
+ * `devicePixelRatio` is the browser's actual CSS-to-raster ratio. */
 function devicePixelSize(
   entry: ResizeObserverEntry,
 ): { width: number; height: number } | null {
-  const box = entry.devicePixelContentBoxSize;
-  const size = Array.isArray(box) ? box[0] : box;
-  if (!size) return null;
-  const width = Math.round(size.inlineSize);
-  const height = Math.round(size.blockSize);
+  const dpr = (globalThis.devicePixelRatio || 1) as number;
+  const width = Math.round(entry.contentRect.width * dpr);
+  const height = Math.round(entry.contentRect.height * dpr);
   return width > 0 && height > 0 ? { width, height } : null;
 }
 

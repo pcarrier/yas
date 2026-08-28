@@ -30,6 +30,10 @@ import {
   setAllowedCodecSupport,
   isIOS,
 } from "@yas-run/core";
+import {
+  windowManagerOf,
+  type WindowManager,
+} from "@yas-run/core/layout";
 import type {
   YasTransport,
   YasSession,
@@ -128,6 +132,7 @@ import { t } from "./i18n";
 import { TerminalDropTarget } from "./terminalDrop";
 import { StatusBar } from "./StatusBar";
 import { DesktopChrome } from "./DesktopChrome";
+import { mprisSurfaceMatchScore } from "./desktopPresentation";
 import { LeftDock, LEFT_PANELS, type LeftPanel } from "./LeftDock";
 import { foldedSections, liveOverrides, toggleSection } from "./dockSections";
 import { settleAttention } from "./surfaceAttention";
@@ -166,6 +171,7 @@ import {
   resolveTab,
 } from "./ide/tabRegistry";
 import { createOpenTabs } from "./ide/openTabs";
+import { createTabCloseTracker } from "./ide/tabCloseTracker";
 import {
   allServerRoots,
   ensureServerRoots,
@@ -207,6 +213,7 @@ import { RootsOverlay } from "./RootsOverlay";
 import { MediaOverlay } from "./MediaOverlay";
 import { createMediaDevices } from "./mediaDevices";
 import { LayoutContainer, EmptyPane } from "./layout/LayoutContainer";
+import { WindowManagerChooser } from "./layout/WindowManagerChooser";
 import { autoFocusPaneTarget } from "./layout/treeContext";
 import { WebOverlay } from "./WebOverlay";
 import type { WebPaneHandle } from "./WebPane";
@@ -298,6 +305,7 @@ export type Overlay =
   | "media"
   | "web"
   | "link"
+  | "window-manager"
   | null;
 
 type HmrWorkspaceData = HmrLeaseState & {
@@ -2244,6 +2252,7 @@ function WorkspaceScreen(props: {
   // this list keeps the dock usable there.
   // Session-only; explicit closes prune it.
   const [localTabs, setLocalTabs] = createSignal<string[]>([]);
+  const closingTabs = createTabCloseTracker();
   // Recording pushes one entry per file navigated past, so the list is
   // LRU-capped — an unbounded dock also meant unbounded live fs syncs,
   // which is how YAS_FS_MAX_SYNCS got exhausted in normal browsing.
@@ -2252,6 +2261,7 @@ function WorkspaceScreen(props: {
   // a content sync of its parent dir); the rest are title-only.
   const LIVE_DOCK_PREVIEWS = 6;
   function recordLocalTab(assignment: string) {
+    closingTabs.reopen(assignment);
     setLocalTabs((prev) =>
       [assignment, ...prev.filter((a) => a !== assignment)].slice(
         0,
@@ -2263,8 +2273,18 @@ function WorkspaceScreen(props: {
    *  fallback entry. The counterpart to `registerTab`, and now the ONLY thing
    *  that unregisters — see the effect below. */
   function closeTab(assignment: string) {
+    const operation = closingTabs.begin(assignment);
     setLocalTabs((prev) => prev.filter((a) => a !== assignment));
-    unregisterTab(workspace, assignment);
+    void unregisterTab(workspace, assignment).then(
+      () =>
+        closingTabs.settle(
+          assignment,
+          operation,
+          true,
+          openTabs().some((tab) => tab.assignment === assignment),
+        ),
+      () => closingTabs.settle(assignment, operation, false, false),
+    );
   }
   // The host-wide open-tab list, mirrored from every connected server's `tabs/`
   // prefix (docs/design/kv.md, ./ide/openTabs.ts).
@@ -2286,7 +2306,7 @@ function WorkspaceScreen(props: {
     const out: string[] = [];
     const seen = new Set<string>();
     const take = (a: string) => {
-      if (displayed.has(a) || seen.has(a)) return;
+      if (displayed.has(a) || seen.has(a) || closingTabs.isClosing(a)) return;
       if (!isTileAssignment(a) && !isWebAssignment(a)) return;
       seen.add(a);
       out.push(a);
@@ -2297,6 +2317,11 @@ function WorkspaceScreen(props: {
     for (const tab of openTabs()) take(tab.assignment);
     for (const a of localTabs()) take(a);
     return out.slice(0, BACKGROUND_TILES_MAX);
+  });
+  createEffect(() => {
+    closingTabs.reconcile(
+      new Set(openTabs().map((tab) => tab.assignment)),
+    );
   });
   /**
    * Everything open, in the order Ctrl+B [ / ] walks it: terminals, then
@@ -2437,12 +2462,17 @@ function WorkspaceScreen(props: {
       at && (isTileAssignment(at) || isWebAssignment(at)) ? at : null;
     prevOpenTiles = shown;
   });
-  // "In a layout" means a genuine multi-pane layout. A single-leaf layout ("_") is
-  // visually just one pane and is treated as single-view for tile purposes, so a
-  // a stale single-pane layout never forces the layout tile path.
+  // A one-leaf tiling tree is visually just the ordinary main view, but a
+  // one-window scrolling/floating tree still needs its manager container:
+  // that owns the floating title bar/frame, assignment tracking, and dock
+  // exclusion. Treating every one-leaf tree as single-view rendered the same
+  // window through the main slot while its managed assignment never mounted.
   const inLayout = createMemo(() => {
     const al = activeLayout();
-    return al != null && leafCount(al.root) > 1;
+    return (
+      al != null &&
+      (leafCount(al.root) > 1 || windowManagerOf(al.root) !== "tiling")
+    );
   });
 
   // Clear focused surface if it was destroyed.  A grace period avoids
@@ -3089,7 +3119,7 @@ function WorkspaceScreen(props: {
     if (overlay() === "web" || overlay() === null) void refreshWebLocations();
   });
 
-  function openTile(assignment: string) {
+  function openTile(assignment: string, asNewFloatingWindow = false) {
     // Manage panels can open terminal assignments through the same tile
     // boundary editors use. Dispatch those to the generic focused-view path;
     // only IDE/web assignments belong in the tile registry below.
@@ -3098,6 +3128,7 @@ function WorkspaceScreen(props: {
       return;
     }
     if (inLayout()) {
+      if (asNewFloatingWindow && showAsFloatingWindow(assignment)) return;
       const paneId = preferredTilePane();
       recordNav(paneId, assignment);
       if (moveToPaneFn) moveToPaneFn(assignment, paneId);
@@ -3122,6 +3153,7 @@ function WorkspaceScreen(props: {
     paneId: string,
     sourcePaneId?: string,
   ) {
+    if (sourcePaneId == null && showAsFloatingWindow(assignment)) return;
     recordNav(paneId, assignment);
     if (moveToPaneFn) moveToPaneFn(assignment, paneId, sourcePaneId);
     else pendingTilePlacement = { assignment, paneId };
@@ -3401,8 +3433,8 @@ function WorkspaceScreen(props: {
 
   // Restore a backgrounded tile: showing it removes it from the dock, which is
   // derived as "open minus displayed".
-  function restoreTile(assignment: string) {
-    openTile(assignment);
+  function restoreTile(assignment: string, asNewFloatingWindow = false) {
+    openTile(assignment, asNewFloatingWindow);
   }
   // The ✕ on a background-editor card. Closes the tab host-wide (it is an
   // explicit close, the same as Ctrl+Alt+Shift+Q on a displayed one), so its
@@ -4033,6 +4065,10 @@ function WorkspaceScreen(props: {
     null;
   let clearPaneAssignmentFn: ((paneId: string) => void) | null = null;
   let focusPaneFn: ((paneId: string) => void) | null = null;
+  let chooseWindowManagerFn:
+    | ((manager: WindowManager) => void)
+    | null = null;
+  let addFloatingWindowFn: ((assignment: string) => void) | null = null;
   // Drop every LayoutContainer control-fn reference. These close over a specific
   // LayoutContainer instance; when the container unmounts that instance is
   // disposed, so the stale fns must be cleared or a later call would write into
@@ -4044,6 +4080,26 @@ function WorkspaceScreen(props: {
     moveToPaneFn = null;
     clearPaneAssignmentFn = null;
     focusPaneFn = null;
+    chooseWindowManagerFn = null;
+    addFloatingWindowFn = null;
+  }
+
+  /** Show a parked item without evicting a floating window already on screen. */
+  function showAsFloatingWindow(assignment: string): boolean {
+    const layout = activeLayout();
+    if (
+      !inLayout() ||
+      !layout ||
+      windowManagerOf(layout.root) !== "floating"
+    ) {
+      return false;
+    }
+    const shown = Object.entries(
+      layoutAssignments()?.assignments ?? {},
+    ).find(([, value]) => value === assignment)?.[0];
+    if (shown) focusPaneFn?.(shown);
+    else addFloatingWindowFn?.(assignment);
+    return true;
   }
 
   /**
@@ -4059,17 +4115,20 @@ function WorkspaceScreen(props: {
     applyLayout("Split", dsl);
   }
 
-  /**
-   * Ctrl+B m with nothing but the single view on screen.
-   *
-   * The cycle is tiling → scrolling → floating, and a single view already *is*
-   * the tiling manager with one window, so the step from here is a strip
-   * holding it. Once a layout exists LayoutContainer binds this key over ours and
-   * cycles the real tree.
-   */
-  function startScrollingFromSingleView() {
-    if (activeLayout()) return;
-    applyLayout("Scrolling", "scroll(_ 1)");
+  function chooseWindowManager(manager: WindowManager) {
+    if (inLayout()) {
+      chooseWindowManagerFn?.(manager);
+      return;
+    }
+    if (manager === "tiling") {
+      setActiveLayout(null);
+      saveActiveLayout(null);
+      return;
+    }
+    applyLayout(
+      manager === "scrolling" ? "Scrolling" : "Floating",
+      manager === "scrolling" ? "scroll(_ 1)" : "float(_ [6,6,58,58])",
+    );
   }
 
   function applyLayout(name: string, dsl: string) {
@@ -4201,7 +4260,10 @@ function WorkspaceScreen(props: {
     closeOverlay();
   }
 
-  function focusSessionFromUi(sessionId: SessionId) {
+  function focusSessionFromUi(
+    sessionId: SessionId,
+    asNewFloatingWindow = false,
+  ) {
     retainMainTerminalRef(sessionId);
     // Re-showing the parked session itself: focus does not change, so only an
     // explicit clear can un-park it.
@@ -4210,13 +4272,20 @@ function WorkspaceScreen(props: {
     // Stops DISPLAYING the single-view tile; the tab stays open and drops into
     // the dock (and stays listed in every other frontend).
     setActiveTile(null);
-    if (activeLayout()) {
+    if (
+      activeLayout() &&
+      !(asNewFloatingWindow && showAsFloatingWindow(sessionId))
+    ) {
       focusBySessionFn?.(sessionId);
     }
     workspace.focusSession(sessionId);
   }
 
-  function focusSurface(surfaceId: SurfaceId, connectionId?: ConnectionId) {
+  function focusSurface(
+    surfaceId: SurfaceId,
+    connectionId?: ConnectionId,
+    asNewFloatingWindow = false,
+  ) {
     setActiveTile(null); // stops displaying the single-view tile; tab stays open
     // When a layout is active, place the surface into the focused pane.
     if (activeLayout() && layoutFocusedPaneId()) {
@@ -4225,6 +4294,12 @@ function WorkspaceScreen(props: {
         surfaces().find((x) => x.surfaceId === surfaceId)?.connectionId ??
         activeConnectionId();
       const assignment = surfaceAssignment(connId, surfaceId);
+      if (asNewFloatingWindow && showAsFloatingWindow(assignment)) {
+        focusSurfaceById(null);
+        previousFocus = null;
+        closeOverlay();
+        return;
+      }
       // Already displayed in some pane? Focus that pane instead of moving it.
       // moveToPane would *swap*: assignmentsAfterDrop recovers a surface's
       // source pane from the current assignments (surfaces are unique views),
@@ -4247,6 +4322,24 @@ function WorkspaceScreen(props: {
     // would steal focus back from the surface — see selectPane.
     previousFocus = null;
     closeOverlay();
+  }
+
+  function raiseMediaPlayer(player: {
+    connectionId: string;
+    desktopEntry: string;
+    identity: string;
+  }) {
+    const target = surfaces()
+      .filter((surface) => surface.connectionId === player.connectionId)
+      .map((surface) => ({
+        surface,
+        score:
+          mprisSurfaceMatchScore(player, surface) +
+          (surface.parentId === 0n ? 1 : 0),
+      }))
+      .filter((candidate) => candidate.score > 1)
+      .sort((left, right) => right.score - left.score)[0]?.surface;
+    if (target) focusSurface(target.surfaceId, target.connectionId, true);
   }
 
   /**
@@ -4437,7 +4530,7 @@ function WorkspaceScreen(props: {
     toggleOverlay,
     forwardPrefix: forwardPrefixToFocusedPane,
     splitFocused: splitFocusedView,
-    cycleWindowManager: startScrollingFromSingleView,
+    openWindowManagerChooser: () => toggleOverlay("window-manager"),
     seedSwitcher: setSwitcherSeed,
     cancelOverlay,
     toggleDebug,
@@ -5260,6 +5353,12 @@ function WorkspaceScreen(props: {
                     onFocusPane={(fn) => {
                       focusPaneFn = fn;
                     }}
+                    onChooseWindowManager={(fn) => {
+                      chooseWindowManagerFn = fn;
+                    }}
+                    onAddFloatingWindow={(fn) => {
+                      addFloatingWindowFn = fn;
+                    }}
                     onMoveSessionToPane={(fn) => {
                       moveSessionToPaneFn = fn;
                     }}
@@ -5321,9 +5420,11 @@ function WorkspaceScreen(props: {
               fontFamily={resolvedFontWithFallback()}
               fontSize={fontSize()}
               isMobileTouch={isMobileTouch()}
-              onFocusSession={switchSession}
+              onFocusSession={(sessionId) =>
+                focusSessionFromUi(sessionId, true)
+              }
               onFocusSurface={(connectionId, surfaceId) =>
-                focusSurface(surfaceId, connectionId)
+                focusSurface(surfaceId, connectionId, true)
               }
               onCloseSession={(id) => void closeSessionFromUi(id)}
               onCloseSurface={(connectionId, surfaceId) =>
@@ -5354,7 +5455,7 @@ function WorkspaceScreen(props: {
                         scale={chromeScale()}
                         isMobileTouch={isMobileTouch()}
                         assignment={assignment}
-                        onFocus={() => restoreTile(assignment)}
+                        onFocus={() => restoreTile(assignment, true)}
                         onClose={() => closeBackgroundTile(assignment)}
                         closeTitle="Close"
                         header={() => (
@@ -5693,6 +5794,19 @@ function WorkspaceScreen(props: {
             />
           )}
         </Show>
+        <Show when={overlay() === "window-manager"}>
+          <WindowManagerChooser
+            current={
+              activeLayout()
+                ? windowManagerOf(activeLayout()!.root)
+                : "tiling"
+            }
+            palette={palette()}
+            fontSize={fontSize()}
+            onChoose={chooseWindowManager}
+            onClose={closeOverlay}
+          />
+        </Show>
         <Show when={overlay() === "link" && pendingLink()}>
           {(pending) => (
             <LinkOverlay
@@ -5985,6 +6099,7 @@ function WorkspaceScreen(props: {
                 focusedConnectionId={
                   focusedSurfaceConnId() ?? activeConnectionId()
                 }
+                onRaisePlayer={raiseMediaPlayer}
               />
             )}
           />
@@ -6933,11 +7048,11 @@ function SurfaceThumbnail(props: {
         <YasSurfaceView
           connectionId={props.surface.connectionId}
           surfaceId={props.surface.surfaceId}
-          // A card shares whatever stream the panes are already getting and
-          // must not size the surface: its own height is derived from the
-          // surface's aspect below, so driving a resize from it closes exactly
-          // the loop that comment warns about.  It also has to stay in flow for
-          // `height: auto` to have anything to measure.
+          // A parked surface has no foreground view to populate the shared
+          // frame cache. Keep a thumbnail subscription of its own; passive
+          // views advertise a scaled target capped at thumbnail cadence and
+          // are excluded from surface size mediation, so this cannot resize
+          // Brave or pin a later foreground handoff to the card's dimensions.
           resizable={false}
           style={{
             display: "block",

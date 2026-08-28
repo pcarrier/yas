@@ -20,7 +20,7 @@
  */
 
 import type { ReactiveStore } from "@yas-run/core";
-import { Notifier } from "@yas-run/core";
+import { Notifier, YAS_STATUS_RESOURCE_EXHAUSTED } from "@yas-run/core";
 
 interface ChannelMessageHandle {
   send(payload: Uint8Array | string): boolean;
@@ -129,17 +129,18 @@ export const SESSION_MAX_NAME_CHARS = 1024;
 export const SESSION_MAX_SOCKET_CHARS = 255;
 export const SESSION_MAX_ICON_PATH_CHARS = 4096;
 
-/** Artwork is demand-loaded a few screens at a time. Keep eight request
- * batches, but never more than a modest document-wide blob budget. */
-export const SESSION_ARTWORK_MAX_ENTRIES = ICON_BATCH * 8;
+/** Keep the launcher's resolved shelf, bounded primarily by actual blob bytes. */
+export const SESSION_ARTWORK_MAX_ENTRIES = SESSION_MAX_CATALOG_ENTRIES - 64;
 export const SESSION_ARTWORK_MAX_BYTES = 32 * 1024 * 1024;
-export const SESSION_ARTWORK_LOAD_MAX_ROUNDS = 4;
+export const SESSION_ARTWORK_LOAD_MAX_ROUNDS = Math.ceil(
+  SESSION_MAX_CATALOG_ENTRIES / ICON_BATCH,
+);
 
 /** Outstanding requests are peer-derived IDs and therefore bounded too. */
-export const SESSION_ICON_REQUEST_MAX_ENTRIES = 1024;
-export const SESSION_ICON_REQUEST_MAX_BYTES = 512 * 1024;
-export const SESSION_ICON_QUEUE_MAX_ENTRIES = ICON_BATCH * 4;
-export const SESSION_ICON_QUEUE_MAX_BYTES = 64 * 1024;
+export const SESSION_ICON_REQUEST_MAX_ENTRIES = SESSION_MAX_CATALOG_ENTRIES;
+export const SESSION_ICON_REQUEST_MAX_BYTES = 1024 * 1024;
+export const SESSION_ICON_QUEUE_MAX_ENTRIES = SESSION_MAX_CATALOG_ENTRIES;
+export const SESSION_ICON_QUEUE_MAX_BYTES = 1024 * 1024;
 export const SESSION_COMMAND_QUEUE_MAX_ENTRIES = 64;
 export const SESSION_COMMAND_QUEUE_MAX_BYTES = 64 * 1024;
 
@@ -742,12 +743,18 @@ export async function openSession(
         if (wanted.length === 0) return;
         const records = await connection.readFiles(
           [wanted.map((entry) => entry.path)],
-          { maxBytes: SESSION_MAX_ARTWORK_FILE_BYTES },
+          {
+            // FS receive credit covers the whole query, not each question.
+            // Giving a 48-file batch one file's 1 MiB allowance truncated the
+            // reply after the first few icons and made the rest look absent.
+            maxBytes: SESSION_MAX_ARTWORK_FILE_BYTES * wanted.length,
+          },
         );
         if (closed) return;
         for (const [index, record] of records.entries()) {
           const entry = wanted[index];
           if (!entry) continue;
+          if (record.status === YAS_STATUS_RESOURCE_EXHAUSTED) continue;
           if (
             record.status !== 0 ||
             record.content.length === 0 ||

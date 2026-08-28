@@ -19,11 +19,8 @@ export interface KeyboardShortcutHandlers {
   overlay: () => Overlay;
   /** Currently active layout (null = single terminal) */
   activeLayout: () => unknown | null;
-  /**
-   * Whether a genuine multi-pane layout is on screen. Not the same as
-   * `activeLayout() != null`: a single-leaf layout renders the single main
-   * view, so the pane slots are not what the user is looking at.
-   */
+  /** Whether a managed layout is on screen. A one-leaf tiling tree still uses
+   * the ordinary main view; one-window scrolling/floating layouts do not. */
   inLayout: () => boolean;
   /** Currently focused pane ID */
   layoutFocusedPaneId: () => string | null;
@@ -59,9 +56,8 @@ export interface KeyboardShortcutHandlers {
    * a single view into a tree.
    */
   splitFocused: (direction: "horizontal" | "vertical") => void;
-  /** Hand the workspace to the next window manager. Same shadowing as
-   *  `splitFocused`: with a layout up, the container converts it in place. */
-  cycleWindowManager: () => void;
+  /** Open the window-manager chooser. */
+  openWindowManagerChooser: () => void;
   /** Open the switcher with one of its mode prefixes already typed. */
   seedSwitcher: (mode: string) => void;
   cancelOverlay: () => void;
@@ -545,7 +541,7 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       // LayoutContainer rebinds both while a layout is on screen.
       ["h", () => h.splitFocused("horizontal"), t("help.splitBeside")],
       ["v", () => h.splitFocused("vertical"), t("help.splitBelow")],
-      ["m", h.cycleWindowManager, t("help.windowManager")],
+      ["m", h.openWindowManagerChooser, t("help.windowManager")],
     ];
     const unbind = bindings.map(([token, run, label]) =>
       registerPrefixAction(token, run, label),

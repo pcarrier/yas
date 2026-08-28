@@ -243,7 +243,8 @@ pub struct SurfaceRecord {
     pub parent_handle: u64,
     pub app_handle: u64,
     pub lifecycle: u8,
-    pub buffer_scale: u16,
+    pub composite_width: u32,
+    pub composite_height: u32,
     pub logical_width_32_32: i64,
     pub logical_height_32_32: i64,
     pub application_id: String,
@@ -255,7 +256,8 @@ impl SurfaceRecord {
     fn validate(&self) -> Result<()> {
         handle(self.surface_handle, "zero surface handle")?;
         if self.revision == 0
-            || self.buffer_scale == 0
+            || self.composite_width == 0
+            || self.composite_height == 0
             || self.logical_width_32_32 <= 0
             || self.logical_height_32_32 <= 0
         {
@@ -539,7 +541,8 @@ impl Encode for SurfaceRecord {
         put_u64(out, self.app_handle);
         out.push(self.lifecycle);
         out.push(0);
-        put_u16(out, self.buffer_scale);
+        put_u32(out, self.composite_width);
+        put_u32(out, self.composite_height);
         put_i64(out, self.logical_width_32_32);
         put_i64(out, self.logical_height_32_32);
         put_string_u16(out, &self.application_id)?;
@@ -565,7 +568,8 @@ impl Decode for SurfaceRecord {
             parent_handle,
             app_handle,
             lifecycle,
-            buffer_scale: decoder.u16()?,
+            composite_width: decoder.u32()?,
+            composite_height: decoder.u32()?,
             logical_width_32_32: decoder.i64()?,
             logical_height_32_32: decoder.i64()?,
             application_id: decoder.string_u16()?,
@@ -1834,6 +1838,29 @@ pub fn surface_from_state_record(record: &Record) -> Result<SurfaceRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_record_preserves_rounded_hidpi_composite_dimensions() {
+        let record = SurfaceRecord {
+            surface_handle: 1,
+            revision: 1,
+            parent_handle: 0,
+            app_handle: 0,
+            lifecycle: 0,
+            composite_width: 1598,
+            composite_height: 1198,
+            logical_width_32_32: 800_i64 << 32,
+            logical_height_32_32: 600_i64 << 32,
+            application_id: "test.browser".to_owned(),
+            title: "Browser".to_owned(),
+            extensions: Extensions::default(),
+        };
+
+        assert_eq!(
+            SurfaceRecord::decode(&record.encode().unwrap()).unwrap(),
+            record
+        );
+    }
 
     #[test]
     fn resize_scale_extension_round_trips_and_rejects_zero() {

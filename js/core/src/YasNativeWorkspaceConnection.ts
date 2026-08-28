@@ -216,6 +216,28 @@ import { YasResultError, YasWriter } from "./yas/wire";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const MAX_QUERY_BYTES = 8 * 1024 * 1024;
+
+/** A custom Wayland cursor expressed as a valid CSS cursor value. */
+export function customSurfaceCursorCss(
+  url: string,
+  hotspotX: number,
+  hotspotY: number,
+  scale120: number,
+): string {
+  const bufferScale = Math.max(120, scale120) / 120;
+  const logicalX = Math.max(0, Math.round(hotspotX));
+  const logicalY = Math.max(0, Math.round(hotspotY));
+  const rawX = Math.max(0, Math.round(hotspotX * bufferScale));
+  const rawY = Math.max(0, Math.round(hotspotY * bufferScale));
+  const image = `url(${JSON.stringify(url)})`;
+  if (bufferScale === 1)
+    return `${image} ${logicalX} ${logicalY}, default`;
+  // Wayland's hotspot is surface-local (logical), while the PNG is the raw
+  // cursor buffer. image-set carries that buffer density into CSS, whose
+  // hotspot is then expressed in the resolved image coordinate system. Keep
+  // the raw URL as a fallback for engines without cursor url-set support.
+  return `image-set(${image} ${bufferScale}x) ${logicalX} ${logicalY}, ${image} ${rawX} ${rawY}, default`;
+}
 // One slot turns the reliable Surface stream into stop-and-wait: every frame
 // has to cross the link, enter WebCodecs, and send its ACK back before the
 // server may emit the next one. Worse, browser/native scheduling can batch
@@ -2166,15 +2188,11 @@ export class YasNativeWorkspaceConnection {
         1,
         fixed32Integer(record.logicalHeight32_32),
       );
-      // SurfaceRecord dimensions are logical; bufferScale is the missing half
-      // of the compositor's physical coordinate space.  PointerMotion is
-      // intentionally encoded in physical composite pixels and converted back
-      // to logical coordinates by the compositor.  Treating the catalogue's
-      // logical width as physical made a 2x client send only half that range,
-      // which the compositor then divided by two again.
-      const bufferScale = Math.max(1, record.bufferScale);
-      const width = Math.max(1, logicalWidth * bufferScale);
-      const height = Math.max(1, logicalHeight * bufferScale);
+      // PointerMotion is encoded in exact physical composite pixels and the
+      // compositor converts it back to logical coordinates. Rounded HiDPI
+      // buffers cannot be reconstructed from an integer scale.
+      const width = record.compositeWidth;
+      const height = record.compositeHeight;
       if (!previous) {
         this.surfaceStore.handleSurfaceCreated(
           record.surfaceHandle,
@@ -2210,7 +2228,8 @@ export class YasNativeWorkspaceConnection {
         if (
           previous.logicalWidth32_32 !== record.logicalWidth32_32 ||
           previous.logicalHeight32_32 !== record.logicalHeight32_32 ||
-          previous.bufferScale !== record.bufferScale
+          previous.compositeWidth !== record.compositeWidth ||
+          previous.compositeHeight !== record.compositeHeight
         )
           this.surfaceStore.handleSurfaceResized(
             record.surfaceHandle,
@@ -2256,14 +2275,24 @@ export class YasNativeWorkspaceConnection {
         type: "image/png",
       });
       const url = URL.createObjectURL(blob);
-      this.surfaceStore.handleSurfaceCursor(surfaceId, "custom", {
-        kind: "custom",
-        url,
-        hotspotX: cursor.hotspotX,
-        hotspotY: cursor.hotspotY,
-        width: cursor.width,
-        height: cursor.height,
-      });
+      this.surfaceStore.handleSurfaceCursor(
+        surfaceId,
+        customSurfaceCursorCss(
+          url,
+          cursor.hotspotX,
+          cursor.hotspotY,
+          cursor.scale120,
+        ),
+        {
+          kind: "custom",
+          url,
+          hotspotX: cursor.hotspotX,
+          hotspotY: cursor.hotspotY,
+          width: cursor.width,
+          height: cursor.height,
+          scale120: cursor.scale120,
+        },
+      );
     }
   }
 

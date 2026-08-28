@@ -9,6 +9,7 @@ import {
   type DesktopRevision,
   type MprisPlayer,
   type PortalRequest,
+  type YasSurface,
 } from "@yas-run/core";
 
 export type DesktopDelivery = "toast" | "native" | "retain";
@@ -257,6 +258,50 @@ export function canRaiseMpris(
   capabilityFlags: number,
 ): boolean {
   return !readOnly && Boolean(capabilityFlags & MPRIS_CAN_RAISE);
+}
+
+const GENERIC_APP_WORDS = new Set([
+  "app",
+  "browser",
+  "client",
+  "desktop",
+  "player",
+]);
+
+function appWords(value: string): string[] {
+  return value
+    .toLowerCase()
+    .replace(/\.desktop$/, "")
+    .split(/[^a-z0-9]+/)
+    .filter(
+      (word) =>
+        word.length >= 4 && !GENERIC_APP_WORDS.has(word) && !/^\d+$/.test(word),
+    );
+}
+
+/** Rank a YAS surface as the native window belonging to an MPRIS player. */
+export function mprisSurfaceMatchScore(
+  player: Pick<MprisPlayer, "desktopEntry" | "identity">,
+  surface: Pick<YasSurface, "appId" | "title" | "origin">,
+): number {
+  const desktop = player.desktopEntry.toLowerCase().replace(/\.desktop$/, "");
+  const appIds = [surface.origin?.appId ?? "", surface.appId]
+    .map((value) => value.toLowerCase().replace(/\.desktop$/, ""))
+    .filter(Boolean);
+  if (desktop && appIds.includes(desktop)) return 100;
+
+  const desktopWords = new Set(appWords(player.desktopEntry));
+  const appIdWords = appIds.flatMap(appWords);
+  if (appIdWords.some((word) => desktopWords.has(word))) return 80;
+
+  const identityWords = new Set(appWords(player.identity));
+  if (appIdWords.some((word) => identityWords.has(word))) return 60;
+
+  if (appIds.length === 0) {
+    const titleWords = new Set(appWords(surface.title));
+    if ([...identityWords].some((word) => titleWords.has(word))) return 40;
+  }
+  return 0;
 }
 
 /**

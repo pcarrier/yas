@@ -293,6 +293,7 @@ export class YasNativeWorkspaceFs {
       const root = await this.openPlatformRoot("/");
       const relative = paths.map((path) => path.slice(1));
       const answered = new Map<number, { status: number; bytes: Uint8Array }>();
+      let truncated = false;
       try {
         const page = await root.read(
           relative.map((path) => ({
@@ -302,6 +303,7 @@ export class YasNativeWorkspaceFs {
           })),
           BigInt(options.maxBytes ?? DEFAULT_QUERY_CREDIT),
         );
+        truncated = (page.flags & g.YAS_FS_PAGE_TRUNCATED) !== 0;
         for (const record of (await page.records()).map(decodeFsQueryRecord)) {
           if (record.kind !== "read") continue;
           answered.set(record.value.questionIndex, {
@@ -315,7 +317,11 @@ export class YasNativeWorkspaceFs {
       for (const [index, path] of paths.entries()) {
         const answer = answered.get(index);
         out.push({
-          status: answer?.status ?? g.YAS_STATUS_UNAVAILABLE,
+          status:
+            answer?.status ??
+            (truncated
+              ? g.YAS_STATUS_RESOURCE_EXHAUSTED
+              : g.YAS_STATUS_UNAVAILABLE),
           path,
           content: answer?.bytes ?? new Uint8Array(),
         });

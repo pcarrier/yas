@@ -2,6 +2,7 @@ import {
   onMount,
   onCleanup,
   createEffect,
+  createMemo,
   createSignal,
   type JSX,
 } from "solid-js";
@@ -112,9 +113,11 @@ export function YasTerminal(props: YasTerminalProps) {
   createEffect(() => surface()?.setReadOnly(props.readOnly));
   createEffect(() => surface()?.setResizable(props.resizable));
 
-  // Re-send dimensions when connection becomes ready.
-  createEffect(() => {
-    const s = surface();
+  // Re-send dimensions only when this session's connection becomes ready.
+  // Reading snapshot() directly in the effect made every unrelated workspace
+  // update repeat CONFIGURE_VIEW, including terminal frames caused by the
+  // preceding configure.
+  const readySessionId = createMemo(() => {
     const snap = snapshot();
     const session = props.sessionId
       ? (snap.sessions.find((ss) => ss.id === props.sessionId) ?? null)
@@ -122,9 +125,11 @@ export function YasTerminal(props: YasTerminalProps) {
     const connection = session
       ? (snap.connections.find((c) => c.id === session.connectionId) ?? null)
       : null;
-    if (connection?.status === "connected" && props.sessionId !== null) {
-      s?.resendSize();
-    }
+    return connection?.status === "connected" ? props.sessionId : null;
+  });
+  createEffect(() => {
+    const s = surface();
+    if (readySessionId() !== null) s?.resendSize();
   });
 
   return (

@@ -112,6 +112,79 @@ describe("YasNativeExtensionFacade", () => {
     );
   });
 
+  it("accepts a coalesced later revision from the same generation", async () => {
+    const record = nativeRecord();
+    const committed = {
+      ...record,
+      definitionRevision: record.definitionRevision + 1n,
+    };
+    const delivered = {
+      ...committed,
+      definitionRevision: committed.definitionRevision + 1n,
+      attempt: committed.attempt + 1n,
+    };
+    const control = vi.fn().mockResolvedValue({
+      extensionHandle: committed.extensionHandle,
+      generation: committed.generation,
+      definitionRevision: committed.definitionRevision,
+      extensions: [],
+    });
+    const client = clientFor(record, {
+      control,
+      catalog: {
+        snapshot: { revision: 3n, definitions: [delivered] },
+        subscribe: vi.fn(() => () => undefined),
+        unwatch: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const facade = new YasNativeExtensionFacade(connection(), client);
+
+    const result = await facade.controlExtension(
+      record.extensionHandle,
+      YAS_EXTENSION_CONTROL_RESTART,
+    );
+
+    expect(result).toBe(delivered);
+  });
+
+  it("waits for the catalogue to reach a restarted generation", async () => {
+    const record = nativeRecord();
+    const restarted = {
+      ...record,
+      generation: record.generation + 1n,
+      attempt: record.attempt + 1n,
+    };
+    const control = vi.fn().mockResolvedValue({
+      extensionHandle: restarted.extensionHandle,
+      generation: restarted.generation,
+      definitionRevision: restarted.definitionRevision,
+      extensions: [],
+    });
+    const subscribe = vi.fn(
+      (listener: (snapshot: { definitions: YasExtensionRecord[] }) => void) => {
+        listener({ definitions: [restarted] });
+        return () => undefined;
+      },
+    );
+    const client = clientFor(record, {
+      control,
+      catalog: {
+        snapshot: { revision: 1n, definitions: [record] },
+        subscribe,
+        unwatch: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const facade = new YasNativeExtensionFacade(connection(), client);
+
+    const result = await facade.controlExtension(
+      record.extensionHandle,
+      YAS_EXTENSION_CONTROL_RESTART,
+    );
+
+    expect(subscribe).toHaveBeenCalledOnce();
+    expect(result).toBe(restarted);
+  });
+
   it("deploys an update with its full high-bit CAS identity", async () => {
     const record = nativeRecord();
     const deploy = vi.fn().mockResolvedValue({

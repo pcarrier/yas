@@ -27,7 +27,10 @@ import {
   YAS_TERMINAL_UNWATCH,
   YAS_TERMINAL_WATCH,
 } from "../yas/generated";
-import { YasNativeWorkspaceConnection } from "../YasNativeWorkspaceConnection";
+import {
+  YasNativeWorkspaceConnection,
+  customSurfaceCursorCss,
+} from "../YasNativeWorkspaceConnection";
 import * as YasSurfaceCanvas from "../YasSurfaceCanvas";
 import { YasNativeProductFamilies } from "../yas/nativeProductFamilies";
 import { encodeSurfaceCodecPayload } from "../yas/packed";
@@ -115,6 +118,18 @@ function surfaceTestConnection(openView: ReturnType<typeof vi.fn>) {
 }
 
 describe("YasNativeWorkspaceConnection", () => {
+  it("turns custom Wayland cursor artwork into a valid scaled CSS cursor", () => {
+    expect(customSurfaceCursorCss("blob:cursor", 4, 5, 240)).toBe(
+      'image-set(url("blob:cursor") 2x) 4 5, url("blob:cursor") 8 10, default',
+    );
+  });
+
+  it("keeps a 1x Wayland cursor as an ordinary CSS cursor", () => {
+    expect(customSurfaceCursorCss("blob:cursor", 4, 5, 120)).toBe(
+      'url("blob:cursor") 4 5, default',
+    );
+  });
+
   it("handles a rejected Font UNWATCH during invalidated disposal", async () => {
     const unwatch = vi
       .fn()
@@ -1124,7 +1139,7 @@ describe("YasNativeWorkspaceConnection", () => {
     );
   });
 
-  it("maps a 2x Surface catalogue record into physical pointer space", () => {
+  it("preserves rounded HiDPI Surface dimensions for pointer space", () => {
     const handleSurfaceCreated = vi.fn();
     const handleSurfaceResized = vi.fn();
     const connection = Object.create(
@@ -1151,7 +1166,8 @@ describe("YasNativeWorkspaceConnection", () => {
       parentHandle: 0n,
       appHandle: 0n,
       lifecycle: 0,
-      bufferScale: 2,
+      compositeWidth: 1598,
+      compositeHeight: 1198,
       logicalWidth32_32: 800n << 32n,
       logicalHeight32_32: 600n << 32n,
       applicationId: "app",
@@ -1163,21 +1179,23 @@ describe("YasNativeWorkspaceConnection", () => {
     expect(handleSurfaceCreated).toHaveBeenCalledWith(
       1n,
       0n,
-      1600,
-      1200,
+      1598,
+      1198,
       "title",
       "app",
     );
     expect(handleSurfaceResized).toHaveBeenCalledWith(
       1n,
-      1600,
-      1200,
+      1598,
+      1198,
       800,
       600,
     );
 
     handleSurfaceResized.mockClear();
-    lifecycle.applySurfaceCatalog([{ ...record, bufferScale: 1 }]);
+    lifecycle.applySurfaceCatalog([
+      { ...record, compositeWidth: 800, compositeHeight: 600 },
+    ]);
     expect(handleSurfaceResized).toHaveBeenCalledWith(
       1n,
       800,

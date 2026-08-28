@@ -141,7 +141,8 @@ export interface YasSurfaceRecord {
   parentHandle: bigint;
   appHandle: bigint;
   lifecycle: number;
-  bufferScale: number;
+  compositeWidth: number;
+  compositeHeight: number;
   logicalWidth32_32: bigint;
   logicalHeight32_32: bigint;
   applicationId: string;
@@ -417,7 +418,8 @@ export function encodeSurfaceRecord(value: YasSurfaceRecord): Uint8Array {
     .u64(value.appHandle)
     .u8(value.lifecycle)
     .u8(0)
-    .u16(value.bufferScale)
+    .u32(value.compositeWidth)
+    .u32(value.compositeHeight)
     .i64(value.logicalWidth32_32)
     .i64(value.logicalHeight32_32)
     .utf8U16(value.applicationId)
@@ -434,7 +436,8 @@ export function decodeSurfaceRecord(bytes: Uint8Array): YasSurfaceRecord {
     parentHandle: cursor.u64("Surface parent handle"),
     appHandle: cursor.u64("Surface app handle"),
     lifecycle: cursor.u8("Surface lifecycle"),
-    bufferScale: 0,
+    compositeWidth: 0,
+    compositeHeight: 0,
     logicalWidth32_32: 0n,
     logicalHeight32_32: 0n,
     applicationId: "",
@@ -443,7 +446,8 @@ export function decodeSurfaceRecord(bytes: Uint8Array): YasSurfaceRecord {
   };
   if (cursor.u8("Surface reserved") !== 0)
     throw new YasProtocolError("Surface record reserved byte is nonzero");
-  value.bufferScale = cursor.u16("Surface buffer scale");
+  value.compositeWidth = cursor.u32("Surface composite width");
+  value.compositeHeight = cursor.u32("Surface composite height");
   value.logicalWidth32_32 = cursor.i64("Surface logical width");
   value.logicalHeight32_32 = cursor.i64("Surface logical height");
   value.applicationId = cursor.utf8U16("Surface application ID");
@@ -2123,7 +2127,8 @@ function validateSurfaceRecord(value: YasSurfaceRecord): void {
   requireHandle(value.surfaceHandle, "Surface handle");
   if (
     value.revision === 0n ||
-    value.bufferScale === 0 ||
+    value.compositeWidth === 0 ||
+    value.compositeHeight === 0 ||
     value.logicalWidth32_32 <= 0n ||
     value.logicalHeight32_32 <= 0n
   )

@@ -44,6 +44,7 @@ import { FileViewSwitcher } from "./ide/FileViewSwitcher";
 import { activityDescription, activityPercent } from "./activityStatus";
 import { nextCompact } from "./statusBarFit";
 import { YasMark } from "./Logo";
+import { SurfaceIcon } from "./SurfaceIcon";
 
 /** One of the status bar's right-end toggles, in either of its two homes: a
  *  bare glyph in the bar, or a labelled row in the overflow menu. */
@@ -488,6 +489,12 @@ export function StatusBar(props: {
                               surfacePrefix(surface(), label());
                             return (
                               <>
+                                <SurfaceIcon
+                                  surface={surface()}
+                                  theme={theme()}
+                                  scale={scale()}
+                                  size={Math.round(scale().md * 1.5)}
+                                />
                                 <span style={{ opacity: 0.5 }}>{prefix()}</span>
                                 {" \u203A "}
                                 {surfaceName(surface())}

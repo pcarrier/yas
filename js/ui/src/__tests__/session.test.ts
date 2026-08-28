@@ -489,7 +489,7 @@ describe("openSession", () => {
     }
   });
 
-  it("LRU-bounds asked ids across hostile request rotation", async () => {
+  it("keeps the full authoritative catalog in the asked-id window", async () => {
     vi.useFakeTimers();
     try {
       const connection = fakeConnection();
@@ -514,7 +514,7 @@ describe("openSession", () => {
       connection.sent.length = 0;
       session.requestIcons([ids[0] ?? ""]);
       vi.advanceTimersByTime(200);
-      expect(connection.sent).toEqual([`icons ${ids[0]}`]);
+      expect(connection.sent).toEqual([]);
       session.close();
     } finally {
       vi.useRealTimers();

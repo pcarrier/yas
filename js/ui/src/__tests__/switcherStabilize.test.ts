@@ -63,6 +63,19 @@ describe("stabilizeSections", () => {
     expect(out[0].items[1]).toBe(prev[0].items[0]);
   });
 
+  it("keeps a section mounted when another section is inserted above it", () => {
+    const terminals = {
+      title: "Terminals",
+      items: [item("session:1")],
+    };
+    const out = stabilizeSections([terminals], [
+      { title: "Background", items: [item("tile:1")] },
+      { title: "Terminals", items: [item("session:1")] },
+    ]);
+    expect(out[1]).toBe(terminals);
+    expect(out[1].items[0]).toBe(terminals.items[0]);
+  });
+
   it("rebuilds on added, removed, and retitled sections", () => {
     const prev: KeyedSection<TestItem>[] = [
       { title: "Terminals", items: [item("a"), item("b")] },

@@ -238,16 +238,17 @@ export class YasNativeExtensionFacade {
         (candidate) => candidate.extensionHandle === identity.extensionHandle,
       );
       if (!record) return undefined;
+      // The request result can overtake the state watch, and the watch can
+      // coalesce later lifecycle changes. Treat the returned identity as a
+      // lower bound for this handle: wait while the catalogue is behind and
+      // accept the current record once it catches up or advances past it.
+      if (record.generation < identity.generation) return undefined;
       if (
-        record.generation !== identity.generation ||
-        record.definitionRevision > identity.definitionRevision
+        record.generation === identity.generation &&
+        record.definitionRevision < identity.definitionRevision
       )
-        throw new YasProtocolError(
-          "Extension identity advanced before delivery",
-        );
-      return record.definitionRevision === identity.definitionRevision
-        ? record
-        : undefined;
+        return undefined;
+      return record;
     };
     const immediate = match(this.client.catalog.snapshot.definitions);
     if (immediate) return Promise.resolve(immediate);

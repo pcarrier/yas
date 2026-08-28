@@ -622,6 +622,11 @@ pub enum CompositorEvent {
     SurfaceActivated {
         surface_id: u16,
     },
+    /// The client used its native title-bar maximize/restore control.
+    SurfaceMaximizeRequested {
+        surface_id: u16,
+        maximized: bool,
+    },
     /// The focused Wayland client committed `zwp_text_input_v3` state for
     /// one toplevel. `requested` is true only for a freshly committed
     /// `enable`; metadata-only commits must not reopen a keyboard the user
@@ -1190,6 +1195,8 @@ pub(crate) struct Surface {
     /// but the client is told, because a client that asks and hears otherwise
     /// backs its own fullscreen out again.
     xdg_fullscreen: bool,
+    /// Requested by the client and mirrored by the frontend as pane soloing.
+    xdg_maximized: bool,
     /// The size range the client says it can render, from
     /// `xdg_toplevel.set_min_size` / `set_max_size`, in window geometry
     /// coordinates.  Zero in a dimension means unset.  Double-buffered, so
@@ -4997,7 +5004,11 @@ impl Compositor {
             .unwrap_or((self.output_width, self.output_height));
         let (w, h) = constrain_to_hints(surf, w, h);
         if let Some(ref tl) = surf.xdg_toplevel {
-            tl.configure(w, h, pane_states(surf.xdg_fullscreen));
+            tl.configure(
+                w,
+                h,
+                pane_states(surf.xdg_maximized, surf.xdg_fullscreen),
+            );
         }
         if let Some(ref xs) = surf.xdg_surface {
             let serial = self.serial.wrapping_add(1);
@@ -5720,7 +5731,11 @@ impl Compositor {
                 {
                     let (cw, ch) = constrain_to_hints(surf, w, h);
                     if let Some(ref tl) = surf.xdg_toplevel {
-                        tl.configure(cw, ch, pane_states(surf.xdg_fullscreen));
+                        tl.configure(
+                            cw,
+                            ch,
+                            pane_states(surf.xdg_maximized, surf.xdg_fullscreen),
+                        );
                     }
                     if let Some(ref xs) = surf.xdg_surface {
                         let serial = self.serial.wrapping_add(1);
@@ -7073,14 +7088,14 @@ fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
     [r, g, b]
 }
 
-/// The states a pane's configure carries.  It is always activated and always
-/// maximized; `fullscreen` is added for a toplevel that asked to be, which
-/// costs nothing because a pane already fills its output.
-fn pane_states(fullscreen: bool) -> Vec<u8> {
-    let mut states = vec![
-        xdg_toplevel::State::Activated,
-        xdg_toplevel::State::Maximized,
-    ];
+/// The states a pane's configure carries. It is always activated; maximize
+/// follows the application's native title-bar control and fullscreen follows
+/// the corresponding xdg-shell request.
+fn pane_states(maximized: bool, fullscreen: bool) -> Vec<u8> {
+    let mut states = vec![xdg_toplevel::State::Activated];
+    if maximized {
+        states.push(xdg_toplevel::State::Maximized);
+    }
     if fullscreen {
         states.push(xdg_toplevel::State::Fullscreen);
     }
@@ -7201,6 +7216,7 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         xdg_popup: None,
                         xdg_geometry: None,
                         xdg_fullscreen: false,
+                        xdg_maximized: false,
                         pending_min_size: (0, 0),
                         pending_max_size: (0, 0),
                         min_size: (0, 0),
@@ -8069,13 +8085,12 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                     state.frame_callback_toplevels.insert(surface_id);
                 }
 
-                // Say up front which of the state requests are worth making,
-                // so a client can leave the rest out of its titlebar instead
-                // of drawing buttons that do nothing.  Fullscreen is the only
-                // one we honour; a pane cannot be minimized or unmaximized.
+                // Say up front which state requests are worth making, so the
+                // client's own title bar exposes controls YAS can honor.
                 // This has to precede the first xdg_surface.configure.
                 if toplevel.version() >= 5 {
                     toplevel.wm_capabilities(xdg_wm_capabilities(&[
+                        xdg_toplevel::WmCapabilities::Maximize,
                         xdg_toplevel::WmCapabilities::Fullscreen,
                     ]));
                 }
@@ -8089,7 +8104,7 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                     .get(&surface_id)
                     .copied()
                     .unwrap_or((state.output_width, state.output_height));
-                toplevel.configure(cw, ch, pane_states(false));
+                toplevel.configure(cw, ch, pane_states(false, false));
                 let serial = state.next_serial();
                 resource.configure(serial);
 
@@ -8346,6 +8361,7 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                     // The wl_surface outlives its toplevel and can be given a
                     // new one; that one starts out not fullscreen.
                     surf.xdg_fullscreen = false;
+                    surf.xdg_maximized = false;
                     if sid > 0 {
                         unmapped_sid = Some(sid);
                         state.screencast_surfaces.remove(&sid);
@@ -8383,12 +8399,20 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                 // say no out loud.
                 state.reassert_toplevel_configure(&data.wl_surface_id);
             }
-            Request::SetMaximized | Request::UnsetMaximized => {
-                // A pane is permanently maximized, so neither of these
-                // changes anything.  Declining is our call to make; declining
-                // silently is not -- xdg-shell says each of them "will respond
-                // by emitting a configure event", and clients hold their own
-                // state pending until one arrives.
+            req @ (Request::SetMaximized | Request::UnsetMaximized) => {
+                let maximized = matches!(req, Request::SetMaximized);
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.xdg_maximized = maximized;
+                    if surf.surface_id > 0 {
+                        let _ = state.event_tx.send(
+                            CompositorEvent::SurfaceMaximizeRequested {
+                                surface_id: surf.surface_id,
+                                maximized,
+                            },
+                        );
+                        (state.event_notify)();
+                    }
+                }
                 state.reassert_toplevel_configure(&data.wl_surface_id);
             }
             req @ (Request::SetFullscreen { .. } | Request::UnsetFullscreen) => {

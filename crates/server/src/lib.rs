@@ -2360,10 +2360,10 @@ struct SurfaceSubState {
     adaptive_scale_shift: u8,
     /// Last time adaptive delivery changed the encoded extent.
     scale_stepped_at: Option<Instant>,
-    /// Most recent time the ACK-derived delivery window could not carry one
-    /// frame at the requested display cadence. Recovery probes are measured
-    /// from this rather than from ordinary full bandwidth-delay pipelines.
-    delivery_pressure_at: Option<Instant>,
+    /// Most recent direct transport or decoder pressure. Resolution recovery
+    /// probes are measured from this; an ACK window merely being full is flow
+    /// control, not evidence that the path or decoder is overloaded.
+    adaptive_pressure_at: Option<Instant>,
     /// Bit per Vulkan Video encoder whose 4:2:0 profile the compositor has
     /// refused for this client and surface (see
     /// [`SurfaceEncoderPreference::vulkan_refusal_bit`]). Latched at one
@@ -2826,9 +2826,10 @@ const SURFACE_INFLIGHT_HARD_MAX: usize = 8_192;
 /// reliable and ordered, so a larger window directly delays audio and input
 /// once the link is saturated.
 const SURFACE_CREDIT_QUEUE_SECS: f32 = 0.1;
-/// Small frames retain a two-frame bootstrap so a fresh path does not begin in
-/// RTT-bound stop-and-wait. Frames larger than the measured path window stay
-/// at one: their serialization time already covers the feedback interval.
+/// Every fresh path gets a two-frame bootstrap so measured goodput can grow
+/// beyond stop-and-wait. Restricting a frame larger than the initial measured
+/// window to one in flight made that estimate self-fulfilling: one ACK per RTT
+/// could never demonstrate that the path had room for a pipeline.
 const SURFACE_CREDIT_BOOTSTRAP_FRAMES: usize = 2;
 /// Surface ACK callbacks arrive in batches. Aggregate long enough to smooth
 /// the JavaScript scheduling noise before changing the client-wide window.
@@ -3215,15 +3216,7 @@ fn surface_credit_limit_bytes(client: &ClientState, next_frame_bytes: usize) -> 
     let window_secs = path_rtt_ms(client).max(0.0) / 1_000.0 + SURFACE_CREDIT_QUEUE_SECS;
     let measured = (client.surface_goodput_bps.max(1.0) * window_secs).ceil() as usize;
     let next = next_frame_bytes.max(1_024);
-    // Two small frames avoid RTT-bound stop-and-wait when both fit inside the
-    // measured path window. An oversized frame already takes at least that
-    // whole window to serialize; admitting a second one only adds old video
-    // in front of input and audio without increasing useful throughput.
-    if next <= measured {
-        measured.max(next.saturating_mul(SURFACE_CREDIT_BOOTSTRAP_FRAMES))
-    } else {
-        next
-    }
+    measured.max(next.saturating_mul(SURFACE_CREDIT_BOOTSTRAP_FRAMES))
 }
 
 /// Admit one more surface frame against a client-wide byte window. An empty
@@ -3488,7 +3481,7 @@ const ADAPTIVE_SCALE_BACKOFF_INTERVAL: Duration = Duration::from_millis(750);
 /// Spare path capacity is unknowable from an app-limited stream. Probe one
 /// resolution step upward occasionally; pressure returns it to the prior
 /// extent if the link cannot carry it.
-const ADAPTIVE_SCALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
+const ADAPTIVE_SCALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 /// A full delivery window is congestion evidence only when a frame is much
 /// larger than its share at the requested cadence. Filling an ordinary BDP
 /// with small frames is healthy pipelining, not a reason to degrade them.
@@ -3677,15 +3670,10 @@ fn step_adaptive_bandwidth(
         .surface_subs
         .get(&surface_id)
         .is_some_and(|sub| sub.decoder_pressure_depth > SURFACE_DECODE_QUEUE_ALLOWANCE);
-    let estimated_bytes = estimated_surface_frame_bytes(client, surface_id, false);
     let budget_bytes = surface_budget_bytes(client, surface_id);
-    let delivery_window_full = !surface_frame_credit_open_for(client, surface_id, estimated_bytes)
-        && (budget_bytes <= 0.0
-            || estimated_bytes as f32 > budget_bytes * ADAPTIVE_DELIVERY_PRESSURE_RATIO);
     let congested = blocked_us.saturating_sub(client.write_blocked_us_seen)
         > WRITE_BLOCKED_CONGESTED_US
-        || decoder_backlogged
-        || delivery_window_full;
+        || decoder_backlogged;
     let previous_congestion = client
         .surface_subs
         .get(&surface_id)
@@ -3693,11 +3681,13 @@ fn step_adaptive_bandwidth(
     let recovering = previous_congestion.is_some();
     let recovery_hold = !congested
         && previous_congestion.is_some_and(|at| now.duration_since(at) < ADAPTIVE_CONGESTION_HOLD);
-    // Pressure evidence: the writer blocking on the socket, this surface's
-    // explicit WebCodecs queue growing, or its ACK-derived delivery window
-    // refusing the next estimated frame. Raw ACK age and callback timing are
-    // deliberately absent: both include ordinary JavaScript scheduling
-    // jitter and produced false quality backoff on otherwise healthy links.
+    // Pressure evidence: the writer blocking on the socket, or this surface's
+    // explicit WebCodecs queue growing. Raw ACK age, callback timing, and a
+    // full delivery window are deliberately absent: all include ordinary
+    // scheduling/flow-control delay and produced false quality backoff on
+    // otherwise healthy links. In particular, adapting to a window derived
+    // from measured goodput was circular: stop-and-wait lowered measured
+    // throughput, which shrank the window and then degraded the stream again.
     //
     // Deliberately *not* `browser_backlog_frames`, for the reason
     // `surface_pacing_fps` spells out: that counter is `pendingAppliedFrames`,
@@ -3730,8 +3720,8 @@ fn step_adaptive_bandwidth(
     let Some(sub) = client.surface_subs.get_mut(&surface_id) else {
         return held;
     };
-    if delivery_window_full {
-        sub.delivery_pressure_at = Some(now);
+    if congested {
+        sub.adaptive_pressure_at = Some(now);
     }
     let interval = if unchanged {
         STILL_REFRESH_INTERVAL
@@ -3794,7 +3784,7 @@ fn step_adaptive_bandwidth(
     let previous_shift = sub.adaptive_scale_shift;
     if can_scale
         && next == ADAPTIVE_MAX_QUANTIZER
-        && delivery_window_full
+        && congested
         && pressure_scale_ready
         && previous_shift < ADAPTIVE_MAX_SCALE_SHIFT
     {
@@ -3807,10 +3797,9 @@ fn step_adaptive_bandwidth(
         && previous_shift > 0
         && !congested
         && !recovery_hold
-        && !delivery_window_full
         && recovery_scale_ready
         && sub
-            .delivery_pressure_at
+            .adaptive_pressure_at
             .is_some_and(|at| now.duration_since(at) >= ADAPTIVE_SCALE_RECOVERY_INTERVAL)
     {
         sub.adaptive_scale_shift -= 1;
@@ -4584,7 +4573,7 @@ fn invalidate_client_surface(client: &mut ClientState, surface_id: u16, destroye
         state.congested_at = previous.congested_at;
         state.adaptive_scale_shift = previous.adaptive_scale_shift;
         state.scale_stepped_at = previous.scale_stepped_at;
-        state.delivery_pressure_at = previous.delivery_pressure_at;
+        state.adaptive_pressure_at = previous.adaptive_pressure_at;
     }
 
     let had_vulkan = client.vulkan_video_surfaces.remove(&surface_id).is_some();
@@ -6033,20 +6022,16 @@ impl Session {
         }
     }
 
-    #[cfg(test)]
     fn mediated_size_for_pty(&self, pty_id: u16) -> Option<(u16, u16)> {
-        let mut min_rows: Option<u16> = None;
-        let mut min_cols: Option<u16> = None;
+        let mut mediated = self.native_terminal_views.mediated_size(pty_id);
         for c in self.clients.values() {
             if let Some((r, cols)) = c.view_sizes.get(&pty_id).copied() {
-                min_rows = Some(min_rows.map_or(r, |m: u16| m.min(r)));
-                min_cols = Some(min_cols.map_or(cols, |m: u16| m.min(cols)));
+                mediated = Some(mediated.map_or((r, cols), |(min_rows, min_cols)| {
+                    (min_rows.min(r), min_cols.min(cols))
+                }));
             }
         }
-        match (min_rows, min_cols) {
-            (Some(r), Some(c)) => Some((r.max(1), c.max(1))),
-            _ => None,
-        }
+        mediated.map(|(rows, cols)| (rows.max(1), cols.max(1)))
     }
 
     fn resize_pty(&mut self, pty_id: u16, rows: u16, cols: u16) -> bool {
@@ -8573,6 +8558,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     cs.surface_activation_revision =
                         cs.surface_activation_revision.saturating_add(1).max(1);
                     cs.surface_activation = Some((surface_id, cs.surface_activation_revision));
+                }
+                CompositorEvent::SurfaceMaximizeRequested { .. } => {
+                    // Published to native Surface clients once the state
+                    // extension is wired through the catalogue. Keep the
+                    // compositor event exhaustive in the meantime.
                 }
                 CompositorEvent::SurfaceTextInput {
                     surface_id,
@@ -14639,7 +14629,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_surface_delivery_window_backs_quality_off() {
+    fn a_full_surface_delivery_window_does_not_fake_congestion() {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.display_fps = 120.0;
         client.rtt_ms = 50.0;
@@ -14649,7 +14639,10 @@ mod tests {
         let sub = client.surface_subs.entry(sid).or_default();
         sub.frame_bytes = 800_000.0;
         sub.max_inflight_frames = Some(3);
-        record_surface_frame_sent(&mut client, sid, 800_000, false, Instant::now());
+        for _ in 0..2 {
+            record_surface_frame_sent(&mut client, sid, 800_000, false, Instant::now());
+        }
+        assert!(!surface_frame_credit_open_for(&client, sid, 800_000));
 
         let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
         let step = step_adaptive_bandwidth(
@@ -14659,7 +14652,12 @@ mod tests {
             Instant::now(),
             false,
         );
-        assert!(step.quantizer.is_some_and(|quantizer| quantizer > ceiling));
+        assert!(step.quantizer.is_none());
+        assert_eq!(client.surface_subs[&sid].adaptive_quantizer, None);
+        assert_eq!(
+            resolve_bandwidth(&client, SurfaceBandwidth::Medium, sid).av1_quantizer(),
+            usize::from(ceiling),
+        );
     }
 
     #[test]
@@ -14676,7 +14674,9 @@ mod tests {
         sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
         sub.scaled_target = Some((3_400, 2_424));
         sub.allow_adaptive_scale = true;
-        record_surface_frame_sent(&mut client, sid, 40_000, false, Instant::now());
+        client
+            .write_blocked_us
+            .store(WRITE_BLOCKED_CONGESTED_US + 1, Ordering::Relaxed);
 
         let step = step_adaptive_bandwidth(
             &mut client,
@@ -14707,7 +14707,7 @@ mod tests {
         sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
         sub.adaptive_scale_shift = ADAPTIVE_MAX_SCALE_SHIFT;
         sub.scale_stepped_at = Some(started);
-        sub.delivery_pressure_at = Some(started);
+        sub.adaptive_pressure_at = Some(started);
         sub.scaled_target = Some((3_400, 2_424));
         sub.allow_adaptive_scale = true;
 
@@ -15764,7 +15764,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_credit_reserves_parallel_encodes_before_they_finish() {
+    fn surface_credit_reserves_two_parallel_encodes_before_they_finish() {
         let mut client = test_client();
         client.rtt_ms = 0.0;
         client.min_rtt_ms = 0.0;
@@ -15798,12 +15798,14 @@ mod tests {
     }
 
     #[test]
-    fn surface_credit_always_allows_one_oversized_keyframe() {
+    fn surface_credit_bootstraps_two_oversized_keyframes() {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.rtt_ms = 0.0;
         client.min_rtt_ms = 0.0;
         client.surface_goodput_bps = 100_000.0;
 
+        assert!(surface_credit_open_for(&client, 300_000));
+        record_surface_frame_sent(&mut client, 1, 300_000, true, Instant::now());
         assert!(surface_credit_open_for(&client, 300_000));
         record_surface_frame_sent(&mut client, 1, 300_000, true, Instant::now());
         assert!(!surface_credit_open_for(&client, 300_000));

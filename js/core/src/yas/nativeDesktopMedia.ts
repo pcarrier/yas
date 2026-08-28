@@ -506,13 +506,12 @@ export class YasNativeDesktopClientLifecycle {
   private mprisController(): NativeMprisController {
     return {
       subscribe: () => undefined,
-      act: async (playerId, revision, action) => {
+      act: async (playerId, action) => {
         if (!this.media) throw new Error("Media family unavailable");
         const mapped = nativeMprisAction(action);
         if (mapped === null) return;
         await this.media.playerAction({
           playerHandle: playerId,
-          revision,
           operationId: operationId(),
           action: mapped.action,
           value: mapped.value,
@@ -750,16 +749,23 @@ export class YasNativeDesktopClientLifecycle {
       | undefined;
     for (const wire of cameraCodecCandidates(options)) {
       const codec = nativeCameraCodec(wire);
-      const candidate = findDeviceFormat(
+      const advertised = findDeviceFormat(
         this.mediaSnapshot.devices,
         g.YAS_MEDIA_KIND_CAMERA,
         [codec],
-        (format) =>
-          format.width === width &&
-          format.height === height &&
-          format.frameRateMilli === fps * 1000,
+        () => true,
       );
-      if (!candidate) continue;
+      if (!advertised) continue;
+      // A camera catalogue format advertises a codec, not one fixed camera
+      // mode. The physical camera belongs to the viewer and is unknown to the
+      // server until ACQUIRE_DEVICE; the server deliberately accepts the
+      // dimensions and cadence offered there. Requiring them to equal the
+      // catalogue's representative 1920x1080@30 entry rejected ordinary Mac
+      // camera modes such as 1280x720 before negotiation even began.
+      const candidate = {
+        device: advertised.device,
+        format: cameraCaptureFormat(advertised.format, width, height, fps),
+      };
       const supported =
         wire === 0
           ? supportsMjpegCamera()
@@ -1196,7 +1202,7 @@ export class YasNativeDesktopClientLifecycle {
       positionUs: safeSignedNumber(record.positionUs),
       lengthUs: safeSignedNumber(record.durationUs),
       identity: record.identity,
-      desktopEntry: "",
+      desktopEntry: record.desktopEntry,
       title: record.title,
       album: record.album,
       artists: record.artist ? [record.artist] : [],
@@ -2186,6 +2192,21 @@ function nativeCameraCodec(codec: CameraWireCodec): number {
     g.YAS_MEDIA_CODEC_H264_444,
     g.YAS_MEDIA_CODEC_AV1_444,
   ][codec]!;
+}
+
+/** Materialize the viewer's actual camera mode from a catalogue codec entry. */
+export function cameraCaptureFormat(
+  advertised: YasMediaFormat,
+  width: number,
+  height: number,
+  fps: number,
+): YasMediaFormat {
+  return {
+    ...advertised,
+    width,
+    height,
+    frameRateMilli: fps * 1_000,
+  };
 }
 
 function evenDimension(value: number, maximum: number): number {

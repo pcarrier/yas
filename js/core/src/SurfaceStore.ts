@@ -117,6 +117,8 @@ export type SurfaceCursorImage =
       hotspotY: number;
       width: number;
       height: number;
+      /** Cursor buffer scale in Wayland 1/120 units. */
+      scale120?: number;
     };
 
 /** Timestamped record of an incoming surface video frame. */

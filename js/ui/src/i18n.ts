@@ -71,7 +71,17 @@ const en: Messages = {
   "remotes.storedWarning":
     "These URIs are stored on the home server. All connected clients can read them.",
   "app.loading": "Loading",
-  "help.windowManager": "Tiling → scrolling → floating",
+  "help.windowManager": "Choose window manager",
+  "windowManager.title": "Window manager",
+  "windowManager.subtitle": "Arrange the current panes",
+  "windowManager.current": "Current",
+  "windowManager.tiling": "Tiling",
+  "windowManager.tilingDescription": "Divide the workspace into fixed panes.",
+  "windowManager.scrolling": "Scrolling",
+  "windowManager.scrollingDescription":
+    "Place columns in a strip that follows focus.",
+  "windowManager.floating": "Floating",
+  "windowManager.floatingDescription": "Overlap movable, resizable windows.",
   "help.columnWidth": "Narrow / widen the column",
   "help.splitPane": "Split: beside / below",
   "help.docks": "Files, Search, Branches, Log, Problems",

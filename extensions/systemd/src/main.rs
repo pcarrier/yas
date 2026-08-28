@@ -123,6 +123,13 @@ const SNAPSHOT_CHUNK: usize = 64 * 1024;
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(5);
 /// A scope with no signal source only learns about changes by asking.
 const UNPOKED_INTERVAL: Duration = Duration::from_secs(1);
+/// Replenished credit per stdout and stderr stream.
+///
+/// The SDK default reserves 4 MiB for each stream. Two permanent scope
+/// helpers plus journal jobs must share the guest's receive budget, while all
+/// of them consume output incrementally, so a smaller window composes without
+/// limiting total output.
+const PROCESS_STREAM_WINDOW: u64 = 256 * 1024;
 
 const DESCRIPTOR: &str = r#"{
   "protocol":"yas.cli.v1",
@@ -387,7 +394,12 @@ yas_guest::entry!(extension);
 /// The SDK turns a failed entry into a bare exit code and drops the message,
 /// so anything worth knowing has to be said before returning: an extension
 /// that just stops is indistinguishable from one that was never installed.
-fn say(_client: &mut Client, _message: &str) {}
+fn say(client: &mut Client, message: &str) {
+    let mut line = String::with_capacity(message.len() + 1);
+    line.push_str(message);
+    line.push('\n');
+    let _ = client.attempt_stdout(line.as_bytes());
+}
 
 fn extension(mut client: Client) -> Result<(), String> {
     match run(&mut client) {
@@ -554,7 +566,7 @@ fn spawn_helper(
     initial_interval: Duration,
 ) -> Result<(), String> {
     let process = client
-        .spawn_process(
+        .spawn_process_with_window(
             0,
             process_wire::EnvironmentKind::Session,
             process_wire::Cwd::ServerDefault,
@@ -572,6 +584,7 @@ fn spawn_helper(
             ],
             Vec::new(),
             Extensions::default(),
+            PROCESS_STREAM_WINDOW,
         )
         .map_err(|error| format!("spawn {}: {error}", scope.name))?;
     scope.process = Some(process);
@@ -1653,13 +1666,14 @@ impl Watcher {
         let mut owned = vec![b"journalctl".to_vec()];
         owned.extend(argv.iter().map(|argument| argument.as_bytes().to_vec()));
         let process = client
-            .spawn_process(
+            .spawn_process_with_window(
                 0,
                 process_wire::EnvironmentKind::Session,
                 process_wire::Cwd::ServerDefault,
                 owned,
                 Vec::new(),
                 Extensions::default(),
+                PROCESS_STREAM_WINDOW,
             )
             .map_err(|error| format!("journal spawn: {error}"))?;
         self.jobs.push(Job {

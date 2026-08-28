@@ -13,6 +13,7 @@ import {
   desktopNotificationHasDetail,
   matchesDesktopNotification,
   mprisHasProgress,
+  mprisSurfaceMatchScore,
   mprisSeekTargetUs,
   popupViewportShift,
   portalDialogFocusTarget,
@@ -49,6 +50,31 @@ function notification(
 }
 
 describe("desktop notification presentation", () => {
+  it("matches an MPRIS desktop entry to its YAS application surface", () => {
+    const player = { desktopEntry: "spotify", identity: "Spotify" };
+    expect(
+      mprisSurfaceMatchScore(player, {
+        appId: "com.spotify.Client",
+        title: "Liked Songs - Spotify",
+        origin: null,
+      }),
+    ).toBe(80);
+    expect(
+      mprisSurfaceMatchScore(player, {
+        appId: "brave-browser",
+        title: "Spotify - Brave",
+        origin: null,
+      }),
+    ).toBe(0);
+    expect(
+      mprisSurfaceMatchScore(player, {
+        appId: "org.alacritty.Alacritty",
+        title: "shell",
+        origin: null,
+      }),
+    ).toBe(0);
+  });
+
   it("uses toasts in the foreground and native delivery only when allowed", () => {
     expect(desktopDelivery("visible", "granted")).toBe("toast");
     expect(desktopDelivery("hidden", "granted")).toBe("native");

@@ -73,7 +73,7 @@ direction = "client_to_server"
 sensitive = "required"
 compression = "allowed"
 datagram = "forbidden"
-layout = "player_handle:u64,revision:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix"
+layout = "player_handle:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix"
 [[request]]
 name = "CLOSE_STREAM"
 kind = 0x0007
@@ -528,7 +528,7 @@ name = "portal_record_metadata"
 layout = "PENDING uses kind-specific request metadata; GRANTED uses PortalGrantedMetadata; DENIED, CANCELLED, and WITHDRAWN are exactly zero bytes"
 [[type]]
 name = "player_record"
-layout = "player_handle:u64,revision:u64,state:u16,flags:u16,position_us:i64,duration_us:i64,identity:string_u16,title:string_u16,artist:string_u16,album:string_u16,Extensions"
+layout = "player_handle:u64,revision:u64,state:u16,flags:u16,position_us:i64,duration_us:i64,identity:string_u16,desktop_entry:string_u16,title:string_u16,artist:string_u16,album:string_u16,Extensions"
 [[type]]
 name = "state_entity_body"
 layout = "entity_kind:u16,reserved:u16=0; ADD/REPLACE complete device_record,lease_record,portal_record,or player_record; PATCH entity handle:u64,revision:u64,Extensions; REMOVE entity handle:u64,revision:u64"

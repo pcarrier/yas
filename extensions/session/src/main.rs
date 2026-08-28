@@ -157,16 +157,6 @@ const CATALOG_TTL: Duration = Duration::from_secs(60);
 /// would be a way to stall the supervisor from the browser.
 const MAX_ICON_REQUEST: usize = 48;
 
-/// Candidate directories probed in the first icon lookup round.
-///
-/// Native FS READ evaluates every STAT question in a request; `FirstStat`
-/// chooses the first successful answer only after that. Sending all theme
-/// directories at once therefore did thousands of syscalls for a screenful,
-/// even when every icon was in the first theme. Probe a small ranked prefix,
-/// then widen geometrically only for names that were not there.
-const ICON_LOOKUP_INITIAL_DIRS: usize = 8;
-const ICON_LOOKUP_MAX_DIRS_PER_ROUND: usize = 32;
-
 /// Resolved icon paths kept in the guest before the cache is dropped wholesale.
 ///
 /// Measured in bytes rather than entries because the entries are not
@@ -599,11 +589,10 @@ fn resolve_icons(
         }
     }
 
-    // Names are probed in ranked directory stages. FS READ evaluates every
-    // question it receives, even though FirstStat returns only the first hit
-    // from each group. Asking all 80-odd directories about every visible row
-    // therefore did thousands of redundant stats before showing one icon.
-    // Most names land in the first stage; only misses widen the search.
+    // One exhaustive native query per bounded name chunk. Staging the ranked
+    // directories saved cheap local stats but inserted a host round trip after
+    // every stage; one missing icon then held all the already-found artwork
+    // behind that serial tail. The launcher wants the complete small shelf now.
     if !lookups.is_empty() {
         refresh_icon_dirs(client, state);
         let dirs = state.icon_dirs.clone();
@@ -613,53 +602,41 @@ fn resolve_icons(
                 resolved.insert(name.clone(), None);
             }
         } else {
-            let mut pending: Vec<&String> = lookups.iter().collect();
-            let mut directory_at = 0;
-            let mut directory_count = ICON_LOOKUP_INITIAL_DIRS;
             let mut complete = true;
-            'directories: while !pending.is_empty() && directory_at < dirs.len() {
-                let directory_end = (directory_at + directory_count).min(dirs.len());
-                let stage = &dirs[directory_at..directory_end];
-                let per_message =
-                    (wire::fs::MAX_QUERY_RECORDS / (stage.len() * 2).max(1)).max(1);
-                for names in pending.chunks(per_message) {
-                    let candidates: Vec<Vec<String>> = names
-                        .iter()
-                        .map(|name| icon::candidates(stage, name))
-                        .collect();
-                    let groups: Vec<Vec<&str>> = candidates
-                        .iter()
-                        .map(|paths| paths.iter().map(String::as_str).collect())
-                        .collect();
-                    let borrowed: Vec<&[&str]> = groups.iter().map(Vec::as_slice).collect();
-                    // Which file, not what is in it: the panel reads the bytes
-                    // itself, so these are STAT questions and carry no artwork.
-                    let Some(records) = fs_read(
-                        client,
-                        ReadMode::FirstStat,
-                        icon::MAX_ICON_BYTES,
-                        &borrowed,
-                    ) else {
-                        complete = false;
-                        break 'directories;
-                    };
-                    for (name, (found, path, _)) in names.iter().zip(records) {
-                        if found && icon::is_drawable_path(&path) {
-                            state.cache_icon((*name).clone(), Some(path.clone()));
-                            resolved.insert((*name).clone(), Some(path));
-                        }
+            let per_message = (wire::fs::MAX_QUERY_RECORDS / (dirs.len() * 2).max(1)).max(1);
+            for names in lookups.chunks(per_message) {
+                let candidates: Vec<Vec<String>> = names
+                    .iter()
+                    .map(|name| icon::candidates(&dirs, name))
+                    .collect();
+                let groups: Vec<Vec<&str>> = candidates
+                    .iter()
+                    .map(|paths| paths.iter().map(String::as_str).collect())
+                    .collect();
+                let borrowed: Vec<&[&str]> = groups.iter().map(Vec::as_slice).collect();
+                // Which file, not what is in it: the panel reads the bytes
+                // itself, so these are STAT questions and carry no artwork.
+                let Some(records) =
+                    fs_read(client, ReadMode::FirstStat, icon::MAX_ICON_BYTES, &borrowed)
+                else {
+                    complete = false;
+                    break;
+                };
+                for (name, (found, path, _)) in names.iter().zip(records) {
+                    if found && icon::is_drawable_path(&path) {
+                        state.cache_icon(name.clone(), Some(path.clone()));
+                        resolved.insert(name.clone(), Some(path));
                     }
                 }
-                pending.retain(|name| !resolved.contains_key(*name));
-                directory_at = directory_end;
-                directory_count = (directory_count * 2).min(ICON_LOOKUP_MAX_DIRS_PER_ROUND);
             }
             // Only an exhaustive search proves that a name has no artwork. A
             // transport failure leaves it unanswered so the panel retries it.
             if complete {
-                for name in pending {
-                    state.cache_icon(name.clone(), None);
-                    resolved.insert(name.clone(), None);
+                for name in &lookups {
+                    if !resolved.contains_key(name) {
+                        state.cache_icon(name.clone(), None);
+                        resolved.insert(name.clone(), None);
+                    }
                 }
             }
         }

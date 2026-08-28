@@ -1494,7 +1494,6 @@ impl Decode for PortalClose {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerAction {
     pub player_handle: u64,
-    pub revision: u64,
     pub operation_id: [u8; 16],
     pub action: u16,
     pub value: i64,
@@ -1504,12 +1503,10 @@ pub struct PlayerAction {
 impl Encode for PlayerAction {
     fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
         handle(self.player_handle, "zero Media player handle")?;
-        revision(self.revision)?;
         if self.action > crate::schema::media::PLAYER_ACTION_RAISE as u16 {
             return Err(Error::Invalid("Media player action"));
         }
         put_u64(out, self.player_handle);
-        put_u64(out, self.revision);
         out.extend_from_slice(&self.operation_id);
         put_u16(out, self.action);
         put_u16(out, 0);
@@ -1522,7 +1519,6 @@ impl Decode for PlayerAction {
     fn decode(input: &[u8]) -> Result<Self> {
         let mut decoder = Decoder::new(input);
         let player_handle = decoder.u64()?;
-        let revision = decoder.u64()?;
         let operation_id = decoder.array_16()?;
         let action = decoder.u16()?;
         if decoder.u16()? != 0 {
@@ -1530,7 +1526,6 @@ impl Decode for PlayerAction {
         }
         let value = Self {
             player_handle,
-            revision,
             operation_id,
             action,
             value: decoder.i64()?,
@@ -2009,6 +2004,7 @@ pub struct PlayerRecord {
     pub position_us: i64,
     pub duration_us: i64,
     pub identity: String,
+    pub desktop_entry: String,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -2067,6 +2063,7 @@ impl Encode for PlayerRecord {
         put_i64(out, self.position_us);
         put_i64(out, self.duration_us);
         put_string_u16(out, &self.identity)?;
+        put_string_u16(out, &self.desktop_entry)?;
         put_string_u16(out, &self.title)?;
         put_string_u16(out, &self.artist)?;
         put_string_u16(out, &self.album)?;
@@ -2085,6 +2082,7 @@ impl Decode for PlayerRecord {
             position_us: decoder.i64()?,
             duration_us: decoder.i64()?,
             identity: decoder.string_u16()?,
+            desktop_entry: decoder.string_u16()?,
             title: decoder.string_u16()?,
             artist: decoder.string_u16()?,
             album: decoder.string_u16()?,
@@ -2496,6 +2494,7 @@ mod tests {
             position_us: 3,
             duration_us: 4,
             identity: "player".into(),
+            desktop_entry: "player".into(),
             title: "title".into(),
             artist: "artist".into(),
             album: "album".into(),

@@ -227,6 +227,11 @@ mod stub {
         SurfaceActivated {
             surface_id: u16,
         },
+        /// The client used its native title-bar maximize/restore control.
+        SurfaceMaximizeRequested {
+            surface_id: u16,
+            maximized: bool,
+        },
         SurfaceTextInput {
             surface_id: u16,
             enabled: bool,

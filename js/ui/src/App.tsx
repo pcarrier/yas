@@ -275,7 +275,7 @@ type HmrData = HmrLeaseState & {
 // Bump when preserved transport instances are incompatible with hot code.
 // Existing class instances keep their old prototype and receive callbacks,
 // so reusing one would silently leave transport fixes inactive until reload.
-const HMR_DATA_VERSION = 6;
+const HMR_DATA_VERSION = 7;
 
 function getHmrData(): HmrData | null {
   return (import.meta.hot?.data?.connectedApp as HmrData) ?? null;

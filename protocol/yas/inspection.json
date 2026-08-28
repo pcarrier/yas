@@ -3340,7 +3340,7 @@
       "header_bytes": 9,
       "key": "35/1/6",
       "kind": 6,
-      "layout": "player_handle:u64,revision:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix",
+      "layout": "player_handle:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix",
       "name": "PLAYER_ACTION",
       "sensitive": "required"
     },
@@ -3357,7 +3357,7 @@
       "header_bytes": 9,
       "key": "35/2/6",
       "kind": 6,
-      "layout": "player_handle:u64,revision:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix",
+      "layout": "player_handle:u64,operation_id:[u8;16],action:u16,reserved:u16=0,value:i64,Extensions; ResultPrefix",
       "name": "PLAYER_ACTION",
       "sensitive": "required"
     },

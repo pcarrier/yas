@@ -269,7 +269,7 @@ export type MprisAction =
 
 export interface NativeMprisController {
   subscribe(enabled: boolean): void;
-  act(playerId: bigint, revision: bigint, action: MprisAction): Promise<void>;
+  act(playerId: bigint, action: MprisAction): Promise<void>;
 }
 
 /** Browser presentation state for the native YAS MPRIS catalogue. */
@@ -330,7 +330,7 @@ export class MprisStore implements ReactiveStore {
     const player = this.#players.get(playerId);
     if (!player || typeof player.revision !== "bigint")
       return Promise.reject(new Error("MPRIS player no longer exists"));
-    return this.#native.act(playerId, player.revision, action);
+    return this.#native.act(playerId, action);
   }
 
   positionUs(playerId: MediaId, nowMs = monotonicNow()): number {

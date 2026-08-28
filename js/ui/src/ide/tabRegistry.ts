@@ -84,15 +84,18 @@ export function registerTab(workspace: YasWorkspace, assignment: string): void {
     .catch(() => {});
 }
 
-/** Fire-and-forget deletion (the tab left every pane, the active view, and
- *  the background dock). */
+/** Delete a tab registry entry. The caller keeps the tab hidden until this
+ * mutation and the registry watch agree, preventing a close from briefly
+ * looking like a background/minimize action. */
 export function unregisterTab(
   workspace: YasWorkspace,
   assignment: string,
-): void {
+): Promise<void> {
   const s = stripConn(assignment);
-  if (!s) return;
-  workspace.kvDelete(s.connectionId, tabKey(tabId(s.bare))).catch(() => {});
+  if (!s) return Promise.resolve();
+  return workspace
+    .kvDelete(s.connectionId, tabKey(tabId(s.bare)))
+    .then(() => undefined);
 }
 
 /** Resolve a short id back to a full assignment for `connectionId`.

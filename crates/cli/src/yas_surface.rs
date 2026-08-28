@@ -615,22 +615,10 @@ fn surface_handle(value: u64) -> Result<u64, String> {
 }
 
 fn physical_dimensions(record: &surface::SurfaceRecord) -> Result<(u32, u32), String> {
-    let dimension = |value: i64, scale: u16| -> Result<u32, String> {
-        let value = u64::try_from(value)
-            .map_err(|_| "Surface state contains a negative dimension".to_string())?;
-        let logical = value.saturating_add((1u64 << 32) - 1) >> 32;
-        let physical = logical
-            .checked_mul(u64::from(scale))
-            .ok_or_else(|| "Surface physical dimension overflow".to_string())?;
-        u32::try_from(physical)
-            .ok()
-            .filter(|value| *value != 0)
-            .ok_or_else(|| "Surface physical dimension is out of range".to_string())
-    };
-    Ok((
-        dimension(record.logical_width_32_32, record.buffer_scale)?,
-        dimension(record.logical_height_32_32, record.buffer_scale)?,
-    ))
+    if record.composite_width == 0 || record.composite_height == 0 {
+        return Err("Surface physical dimensions are zero".to_string());
+    }
+    Ok((record.composite_width, record.composite_height))
 }
 
 fn capture_format(

@@ -7,9 +7,9 @@
  * below the root is the same recursion either way, which is why a strip
  * column can be a stack and a floating window can hold a tiling tree.
  *
- * Ctrl+B m hands the same windows to the next manager (`cycleWindowManager`),
- * and the keys that only mean something with a tree on screen are registered
- * from here so they are unbound when there is not one.
+ * Ctrl+B m offers the managers for the same windows from Workspace, and the
+ * keys that only mean something with a tree on screen are registered from
+ * here so they are unbound when there is not one.
  */
 import {
   createSignal,
@@ -42,12 +42,12 @@ import type {
   LayoutSplit,
   LayoutLeaf,
   LayoutRect,
+  WindowManager,
 } from "@yas-run/core/layout";
 import {
   cascadeRect,
   clampRect,
   leafCount,
-  nextWindowManager,
   serializeDSL,
   toWindowManager,
   windowManagerOf,
@@ -105,8 +105,14 @@ import {
   floatingLayerStackingStyle,
   floatingPaneIds,
   floatingWindowTitle,
+  appendFloatingWindow,
+  resizeFloatingRect,
+  snapFloatingRect,
+  type FloatingDragMode,
+  type FloatingResizeEdge,
 } from "./floatingWindow";
 import { removePaneFromLayout } from "./paneRemoval";
+import { SurfaceIcon } from "../SurfaceIcon";
 
 // The tree context lives in ./treeContext so its identity survives hot
 // reloads of this module (see that file).
@@ -223,6 +229,10 @@ export function LayoutContainer(props: {
   /** Called with control functions so the parent can direct pane focus/assignments. */
   onFocusBySession?: (fn: (sessionId: SessionId) => void) => void;
   onFocusPane?: (fn: (paneId: string) => void) => void;
+  onChooseWindowManager?: (
+    fn: (manager: WindowManager) => void,
+  ) => void;
+  onAddFloatingWindow?: (fn: (assignment: string) => void) => void;
   onMoveSessionToPane?: (
     fn: (sessionId: SessionId, targetPaneId: string) => void,
   ) => void;
@@ -856,6 +866,31 @@ export function LayoutContainer(props: {
     props.onSplitPane?.(splitPane);
   });
 
+  /** A parked item entering floating mode is a new window, never a replace. */
+  function addFloatingWindow(value: string) {
+    const shown = paneIds().find(
+      (paneId) => layoutState().assignments[paneId] === value,
+    );
+    if (shown) {
+      setFocusedPaneId(shown);
+      return;
+    }
+    const appended = appendFloatingWindow(root());
+    if (!appended) return;
+    forgetPendingRef(appended.paneId);
+    batch(() => {
+      setLayoutState((previous) => ({
+        ...previous,
+        assignments: {
+          ...previous.assignments,
+          [appended.paneId]: value,
+        },
+      }));
+      updateRoot(appended.root);
+      setFocusedPaneId(appended.paneId);
+    });
+  }
+
   function clearPaneAssignment(paneId: string) {
     // The stable-ref capture effect observes both signals. Publish their
     // removal atomically or it can see the old occupant after the ref is
@@ -912,7 +947,11 @@ export function LayoutContainer(props: {
     // A layout-mounted container should have at least two leaves, but keep the
     // operation well-defined during a concurrent external layout collapse.
     if (currentPanes.length <= 1) {
-      if (!closeContent) clearPaneAssignment(paneId);
+      // The resource close was already sent above. Remove the last frame now
+      // instead of leaving a dead shell up until the asynchronous catalogue
+      // destroy comes back. Backgrounding likewise leaves no empty floating
+      // window behind.
+      props.onCollapseToSingle?.(null);
       return;
     }
 
@@ -933,7 +972,7 @@ export function LayoutContainer(props: {
       if (ref && target) nextPending[target.id] = ref;
     }
 
-    if (nextPanes.length === 1) {
+    if (nextPanes.length === 1 && windowManagerOf(nextRoot) === "tiling") {
       props.onCollapseToSingle?.(
         nextAssignments.assignments[nextPanes[0].id] ?? null,
       );
@@ -980,6 +1019,14 @@ export function LayoutContainer(props: {
     props.onFocusPane?.(focusPane);
   });
 
+  createEffect(() => {
+    props.onChooseWindowManager?.(chooseWindowManager);
+  });
+
+  createEffect(() => {
+    props.onAddFloatingWindow?.(addFloatingWindow);
+  });
+
   // Remember last active tab per tabs container so switching away doesn't reset.
   const tabMemory: Record<string, number> = {};
 
@@ -1020,7 +1067,6 @@ export function LayoutContainer(props: {
       // tmux's axes: -h puts the new pane beside this one, -v below it.
       ["h", () => split("horizontal"), t("help.splitBeside")],
       ["v", () => split("vertical"), t("help.splitBelow")],
-      ["m", cycleWindowManager, t("help.windowManager")],
       ["-", () => resizeColumn(1 / 1.25), t("help.narrowColumn")],
       ["=", () => resizeColumn(1.25), t("help.widenColumn")],
       ["q", () => fpId && backgroundPane(fpId), t("help.removeFromPane")],
@@ -1128,12 +1174,10 @@ export function LayoutContainer(props: {
    * explicitly — `updateRoot` marks the layout as ours, which is exactly what
    * stops the external-layout effect from doing that carry for us.
    */
-  function cycleWindowManager() {
+  function chooseWindowManager(manager: WindowManager) {
     const current = root();
-    const next = toWindowManager(
-      current,
-      nextWindowManager(windowManagerOf(current)),
-    );
+    if (windowManagerOf(current) === manager) return;
+    const next = toWindowManager(current, manager);
     const currentPanes = enumeratePanes(current);
     const nextPanes = enumeratePanes(next);
     const focusedIndex = Math.max(
@@ -1313,6 +1357,7 @@ export function LayoutContainer(props: {
     onColumnWidth: handleColumnWidth,
     floatingDepth,
     onRaisePane: raisePane,
+    onAddFloatingWindow: addFloatingWindow,
   };
   return (
     <LayoutTreeContext.Provider value={ctxValue}>
@@ -1695,7 +1740,8 @@ function LeafPane(props: {
         width: "100%",
         height: "100%",
         position: "relative",
-        border: ctx.multiPane
+        border:
+          ctx.multiPane && ctx.windowManager !== "floating"
           ? `1px solid ${
               paneAttention()
                 ? theme().errorText
@@ -1725,6 +1771,7 @@ function LeafPane(props: {
         setTileDragOver(false);
         if (assignment && ctx.onDropTile) {
           e.preventDefault();
+          e.stopPropagation();
           ctx.onDropTile(
             assignment,
             props.paneId,
@@ -2174,7 +2221,7 @@ function FloatingLayer(props: {
     event: PointerEvent,
     index: number,
     start: LayoutRect,
-    mode: "move" | "resize",
+    mode: FloatingDragMode,
   ) => {
     if (event.button !== 0) return;
     const target = event.currentTarget as HTMLElement;
@@ -2191,12 +2238,16 @@ function FloatingLayer(props: {
       const next =
         mode === "move"
           ? { ...start, x: start.x + dx, y: start.y + dy }
-          : {
-              ...start,
-              width: start.width + dx,
-              height: start.height + dy,
-            };
-      setDragging({ index, rect: clampRect(next) });
+          : resizeFloatingRect(start, dx, dy, mode);
+      // Use a fixed physical capture radius so snapping feels the same on a
+      // narrow phone and a desktop viewport. The stored geometry remains in
+      // percentages.
+      const snapX = percentOf(12, box.width);
+      const snapY = percentOf(12, box.height);
+      setDragging({
+        index,
+        rect: snapFloatingRect(next, mode, snapX, snapY),
+      });
     };
     const done = () => {
       target.removeEventListener("pointermove", move);
@@ -2220,6 +2271,22 @@ function FloatingLayer(props: {
         height: "100%",
         overflow: "hidden",
         ...floatingLayerStackingStyle,
+      }}
+      onDragOver={(event) => {
+        if (!isTileDrag(event)) return;
+        event.preventDefault();
+        event.dataTransfer!.dropEffect = "copy";
+      }}
+      onDrop={(event) => {
+        // Moving an existing floating pane keeps the ordinary pane-drop
+        // semantics. A sidebar card has no pane source and becomes a new
+        // top-level window even when it lands in the empty space between two.
+        if (paneDragSource(event)) return;
+        const value = tileDragAssignment(event);
+        if (!value) return;
+        event.preventDefault();
+        event.stopPropagation();
+        ctx.onAddFloatingWindow(value);
       }}
     >
       <Index each={props.split.children}>
@@ -2252,7 +2319,11 @@ function FloatingLayer(props: {
             const value = assignment();
             return value
               ? floatingWindowTitle(value, sessions(), surfaceFor(value))
-              : "";
+                : "";
+          };
+          const surface = () => {
+            const value = assignment();
+            return value ? surfaceFor(value) : null;
           };
           const frameButton = (): JSX.CSSProperties => ({
             ...ui.btn,
@@ -2263,7 +2334,7 @@ function FloatingLayer(props: {
             height: "100%",
             padding: 0,
             color: theme().fg,
-            "background-color": theme().solidPanelBg,
+            "background-color": theme().bg,
             border: "none",
             "border-left": `1px solid ${theme().border}`,
             "border-radius": "0",
@@ -2271,6 +2342,52 @@ function FloatingLayer(props: {
             "font-size": `${scale().md}px`,
             "touch-action": "manipulation",
           });
+          const resizeHandles: readonly {
+            edge: FloatingResizeEdge;
+            cursor: string;
+            style: JSX.CSSProperties;
+          }[] = [
+            {
+              edge: "n",
+              cursor: "ns-resize",
+              style: { top: 0, left: "10px", right: "10px", height: "6px" },
+            },
+            {
+              edge: "e",
+              cursor: "ew-resize",
+              style: { top: "10px", right: 0, bottom: "10px", width: "6px" },
+            },
+            {
+              edge: "s",
+              cursor: "ns-resize",
+              style: { right: "10px", bottom: 0, left: "10px", height: "6px" },
+            },
+            {
+              edge: "w",
+              cursor: "ew-resize",
+              style: { top: "10px", bottom: "10px", left: 0, width: "6px" },
+            },
+            {
+              edge: "nw",
+              cursor: "nwse-resize",
+              style: { top: 0, left: 0, width: "10px", height: "10px" },
+            },
+            {
+              edge: "ne",
+              cursor: "nesw-resize",
+              style: { top: 0, right: 0, width: "10px", height: "10px" },
+            },
+            {
+              edge: "se",
+              cursor: "nwse-resize",
+              style: { right: 0, bottom: 0, width: "10px", height: "10px" },
+            },
+            {
+              edge: "sw",
+              cursor: "nesw-resize",
+              style: { bottom: 0, left: 0, width: "10px", height: "10px" },
+            },
+          ];
           return (
             <Show when={occupied()}>
               <div
@@ -2293,7 +2410,10 @@ function FloatingLayer(props: {
                     (focused() ? 1_000 : 0) +
                     ctx.floatingDepth(props.paneIdAt(index)),
                 }}
-                onPointerDown={() => ctx.onRaisePane(props.paneIdAt(index))}
+                onPointerDown={() => {
+                  ctx.onRaisePane(props.paneIdAt(index));
+                  ctx.onFocusPane(paneId());
+                }}
               >
                 <div
                   role="presentation"
@@ -2306,15 +2426,32 @@ function FloatingLayer(props: {
                     display: "flex",
                     "align-items": "center",
                     cursor: soloed() ? "default" : "move",
-                    "background-color": focused()
-                      ? theme().selectedBg
-                      : theme().solidPanelBg,
+                    "background-color": theme().bg,
                     color: theme().fg,
                     "border-bottom": `1px solid ${theme().border}`,
                     "touch-action": "none",
                     "font-size": `${scale().sm}px`,
                   }}
                 >
+                  <Show when={surface()}>
+                    {(value) => (
+                      <span
+                        style={{
+                          display: "flex",
+                          "align-items": "center",
+                          padding: `0 0 0 ${scale().controlY}px`,
+                          "flex-shrink": 0,
+                        }}
+                      >
+                        <SurfaceIcon
+                          surface={value()}
+                          theme={theme()}
+                          scale={scale()}
+                          size={Math.round(scale().md * 1.45)}
+                        />
+                      </span>
+                    )}
+                  </Show>
                   <div
                     title={title()}
                     style={{
@@ -2379,21 +2516,24 @@ function FloatingLayer(props: {
                   />
                 </div>
                 <Show when={!soloed()}>
-                  <div
-                    role="presentation"
-                    onPointerDown={(event) =>
-                      drag(event, index, rect(), "resize")
-                    }
-                    style={{
-                      position: "absolute",
-                      right: 0,
-                      bottom: 0,
-                      width: `${scale().controlX * 2}px`,
-                      height: `${scale().controlX * 2}px`,
-                      cursor: "nwse-resize",
-                      "touch-action": "none",
-                    }}
-                  />
+                  <For each={resizeHandles}>
+                    {(handle) => (
+                      <div
+                        role="presentation"
+                        aria-label={`Resize ${handle.edge}`}
+                        onPointerDown={(event) =>
+                          drag(event, index, rect(), handle.edge)
+                        }
+                        style={{
+                          position: "absolute",
+                          cursor: handle.cursor,
+                          "touch-action": "none",
+                          "z-index": 2,
+                          ...handle.style,
+                        }}
+                      />
+                    )}
+                  </For>
                 </Show>
               </div>
             </Show>

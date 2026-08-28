@@ -155,6 +155,27 @@ describe("carryAssignmentsToPanes", () => {
       "2": web,
     });
   });
+
+  it("collapses duplicate restored windows to one owner", () => {
+    const currentPanes = enumeratePanes(parseDSL("float(_, _, _)").root);
+    const nextPanes = enumeratePanes(parseDSL("float(_, _, _)").root);
+    const surface = surfaceAssignment("local", 7n);
+
+    const result = carryAssignmentsToPanes({
+      currentPanes,
+      nextPanes,
+      previous: {
+        assignments: { "0": surface, "1": surface, "2": "session-1" },
+      },
+      liveSessionIds: ["session-1"],
+    });
+
+    expect(result.assignments).toEqual({
+      "0": surface,
+      "1": "session-1",
+      "2": null,
+    });
+  });
 });
 
 describe("buildCandidateOrder", () => {
@@ -252,6 +273,27 @@ describe("assignmentsAfterDrop", () => {
     expect(next).toEqual({ "0": "s2", "1": "surface:c1:7" });
   });
 
+  it("recovers terminal and panel sources when drag metadata is missing", () => {
+    expect(
+      assignmentsAfterDrop(
+        { "0": "s1", "1": "s2" },
+        "s1",
+        "1",
+        undefined,
+        PANES,
+      ),
+    ).toEqual({ "0": "s2", "1": "s1" });
+    expect(
+      assignmentsAfterDrop(
+        { "0": "manage:local:", "1": "s2" },
+        "manage:local:",
+        "1",
+        undefined,
+        PANES,
+      ),
+    ).toEqual({ "0": "s2", "1": "manage:local:" });
+  });
+
   it("recovers a surface source when the marked pane is stale", () => {
     const next = assignmentsAfterDrop(
       { "0": "surface:c1:7", "1": "s2", "2": "s3" },
@@ -298,6 +340,19 @@ describe("assignmentsAfterDrop", () => {
 });
 
 describe("reconcileAssignments", () => {
+  it("clears duplicate restored assignments after their first owner", () => {
+    const panes = enumeratePanes(parseDSL("float(_, _, _)").root);
+    const surf = surfaceAssignment("conn", 42n);
+    const result = reconcileAssignments({
+      panes,
+      previous: { assignments: { "0": surf, "1": surf, "2": "s1" } },
+      liveSessionIds: ["s1"],
+      knownSessionIds: ["s1"],
+      liveSurfaceKeys: ["conn:42"],
+    });
+    expect(result.assignments).toEqual({ "0": surf, "1": null, "2": "s1" });
+  });
+
   it("keeps live sessions", () => {
     const { root } = parseDSL("line(_, _)");
     const panes = enumeratePanes(root);

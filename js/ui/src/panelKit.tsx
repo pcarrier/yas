@@ -129,11 +129,13 @@ export function AppIcon(props: {
   scale: UIScale;
   name: string;
   src?: string | null;
+  /** Override the catalogue-row size for compact chrome such as title bars. */
+  size?: number;
 }): JSX.Element {
   // A data URL the browser cannot decode is indistinguishable from no icon at
   // all as far as the row is concerned, so it becomes one.
   const [broken, setBroken] = createSignal(false);
-  const size = () => Math.round(props.scale.md * 1.9);
+  const size = () => props.size ?? Math.round(props.scale.md * 1.9);
   const monogram = () =>
     (props.name.match(/\p{L}|\p{N}/u)?.[0] ?? "?").toUpperCase();
 

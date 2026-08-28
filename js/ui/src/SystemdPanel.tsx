@@ -27,6 +27,7 @@ import type {
 import {
   filterUnits,
   openSystemdUnits,
+  systemdUnitsReady,
   unitStates,
   SYSTEMD_UNIT_TYPES,
   type SystemdUnitsHandle,
@@ -124,6 +125,12 @@ export function SystemdPanel(props: {
     revision();
     const current = handle();
     return current ? unitStates(current.scopes) : [];
+  });
+
+  const ready = createMemo(() => {
+    revision();
+    const current = handle();
+    return current ? systemdUnitsReady(current.scopes) : false;
   });
 
   // The unit count is right below, and the source only matters when it is the
@@ -293,7 +300,7 @@ export function SystemdPanel(props: {
                     padding: `${scale().sm}px 0`,
                   }}
                 >
-                  {handle() ? t("systemd.noMatches") : t("systemd.loading")}
+                  {ready() ? t("systemd.noMatches") : t("systemd.loading")}
                 </div>
               }
             >

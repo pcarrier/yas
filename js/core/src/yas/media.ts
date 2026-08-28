@@ -115,6 +115,7 @@ export interface YasMediaPlayerRecord {
   positionUs: bigint;
   durationUs: bigint;
   identity: string;
+  desktopEntry: string;
   title: string;
   artist: string;
   album: string;
@@ -178,7 +179,6 @@ export interface YasMediaPortalClose {
 
 export interface YasMediaPlayerAction {
   playerHandle: bigint;
-  revision: bigint;
   operationId: Uint8Array;
   action: number;
   value: bigint;
@@ -1020,13 +1020,11 @@ export function encodeMediaPlayerAction(
   value: YasMediaPlayerAction,
 ): Uint8Array {
   requireHandle(value.playerHandle, "Media player");
-  requireRevision(value.revision, "Media player revision");
   requireOperationId(value.operationId, "Media PLAYER_ACTION");
   if (value.action > g.YAS_MEDIA_PLAYER_ACTION_RAISE)
     throw new YasProtocolError("invalid Media player action");
   return new YasWriter()
     .u64(value.playerHandle)
-    .u64(value.revision)
     .bytes(value.operationId)
     .u16(value.action)
     .u16(0)
@@ -1040,14 +1038,12 @@ export function decodeMediaPlayerAction(
 ): YasMediaPlayerAction {
   const cursor = new YasCursor(bytes);
   const playerHandle = cursor.u64("Media player");
-  const revision = cursor.u64("Media player revision");
   const operationId = new Uint8Array(cursor.take(16, "Media operation ID"));
   const action = cursor.u16("Media player action");
   if (cursor.u16("Media PLAYER_ACTION reserved") !== 0)
     throw new YasProtocolError("Media PLAYER_ACTION reserved field is nonzero");
   const value = {
     playerHandle,
-    revision,
     operationId,
     action,
     value: cursor.i64("Media player action value"),
@@ -1531,6 +1527,7 @@ export function encodeMediaPlayerRecord(
     .i64(value.positionUs)
     .i64(value.durationUs)
     .utf8U16(value.identity)
+    .utf8U16(value.desktopEntry)
     .utf8U16(value.title)
     .utf8U16(value.artist)
     .utf8U16(value.album)
@@ -1551,6 +1548,7 @@ export function decodeMediaPlayerRecord(
     positionUs: cursor.i64("Media player position"),
     durationUs: cursor.i64("Media player duration"),
     identity: cursor.utf8U16("Media player identity"),
+    desktopEntry: cursor.utf8U16("Media player desktop entry"),
     title: cursor.utf8U16("Media player title"),
     artist: cursor.utf8U16("Media player artist"),
     album: cursor.utf8U16("Media player album"),

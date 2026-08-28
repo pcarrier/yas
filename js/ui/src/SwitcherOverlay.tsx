@@ -43,7 +43,6 @@ import {
 } from "./theme";
 import { LayoutPreview } from "./layout/LayoutPreview";
 import {
-  enumeratePanes,
   isSurfaceAssignment,
   layoutFromDSL,
   type LayoutAssignments,
@@ -127,17 +126,6 @@ type ActionItem = {
     | "open-web"
     | "open-search";
   connectionId?: string;
-};
-
-type PaneItem = {
-  type: "pane";
-  key: string;
-  title: string;
-  subtitle: string;
-  paneId: string;
-  paneIndex: number;
-  sessionId: SessionId | null;
-  empty: boolean;
 };
 
 type SurfaceItem = {
@@ -226,7 +214,6 @@ type AppItem = {
 type SwitcherItem =
   | LayoutItem
   | SessionItem
-  | PaneItem
   | ActionItem
   | SurfaceItem
   | RemoteItem
@@ -251,38 +238,6 @@ function parseLayoutQuery(query: string): { name: string | null; dsl: string } {
   const match = query.match(/^\s*([^:(]+?)\s*:\s*((line|col|tabs)\s*\(.*)/i);
   if (match) return { name: match[1].trim(), dsl: match[2].trim() };
   return { name: null, dsl: query.trim() };
-}
-
-function PaneGlyph(props: { empty: boolean; fg: string; dimFg: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      width="24"
-      height="24"
-      fill="none"
-      aria-hidden="true"
-    >
-      <rect x="4.5" y="4.5" width="15" height="15" stroke={props.dimFg} />
-      <path d="M4.5 10.5h15" stroke={props.dimFg} />
-      <path d="M10.5 4.5v15" stroke={props.dimFg} />
-      <Show
-        when={props.empty}
-        fallback={
-          <rect
-            x="6.5"
-            y="6.5"
-            width="7"
-            height="7"
-            fill={props.fg}
-            opacity="0.75"
-          />
-        }
-      >
-        <path d="M12 8v8" stroke={props.fg} />
-        <path d="M8 12h8" stroke={props.fg} />
-      </Show>
-    </svg>
-  );
 }
 
 function TileGlyph(props: {
@@ -1001,41 +956,6 @@ export function SwitcherOverlay(props: {
     };
   });
 
-  const paneMatches = createMemo(() => {
-    if (!props.activeLayout) return [] as PaneItem[];
-
-    const needle = searchPart().toLowerCase();
-    return enumeratePanes(props.activeLayout.root)
-      .map((pane, index) => {
-        const sessionId = props.layoutAssignments?.assignments[pane.id] ?? null;
-        const session = sessionId
-          ? (sessionsById().get(sessionId) ?? null)
-          : null;
-        // Panes are anonymous — position is the only name they have.
-        const paneName = `Pane ${index + 1}`;
-        const assignedName = session ? sessionName(session) : null;
-        const subtitle = session
-          ? tp("switcher.showsPane", { name: assignedName ?? "" })
-          : t("switcher.emptyPane");
-        return {
-          type: "pane" as const,
-          key: `pane:${pane.id}`,
-          title: paneName,
-          subtitle,
-          paneId: pane.id,
-          paneIndex: index,
-          sessionId,
-          empty: sessionId == null,
-        };
-      })
-      .filter((pane) => {
-        if (!searching()) return true;
-        return [pane.title].some((value) =>
-          value.toLowerCase().includes(needle),
-        );
-      });
-  });
-
   const sessionMatches = createMemo(() => {
     const dp = destPrefix();
 
@@ -1362,9 +1282,6 @@ export function SwitcherOverlay(props: {
       subtitle: layout.dsl,
       layout,
     }));
-    if (paneMatches().length > 0) {
-      next.push({ title: t("switcher.sectionPanes"), items: paneMatches() });
-    }
     if (backgroundMatches().length > 0) {
       next.push({
         title: t("switcher.sectionBackground"),
@@ -1696,13 +1613,12 @@ export function SwitcherOverlay(props: {
     });
   });
 
-  // IntersectionObserver does not run until after the first paint. Prime the
-  // first screen synchronously so a typed application result does not spend a
-  // frame showing its fallback glyph before its icon request even starts.
+  // Resolve the launcher's application shelf as soon as it exists. Icons are
+  // small catalog metadata, not video frames; making each row wait for viewport
+  // admission left the menu visibly filling for seconds.
   createEffect(() => {
     const tokens = flatItems()
       .filter((item): item is AppItem => item.type === "app")
-      .slice(0, 16)
       .map((item) => `${item.connectionId} ${item.appId}`);
     if (tokens.length > 0) requestIconTokens(tokens);
   });
@@ -1781,7 +1697,8 @@ export function SwitcherOverlay(props: {
       sel.type !== "remote" &&
       sel.type !== "tile" &&
       sel.type !== "file" &&
-      sel.type !== "symbol"
+      sel.type !== "symbol" &&
+      sel.type !== "app"
     );
   };
 
@@ -1869,23 +1786,6 @@ export function SwitcherOverlay(props: {
               overflow: "hidden",
             }}
           />
-        ) : item.type === "pane" ? (
-          props.activeLayout ? (
-            <LayoutPreview
-              node={props.activeLayout.root}
-              width={iconSize()}
-              height={iconSize()}
-              color={theme().fg}
-              bg={theme().bg}
-              highlightIndex={item.paneIndex}
-            />
-          ) : (
-            <PaneGlyph
-              empty={item.empty}
-              fg={theme().fg}
-              dimFg={theme().dimFg}
-            />
-          )
         ) : item.type === "remote" ? (
           <StatusDot
             status={(item as RemoteItem).status}
@@ -1935,12 +1835,6 @@ export function SwitcherOverlay(props: {
         searchRef?.focus();
         searchRef?.select();
       }
-      return;
-    }
-    if (item.type === "pane") {
-      const cmdMatch = query().match(/>(.*)/);
-      const paneCommand = cmdMatch?.[1]?.trim() || undefined;
-      props.onSelectPane?.(item.paneId, item.sessionId, paneCommand);
       return;
     }
     if (item.type === "remote") {
@@ -2202,7 +2096,9 @@ export function SwitcherOverlay(props: {
           "flex-direction": "column",
           "justify-content": "center",
           "margin-right":
-            narrow() || newTerminalMode() ? undefined : sidebarWidth,
+            narrow() || newTerminalMode() || !showPreview()
+              ? undefined
+              : sidebarWidth,
         }}
       >
         <OverlayPanel
@@ -2498,16 +2394,6 @@ export function SwitcherOverlay(props: {
                                   >
                                     <mark style={ui.badge}>
                                       {t("switcher.badgeInLayout")}
-                                    </mark>
-                                  </Show>
-                                  <Show
-                                    when={
-                                      item.type === "pane" &&
-                                      (item as PaneItem).empty
-                                    }
-                                  >
-                                    <mark style={ui.badge}>
-                                      {t("switcher.badgeEmpty")}
                                     </mark>
                                   </Show>
                                   <Show
@@ -2972,79 +2858,6 @@ export function SwitcherOverlay(props: {
                     </button>
                   </Show>
                 </div>
-              </Show>
-
-              <Show when={sel().type === "pane"}>
-                <div style={{ display: "grid", gap: `${scale().tightGap}px` }}>
-                  <div
-                    style={{
-                      "font-size": `${fsXs()}px`,
-                      "text-transform": "uppercase",
-                      "letter-spacing": "0.08em",
-                      color: theme().dimFg,
-                    }}
-                  >
-                    {t("switcher.previewPane")}
-                  </div>
-                  <div
-                    style={{
-                      "font-size": `${fsLg()}px`,
-                      "font-weight": 600,
-                    }}
-                  >
-                    {sel().title}
-                  </div>
-                  <div
-                    style={{
-                      "font-size": `${fsSm()}px`,
-                      color: theme().dimFg,
-                    }}
-                  >
-                    {inlineCmd()
-                      ? tp("switcher.runInPane", {
-                          command: inlineCmd(),
-                          pane: sel().title,
-                        })
-                      : (sel() as PaneItem).empty
-                        ? tp("switcher.paneEmpty", {
-                            pane: sel().title,
-                          })
-                        : sel().subtitle}
-                  </div>
-                </div>
-                <Show when={props.activeLayout}>
-                  {(al) => (
-                    <div
-                      style={{
-                        border: `1px solid ${theme().subtleBorder}`,
-                        display: "flex",
-                        "align-items": "center",
-                        "justify-content": "center",
-                        "background-color": theme().panelBg,
-                        "border-radius": "0",
-                        padding: `${scale().panelPadding}px`,
-                      }}
-                    >
-                      <LayoutPreview
-                        node={al().root}
-                        width={160}
-                        height={96}
-                        color={theme().fg}
-                        bg={theme().bg}
-                        highlightIndex={(sel() as PaneItem).paneIndex}
-                      />
-                    </div>
-                  )}
-                </Show>
-                <button
-                  type="button"
-                  onClick={() => activateItem(sel())}
-                  style={ctaStyle()}
-                >
-                  {inlineCmd()
-                    ? tp("switcher.runInlineCmd", { command: inlineCmd() })
-                    : t("switcher.selectPane")}
-                </button>
               </Show>
 
               <Show when={sel().type === "session"}>

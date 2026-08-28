@@ -201,7 +201,7 @@ layout = "surface_handle:u64,seat_handle:u64,expires_server_ns:u64,input_kind:u8
 
 [[type]]
 name = "surface_record"
-layout = "surface_handle:u64,revision:u64,parent_handle:u64,app_handle:u64,lifecycle:u8,reserved:u8=0,buffer_scale:u16,logical_width_32_32:i64,logical_height_32_32:i64,application_id:string_u16,title:string_u16,Extensions"
+layout = "surface_handle:u64,revision:u64,parent_handle:u64,app_handle:u64,lifecycle:u8,reserved:u8=0,composite_width:u32,composite_height:u32,logical_width_32_32:i64,logical_height_32_32:i64,application_id:string_u16,title:string_u16,Extensions"
 [[type]]
 name = "view_result"
 layout = "view_id:u32,codec_version:u16,max_inflight_frames:u16,max_encoded_frame:u32,max_decoded_frame:u32,first_sequence:u64,Extensions"
@@ -212,7 +212,6 @@ layout = "kind:u8,reserved:[u8;3]=0; NAMED name:string_u16, HIDDEN empty, CUSTOM
 [[type]]
 name = "text_input_state"
 layout = "flags:u16,reserved:u16=0,content_hint:u32,content_purpose:u32; when HAS_CURSOR_RECT x:i32,y:i32,width:i32,height:i32"
-
 [[constant]]
 name = "STATE_ACTIVATION_REVISION_EXTENSION"
 value = 1
@@ -225,6 +224,9 @@ value = 3
 [[constant]]
 name = "RESIZE_SCALE_120_EXTENSION"
 value = 4
+[[constant]]
+name = "STATE_MAXIMIZE_REQUEST_EXTENSION"
+value = 5
 [[constant]]
 name = "MAX_INLINE_CURSOR_BYTES"
 value = 32768

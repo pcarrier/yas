@@ -221,9 +221,15 @@ function MprisChrome(props: {
   scale: UIScale;
   compact: boolean;
   focusedConnectionId?: string;
+  onRaisePlayer?: (player: {
+    connectionId: string;
+    desktopEntry: string;
+    identity: string;
+  }) => void;
   closeOthers: () => void;
 }) {
   const [open, setOpen] = createSignal(false);
+  const [actionError, setActionError] = createSignal<string>();
   const [manualMediaSessionKey, setManualMediaSessionKey] =
     createSignal<string>();
   const [playingOrderRevision, setPlayingOrderRevision] = createSignal(0);
@@ -316,6 +322,14 @@ function MprisChrome(props: {
    *  showed the action as already taken needs to know when to stop. */
   const act = (entry: MprisEntry, action: MprisAction): Promise<void> => {
     if (entry.readOnly) return Promise.resolve();
+    setActionError(undefined);
+    if (action.kind === "raise") {
+      props.onRaisePlayer?.({
+        connectionId: entry.connectionId,
+        desktopEntry: entry.player.desktopEntry,
+        identity: entry.player.identity,
+      });
+    }
     const pending = props.workspace
       .getConnection(entry.connectionId)
       ?.mprisStore.act(entry.player.playerId, action);
@@ -326,7 +340,12 @@ function MprisChrome(props: {
           setManualMediaSessionKey(mprisMediaSessionKey(entry));
         }
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        setActionError(
+          error instanceof Error ? error.message : "Media action failed",
+        );
+        setOpen(true);
+      });
   };
   const capable = (entry: MprisEntry, flag: number) =>
     !entry.readOnly &&
@@ -658,6 +677,21 @@ function MprisChrome(props: {
               scale={props.scale}
               width="min(30em, calc(100vw - 2em))"
             >
+              <Show when={actionError()}>
+                {(message) => (
+                  <div
+                    role="alert"
+                    style={{
+                      padding: `${props.scale.panelPadding}px`,
+                      color: props.theme.errorText,
+                      border: `1px solid ${props.theme.errorText}`,
+                      "background-color": props.theme.solidPanelBg,
+                    }}
+                  >
+                    {message()}
+                  </div>
+                )}
+              </Show>
               <For each={players()}>
                 {(entry) => {
                   const art = () => artworkUrl(entry.player.artwork);
@@ -1440,6 +1474,11 @@ export function DesktopChrome(props: {
   scale: UIScale;
   compact: boolean;
   focusedConnectionId?: string;
+  onRaisePlayer?: (player: {
+    connectionId: string;
+    desktopEntry: string;
+    identity: string;
+  }) => void;
 }) {
   const [toasts, setToasts] = createSignal<Toast[]>([]);
   const [bellOpen, setBellOpen] = createSignal(false);
@@ -1886,6 +1925,7 @@ export function DesktopChrome(props: {
         scale={props.scale}
         compact={props.compact}
         focusedConnectionId={props.focusedConnectionId}
+        onRaisePlayer={props.onRaisePlayer}
         closeOthers={() => {
           setBellOpen(false);
           setTrayOpen(false);
