@@ -579,11 +579,17 @@ function attachScrolling(
   opts: {
     frame?: [number, number];
     css?: [number, number];
+    surface?: [number, number];
+    display?: [number, number];
+    origin?: [number, number];
     directTouch?: boolean;
   } = {},
 ) {
   const [fw, fh] = opts.frame ?? [800, 600];
   const [cw, ch] = opts.css ?? [800, 600];
+  const [sw, sh] = opts.surface ?? [fw, fh];
+  const [dw, dh] = opts.display ?? [fw, fh];
+  const [left, top] = opts.origin ?? [0, 0];
   const sent: SurfaceAxisEvent[] = [];
   const keys: { keycode: number; pressed: boolean }[] = [];
   const pointers: { type: number; button: number; x: number; y: number }[] = [];
@@ -633,7 +639,7 @@ function attachScrolling(
     // this stub does not need updating when the store grows a method.
     surfaceStore: new Proxy(
       {
-        getSurface: () => ({ width: fw, height: fh }),
+        getSurface: () => ({ width: sw, height: sh }),
         getCanvas: () => null,
         canDecodeVideo: false,
         generation: 0,
@@ -664,10 +670,10 @@ function attachScrolling(
   canvas.height = fh;
   // A display size is what separates a live view from a thumbnail, and
   // only live views take input.
-  surface.setDisplaySize(fw, fh, 120);
+  surface.setDisplaySize(dw, dh, 120);
   // jsdom lays nothing out, so the drawn region has to be declared.
   canvas.getBoundingClientRect = () =>
-    ({ left: 0, top: 0, width: cw, height: ch }) as DOMRect;
+    ({ left, top, width: cw, height: ch }) as DOMRect;
   const wheel = (init: Partial<WheelEvent>) => {
     canvas.dispatchEvent(
       new WheelEvent("wheel", { cancelable: true, ...init }),
@@ -822,6 +828,33 @@ describe("YasSurfaceCanvas scroll", () => {
       { type: SURFACE_POINTER_MOVE, button: 0, x: 400, y: 599 },
     ]);
     expect(pointers.every((p) => p.x >= 0 && p.y >= 0)).toBe(true);
+    surface.dispose();
+  });
+
+  it("maps a centered downscaled video across the full native surface", () => {
+    // A 400x300 encode is centered in a roomy 1x pane while another viewer
+    // makes the shared surface composite at 1200x900.  Input is relative to
+    // the drawn video, then expanded into the native compositor space.
+    const { surface, canvas, pointers } = attachScrolling({
+      frame: [400, 300],
+      css: [400, 300],
+      surface: [1200, 900],
+      display: [1600, 1200],
+      origin: [600, 450],
+    });
+
+    canvas.dispatchEvent(
+      new MouseEvent("mousemove", {
+        bubbles: true,
+        cancelable: true,
+        clientX: 1000,
+        clientY: 750,
+      }),
+    );
+
+    expect(pointers).toEqual([
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 1199, y: 899 },
+    ]);
     surface.dispose();
   });
 

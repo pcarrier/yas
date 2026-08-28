@@ -23,8 +23,10 @@ use crate::{
     yas::{Client, Error as ClientError},
 };
 
-/// Receive credit held open for each connected native Channel.
-pub const DEFAULT_RECEIVE_WINDOW: u64 = 4 * 1024 * 1024;
+/// Automatic sliding window for ordinary message Channels. Applications with
+/// genuinely larger atomic messages may opt in explicitly; routine callers do
+/// not need to budget the session themselves.
+pub const DEFAULT_RECEIVE_WINDOW: u64 = 1024 * 1024;
 
 /// A reason for ending a native Channel transfer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,10 +235,14 @@ impl Listener {
         {
             return Ok(None);
         }
-        Ok(Some(ListenerEvent::Accepted(Box::new(Channel::accepted(
-            client,
-            accept.endpoint,
-        )?))))
+        match Channel::accepted(client, accept.endpoint) {
+            Ok(channel) => Ok(Some(ListenerEvent::Accepted(Box::new(channel)))),
+            // Channel::accepted already reset the peer endpoint with
+            // ResourceExhausted. A routed event loop has handled this ACCEPT;
+            // admission pressure must not tear down its long-lived listener.
+            Err(Error::Client(ClientError::ReceiveBudgetExhausted { .. })) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn close(&mut self, client: &mut Client) -> Result<(), Error> {
@@ -938,10 +944,27 @@ impl Client {
         listener: ListenerIdentity,
         metadata: &[u8],
     ) -> Result<Channel, Error> {
+        self.connect_channel_with_receive_window(listener, metadata, DEFAULT_RECEIVE_WINDOW)
+    }
+
+    /// Connect with an explicit maximum inbound message/window size.
+    ///
+    /// The ordinary API chooses a workload-sized default. This override is for
+    /// protocols whose atomic inbound messages genuinely exceed that bound,
+    /// not for routine session-budget tuning.
+    pub fn connect_channel_with_receive_window(
+        &mut self,
+        listener: ListenerIdentity,
+        metadata: &[u8],
+        receive_window: u64,
+    ) -> Result<Channel, Error> {
         if !self.supports(family::CHANNEL, Class::Request, wire::request_kind::CONNECT) {
             return Err(Error::FeatureMissing);
         }
-        let mut receive_lease = self.receive_credit_exact(DEFAULT_RECEIVE_WINDOW)?;
+        if receive_window == 0 {
+            return Err(Error::Protocol("Channel receive window is zero"));
+        }
+        let mut receive_lease = self.receive_credit_exact(receive_window)?;
         let initial_receive_credit = receive_lease.bytes();
         let endpoint: wire::ChannelEndpoint = self.request_typed_with_receive_lease(
             family::CHANNEL,
@@ -1394,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_channel_resets_when_no_receive_authority_is_available() {
+    fn routed_accept_rejects_only_the_new_channel_when_budget_is_unavailable() {
         let (mut client, state, _guard) = bootstrap_client();
         let held = client.receive_credit_exact(16 * 1024 * 1024).unwrap();
         let frame = Frame {
@@ -1405,10 +1428,12 @@ mod tests {
             payload: accept_with_window(1).encode().unwrap(),
         };
 
-        assert!(matches!(
-            listener().offer_frame(&mut client, &frame),
-            Err(Error::Client(ClientError::ReceiveBudgetExhausted { .. }))
-        ));
+        assert!(
+            listener()
+                .offer_frame(&mut client, &frame)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             sent_event_kinds(&state),
             vec![yas_wire::transfer::kind::RESET]
@@ -1445,7 +1470,10 @@ mod tests {
             Err(Error::Client(_))
         ));
         assert!(state.borrow().sent.is_empty());
-        assert_eq!(client.available_receive_credit(), 12 * 1024 * 1024);
+        assert_eq!(
+            client.available_receive_credit(),
+            16 * 1024 * 1024 - DEFAULT_RECEIVE_WINDOW
+        );
         assert!(matches!(client.next_event(), Err(ClientError::Poisoned)));
     }
 
@@ -1480,7 +1508,10 @@ mod tests {
             Err(Error::Client(_))
         ));
         assert!(state.borrow().sent.is_empty());
-        assert_eq!(client.available_receive_credit(), 12 * 1024 * 1024);
+        assert_eq!(
+            client.available_receive_credit(),
+            16 * 1024 * 1024 - DEFAULT_RECEIVE_WINDOW
+        );
         assert!(matches!(client.next_event(), Err(ClientError::Poisoned)));
     }
 
@@ -1488,7 +1519,10 @@ mod tests {
     fn queued_out_of_order_data_drains_before_peer_close_releases_credit() {
         let (mut client, _state, _guard) = bootstrap_client();
         let mut channel = Channel::accepted(&mut client, accept().endpoint).unwrap();
-        assert_eq!(client.available_receive_credit(), 12 * 1024 * 1024);
+        assert_eq!(
+            client.available_receive_credit(),
+            16 * 1024 * 1024 - DEFAULT_RECEIVE_WINDOW
+        );
 
         assert!(channel.offer_frame(&message(1, b"b")).unwrap().is_none());
         let Some(Event::Data(first)) = channel.offer_frame(&message(0, b"a")).unwrap() else {
@@ -1497,7 +1531,10 @@ mod tests {
         assert_eq!(first.sequence(), 0);
         assert_eq!(first.payload(), b"a");
         assert!(channel.offer_frame(&peer_close(2)).unwrap().is_none());
-        assert_eq!(client.available_receive_credit(), 12 * 1024 * 1024);
+        assert_eq!(
+            client.available_receive_credit(),
+            16 * 1024 * 1024 - DEFAULT_RECEIVE_WINDOW
+        );
 
         assert_eq!(channel.consume(&mut client, first).unwrap(), b"a");
         let Some(Event::Data(second)) = channel.poll_event().unwrap() else {
@@ -1535,13 +1572,19 @@ mod tests {
     fn abandoned_live_channel_authority_is_not_reused() {
         let (mut client, _state, _guard) = bootstrap_client();
         let channel = Channel::accepted(&mut client, accept().endpoint).unwrap();
-        assert_eq!(client.available_receive_credit(), 12 * 1024 * 1024);
+        assert_eq!(
+            client.available_receive_credit(),
+            16 * 1024 * 1024 - DEFAULT_RECEIVE_WINDOW
+        );
 
         drop(channel);
 
-        assert_eq!(client.available_receive_credit(), 12 * 1024 * 1024);
+        assert_eq!(
+            client.available_receive_credit(),
+            16 * 1024 * 1024 - DEFAULT_RECEIVE_WINDOW
+        );
         assert!(matches!(
-            client.receive_credit_exact(13 * 1024 * 1024),
+            client.receive_credit_exact(16 * 1024 * 1024),
             Err(ClientError::ReceiveBudgetExhausted { .. })
         ));
     }

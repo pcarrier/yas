@@ -2238,10 +2238,12 @@ Surface input has stable YAS enums. KEY carries a generated physical-key code,
 press/release/repeat state, modifiers, and client monotonic time. The initial
 registry follows USB HID positions where they exist but is a YAS registry, not
 a browser or evdev number. TEXT carries committed UTF-8; PREEDIT carries text,
-selection, and cursor as byte offsets. POINTER and AXIS use signed 32.32 logical
-coordinates; AXIS separately represents pixel delta, discrete steps, source,
-and stop. TOUCH carries a phase plus length-delimited contacts. Unknown enums
-are dropped and counted, never coerced into a valid button or key.
+selection, and cursor as byte offsets. POINTER positions and AXIS smooth deltas
+use signed 32.32 coordinates in the native composited frame's physical pixel
+space; they do not change when a subscriber receives a downscaled encode. AXIS
+separately represents discrete steps, source, and stop. TOUCH carries a phase
+plus length-delimited contacts in that same coordinate space. Unknown enums are
+dropped and counted, never coerced into a valid button or key.
 
 REMOTE_INPUT carries another session's transient pointer or touch marks with a
 seat handle and expiry. Its exact body is

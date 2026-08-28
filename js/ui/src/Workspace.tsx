@@ -1847,7 +1847,7 @@ function WorkspaceScreen(props: {
   let pendingAppStartTimer: ReturnType<typeof setTimeout> | undefined;
   function startAppFromSwitcher(connectionId: ConnectionId, appId: string) {
     if (pendingAppStartTimer) clearTimeout(pendingAppStartTimer);
-    startApplication(connectionId, appId);
+    if (!startApplication(connectionId, appId)) return false;
     setPendingAppStart({ connectionId, appId });
     // If the surface never appears, don't leave this hanging forever.
     pendingAppStartTimer = setTimeout(() => {
@@ -1856,6 +1856,7 @@ function WorkspaceScreen(props: {
         cur?.connectionId === connectionId && cur?.appId === appId ? null : cur,
       );
     }, 30_000);
+    return true;
   }
 
   /** Set or clear the focused surface, always keeping the connectionId
@@ -4150,6 +4151,25 @@ function WorkspaceScreen(props: {
     setActiveLayout(null);
   }
 
+  /** Collapse a two-pane layout after one leaf is removed. The surviving
+   * assignment becomes the ordinary single main view; a null survivor leaves
+   * that view genuinely empty instead of resurrecting whatever happened to be
+   * focused behind the layout. */
+  function collapseLayoutToSingle(assignment: string | null) {
+    setLayoutAssignments(null);
+    setUnresolvedLayoutAssignments({});
+    setAssignmentsResolved(true);
+    setActiveLayout(null);
+    saveActiveLayout(null);
+    if (assignment) {
+      focusAssignment(assignment);
+      return;
+    }
+    setActiveTile(null);
+    focusSurfaceById(null);
+    parkMainViewSession();
+  }
+
   /** The mirror of exitLayout. Under a layout the panes own what is on
    *  screen, so the single-view surface slot describes nothing — and entering
    *  entering a layout never placed the focused surface in a pane, it simply stopped
@@ -5240,6 +5260,7 @@ function WorkspaceScreen(props: {
                     onClearPaneAssignment={(fn) => {
                       clearPaneAssignmentFn = fn;
                     }}
+                    onCollapseToSingle={collapseLayoutToSingle}
                     onFocusedPaneChange={setLayoutFocusedPaneId}
                     onOpenTile={openTile}
                     registerWebPaneHost={webPaneHosts.register}

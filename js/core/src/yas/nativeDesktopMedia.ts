@@ -1943,13 +1943,25 @@ function productClient(
   record: YasClientRecord,
 ): YasClientInfo {
   const active = record.activeSubscriptions;
+  const details = new Map(
+    (record.auxiliarySubscriptionDetails?.entries ?? []).map((entry) => [
+      `${entry.family}:${entry.subscriptionId}`,
+      entry,
+    ]),
+  );
   const subscriptions: YasClientAuxSubscription[] = (
     active?.auxiliary ?? []
-  ).map((entry) => ({
-    kind: entry.family,
-    id: entry.resourceHandle,
-    subscriptionId: entry.subscriptionId,
-  }));
+  ).map((entry) => {
+    const detail = details.get(`${entry.family}:${entry.subscriptionId}`);
+    return {
+      kind: entry.family,
+      id: entry.resourceHandle,
+      subscriptionId: entry.subscriptionId,
+      resource: detail?.resource,
+      requestFlags: detail?.requestFlags,
+      stateWatchFlags: detail?.stateWatchFlags,
+    };
+  });
   return {
     id: bytesHex(record.sessionId),
     ageSeconds: Number(

@@ -51,7 +51,7 @@ function surfaceTestView(codecVersion: number, firstSequence = 1n) {
   return {
     result: {
       firstSequence,
-      maxInflightFrames: 1,
+      maxInflightFrames: 3,
       codecVersion,
     },
     subscribe: vi.fn(() => vi.fn()),
@@ -898,15 +898,15 @@ describe("YasNativeWorkspaceConnection", () => {
     const second = lifecycle.refreshNativeSurfaceView(1n);
     expect(openView).toHaveBeenCalledOnce();
     expect(openView).toHaveBeenLastCalledWith(
-      expect.objectContaining({ decoderCapacity: 1, maxFps: 120 }),
+      expect.objectContaining({ decoderCapacity: 3, maxFps: 120 }),
     );
     result.resolve(view);
     await Promise.all([first, second]);
 
     expect(openView).toHaveBeenCalledOnce();
-    expect(view.configure).toHaveBeenCalledWith(
-      expect.objectContaining({ decoderCapacity: 1 }),
-    );
+    // The second waiter re-evaluates the now-open view, but identical
+    // parameters must not reset its encoder.
+    expect(view.configure).not.toHaveBeenCalled();
     expect(lifecycle.surfaceViews.size).toBe(1);
     expect(lifecycle.pendingSurfaceViews.size).toBe(0);
     expect(view.close).not.toHaveBeenCalled();
@@ -950,7 +950,7 @@ describe("YasNativeWorkspaceConnection", () => {
       const first = lifecycle.refreshNativeSurfaceView(1n);
       expect(openView).toHaveBeenCalledWith(
         expect.objectContaining({
-          decoderCapacity: 1,
+          decoderCapacity: 3,
           codecVersions: expect.arrayContaining([YAS_SURFACE_CODEC_H264_V1]),
         }),
       );
@@ -966,7 +966,7 @@ describe("YasNativeWorkspaceConnection", () => {
       expect(lifecycle.surfaceViews.has(1n)).toBe(false);
       expect(openView).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          decoderCapacity: 1,
+          decoderCapacity: 3,
           codecVersions: expect.arrayContaining([YAS_SURFACE_CODEC_AV1_V1]),
         }),
       );
@@ -994,6 +994,7 @@ describe("YasNativeWorkspaceConnection", () => {
       removeFrames: vi.fn(),
       width: 640,
       height: 480,
+      maxFps: 60,
       lastReceived: 0n,
       lastPresented: 0n,
       decoderQueueDepth: 0,
@@ -1123,6 +1124,69 @@ describe("YasNativeWorkspaceConnection", () => {
     );
   });
 
+  it("maps a 2x Surface catalogue record into physical pointer space", () => {
+    const handleSurfaceCreated = vi.fn();
+    const handleSurfaceResized = vi.fn();
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    Object.assign(connection as object, {
+      surfaceRecords: new Map(),
+      surfaceStore: {
+        handleSurfaceCreated,
+        handleSurfaceResized,
+        handleSurfaceDestroyed: vi.fn(),
+        handleSurfaceTitle: vi.fn(),
+        handleSurfaceAppId: vi.fn(),
+      },
+      surfaceViews: new Map(),
+      emit: vi.fn(),
+    });
+    const lifecycle = connection as unknown as {
+      applySurfaceCatalog(records: readonly unknown[]): void;
+    };
+    const record = {
+      surfaceHandle: 1n,
+      revision: 1n,
+      parentHandle: 0n,
+      appHandle: 0n,
+      lifecycle: 0,
+      bufferScale: 2,
+      logicalWidth32_32: 800n << 32n,
+      logicalHeight32_32: 600n << 32n,
+      applicationId: "app",
+      title: "title",
+      extensions: [],
+    };
+
+    lifecycle.applySurfaceCatalog([record]);
+    expect(handleSurfaceCreated).toHaveBeenCalledWith(
+      1n,
+      0n,
+      1600,
+      1200,
+      "title",
+      "app",
+    );
+    expect(handleSurfaceResized).toHaveBeenCalledWith(
+      1n,
+      1600,
+      1200,
+      800,
+      600,
+    );
+
+    handleSurfaceResized.mockClear();
+    lifecycle.applySurfaceCatalog([{ ...record, bufferScale: 1 }]);
+    expect(handleSurfaceResized).toHaveBeenCalledWith(
+      1n,
+      800,
+      600,
+      800,
+      600,
+    );
+  });
+
   it("opens an unscaled HiDPI Surface view at physical size and display rate", async () => {
     const view = surfaceTestView(YAS_SURFACE_CODEC_AV1_V1);
     const openView = vi.fn().mockResolvedValue(view);
@@ -1181,6 +1245,7 @@ describe("YasNativeWorkspaceConnection", () => {
         removeFrames: vi.fn(),
         width: 640,
         height: 480,
+        maxFps: 60,
         lastReceived: 0n,
         lastPresented: 0n,
         decoderQueueDepth: 0,
@@ -1197,7 +1262,7 @@ describe("YasNativeWorkspaceConnection", () => {
       expect(oldView.reset).not.toHaveBeenCalled();
       expect(openView).toHaveBeenCalledWith(
         expect.objectContaining({
-          decoderCapacity: 1,
+          decoderCapacity: 3,
           codecVersions: expect.arrayContaining([YAS_SURFACE_CODEC_AV1_V1]),
         }),
       );

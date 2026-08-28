@@ -109,6 +109,40 @@ export interface ExtensionRow {
   readonly offered?: RegistryEntry;
 }
 
+/** Keep a mutation result visible while a watched inventory catches up. */
+export function upsertExtensionRecord(
+  records: readonly YasExtensionRecord[] | null,
+  updated: YasExtensionRecord,
+): readonly YasExtensionRecord[] {
+  if (records === null) return [updated];
+  const index = records.findIndex(
+    (record) => record.extensionHandle === updated.extensionHandle,
+  );
+  if (index < 0) return [...records, updated];
+  const next = [...records];
+  next[index] = updated;
+  return next;
+}
+
+/** Do not let a lagging catalogue snapshot undo a completed update result. */
+export function mergeExtensionInventory(
+  previous: readonly YasExtensionRecord[] | null,
+  observed: readonly YasExtensionRecord[],
+): readonly YasExtensionRecord[] {
+  if (previous === null) return observed;
+  const prior = new Map(
+    previous.map((record) => [record.extensionHandle, record] as const),
+  );
+  return observed.map((record) => {
+    const known = prior.get(record.extensionHandle);
+    return known &&
+      known.generation === record.generation &&
+      known.definitionRevision > record.definitionRevision
+      ? known
+      : record;
+  });
+}
+
 /**
  * The one list the panel shows: installed first, then what only the registry
  * has.
@@ -196,7 +230,13 @@ export async function fetchRegistry(
   fetcher: typeof fetch = fetch,
 ): Promise<Registry> {
   const base = url.replace(/\/+$/, "");
-  const response = await fetcher(`${base}/manifest.json`, { mode: "cors" });
+  const response = await fetcher(`${base}/manifest.json`, {
+    mode: "cors",
+    // The development registry replaces manifest.json in place. A normal
+    // browser cache otherwise keeps offering yesterday's digest after a
+    // rebuild, however often the panel says Reload.
+    cache: "no-store",
+  });
   if (!response.ok) {
     throw new Error(`${base}/manifest.json: HTTP ${response.status}`);
   }
@@ -245,8 +285,14 @@ export async function installFromRegistry(
     expectedGeneration: installed?.generation,
     expectedDefinitionRevision: installed?.definitionRevision,
     module: async () => {
-      const response = await fetcher(`${registry.url}/${entry.file}`, {
+      // Registry object names are stable while their digest changes. Put the
+      // identity in the URL so an Update cannot upload cached bytes belonging
+      // to the old hash.
+      const separator = entry.file.includes("?") ? "&" : "?";
+      const moduleUrl = `${registry.url}/${entry.file}${separator}blake3=${encodeURIComponent(entry.blake3)}`;
+      const response = await fetcher(moduleUrl, {
         mode: "cors",
+        cache: "no-store",
       });
       if (!response.ok) {
         throw new Error(`${entry.file}: HTTP ${response.status}`);

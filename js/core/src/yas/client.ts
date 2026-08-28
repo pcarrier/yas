@@ -1,5 +1,6 @@
 import {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
+  YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
   YAS_CLIENT_BANDWIDTH_RATES_EXTENSION,
   YAS_CLIENT_DISCONNECT,
   YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS,
@@ -49,6 +50,7 @@ import {
 
 export {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
+  YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
   YAS_CLIENT_BANDWIDTH_RATES_EXTENSION,
   YAS_CLIENT_DISCONNECT,
   YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS,
@@ -114,6 +116,7 @@ export interface YasClientRecord {
   origin: YasClientOrigin;
   extensions: readonly YasExtension[];
   activeSubscriptions: YasClientActiveSubscriptions | null;
+  auxiliarySubscriptionDetails: YasClientAuxiliarySubscriptionDetails | null;
   bandwidthRates: YasClientBandwidthRates | null;
 }
 
@@ -148,6 +151,19 @@ export interface YasClientActiveSubscriptions {
   terminals: readonly YasClientTerminalSubscription[];
   surfaces: readonly YasClientSurfaceSubscription[];
   auxiliary: readonly YasClientAuxiliarySubscription[];
+}
+
+export interface YasClientAuxiliarySubscriptionDetail {
+  family: number;
+  stateWatchFlags: number;
+  subscriptionId: number;
+  requestFlags: number;
+  /** Family-specific resource identity; for KV this is the namespace prefix. */
+  resource: Uint8Array;
+}
+
+export interface YasClientAuxiliarySubscriptionDetails {
+  entries: readonly YasClientAuxiliarySubscriptionDetail[];
 }
 
 export interface YasClientSnapshot {
@@ -241,6 +257,8 @@ export function decodeClientRecord(bytes: Uint8Array): YasClientRecord {
     ...extensionsOffset,
     extensions,
     activeSubscriptions: decodeClientActiveSubscriptions(extensions),
+    auxiliarySubscriptionDetails:
+      decodeClientAuxiliarySubscriptionDetails(extensions),
     bandwidthRates: decodeClientBandwidthRates(extensions),
   };
   cursor.end("Client record");
@@ -249,6 +267,59 @@ export function decodeClientRecord(bytes: Uint8Array): YasClientRecord {
   if (record.name.length === 0)
     throw new YasProtocolError("Client name is empty");
   return record;
+}
+
+export function decodeClientAuxiliarySubscriptionDetails(
+  extensions: readonly YasExtension[],
+): YasClientAuxiliarySubscriptionDetails | null {
+  const extension = extensions.find(
+    (candidate) =>
+      candidate.tag ===
+      YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
+  );
+  if (!extension) return null;
+  const cursor = new YasCursor(extension.value);
+  const count = cursor.u16("Client auxiliary subscription detail count");
+  if (cursor.u16("Client auxiliary subscription details reserved") !== 0)
+    throw new YasProtocolError(
+      "Client auxiliary subscription details reserved is nonzero",
+    );
+  if (
+    count > YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS ||
+    count > Math.floor(cursor.remaining / 14)
+  )
+    throw new YasProtocolError(
+      "invalid Client auxiliary subscription detail count",
+    );
+  const entries: YasClientAuxiliarySubscriptionDetail[] = [];
+  let previous: readonly [number, number] | null = null;
+  for (let index = 0; index < count; index++) {
+    const value: YasClientAuxiliarySubscriptionDetail = {
+      family: cursor.u16("Client auxiliary subscription detail family"),
+      stateWatchFlags: cursor.u16(
+        "Client auxiliary subscription detail State WATCH flags",
+      ),
+      subscriptionId: cursor.u32(
+        "Client auxiliary subscription detail ID",
+      ),
+      requestFlags: cursor.u32(
+        "Client auxiliary subscription detail request flags",
+      ),
+      resource: new Uint8Array(
+        cursor.bytesU16("Client auxiliary subscription detail resource"),
+      ),
+    };
+    if (
+      value.subscriptionId === 0 ||
+      (previous !== null &&
+        compareNumberPair(previous, [value.family, value.subscriptionId]) >= 0)
+    )
+      throw new YasProtocolError("invalid Client auxiliary subscription detail");
+    previous = [value.family, value.subscriptionId];
+    entries.push(value);
+  }
+  cursor.end("Client auxiliary subscription details");
+  return { entries };
 }
 
 export function decodeClientActiveSubscriptions(
@@ -661,6 +732,8 @@ export class YasClientCatalog {
           extensions: mergedExtensions,
           activeSubscriptions:
             decodeClientActiveSubscriptions(mergedExtensions),
+          auxiliarySubscriptionDetails:
+            decodeClientAuxiliarySubscriptionDetails(mergedExtensions),
           bandwidthRates: decodeClientBandwidthRates(mergedExtensions),
         });
         retention.upsert(key, estimateStateRetainedBytes(next));
@@ -798,6 +871,13 @@ function comparePair(
 ): number {
   if (left[0] !== right[0]) return left[0] < right[0] ? -1 : 1;
   return left[1] - right[1];
+}
+
+function compareNumberPair(
+  left: readonly [number, number],
+  right: readonly [number, number],
+): number {
+  return left[0] !== right[0] ? left[0] - right[0] : left[1] - right[1];
 }
 
 function compareTriple(

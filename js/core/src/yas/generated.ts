@@ -456,6 +456,7 @@ export const YAS_CLIENT_ORIGIN_WEBRTC = 4 as const;
 export const YAS_CLIENT_ORIGIN_EXTENSION = 5 as const;
 export const YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION = 1 as const;
 export const YAS_CLIENT_BANDWIDTH_RATES_EXTENSION = 2 as const;
+export const YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION = 3 as const;
 export const YAS_CLIENT_MAX_ACTIVE_SUBSCRIPTIONS = 4096 as const;
 export const YAS_CLIENT_MAX_PUBLISHED_CLIENTS = 4096 as const;
 export const YAS_CLIENT_LIMIT_MAX_PUBLISHED_CLIENTS = 1 as const;
@@ -4695,6 +4696,10 @@ export const YAS_SCHEMA = {
           "layout": "ClientRecord/ClientPatch extension tag 2 exact value received_bytes_per_second:u64,sent_bytes_per_second:u64,sample_window_ns:u64; sample_window_ns is nonzero; cumulative bytes_received/bytes_sent remain required in ClientRecord"
         },
         {
+          "name": "auxiliary_subscription_details",
+          "layout": "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the family-specific resource identity (the namespace prefix for KV), request_flags are family-specific, and state_watch_flags use StateWatch flags"
+        },
+        {
           "name": "family_limits",
           "layout": "ordered optional extensions: tag 1 max published client records:u32, tag 2 max active subscriptions represented per client:u32; both tags are present in a selected family descriptor"
         }
@@ -4731,6 +4736,10 @@ export const YAS_SCHEMA = {
         {
           "name": "BANDWIDTH_RATES_EXTENSION",
           "value": 2
+        },
+        {
+          "name": "AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION",
+          "value": 3
         },
         {
           "name": "MAX_ACTIVE_SUBSCRIPTIONS",

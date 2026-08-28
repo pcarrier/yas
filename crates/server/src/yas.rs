@@ -2152,7 +2152,12 @@ async fn serve_registered<S>(
         tokio::select! {
             queued = in_rx.recv() => match queued {
                 Some(queued) => {
+                    let rejected = queued.frame.header;
                     if session.handle(queued.frame, queued._credit).await.is_err() {
+                        eprintln!(
+                            "native YAS session rejected {:?} frame family={} kind={}",
+                            rejected.class, rejected.family, rejected.kind
+                        );
                         break;
                     }
                     session.sync_inbound_transfer_registry();
@@ -2296,7 +2301,12 @@ async fn serve_registered<S>(
                 // the time. Whatever the reader already queued is owed its
                 // turn before the session goes down.
                 while let Ok(queued) = in_rx.try_recv() {
+                    let rejected = queued.frame.header;
                     if session.handle(queued.frame, queued._credit).await.is_err() {
+                        eprintln!(
+                            "native YAS session rejected {:?} frame family={} kind={}",
+                            rejected.class, rejected.family, rejected.kind
+                        );
                         break;
                     }
                     session.sync_inbound_transfer_registry();
@@ -4761,12 +4771,22 @@ async fn client_catalogue_snapshot(
     for (&session_id, client) in &session.native_yas_clients {
         let elapsed_ns =
             u64::try_from(client.connected_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let active_subscriptions = client.active_subscriptions.snapshot();
-        let extensions = Extensions(vec![
-            active_subscriptions
+        let subscription_snapshot = client.active_subscriptions.snapshot();
+        let mut subscription_extensions = vec![
+            subscription_snapshot
+                .active
                 .extension()
                 .expect("validated native Client subscriptions"),
-        ]);
+        ];
+        if !subscription_snapshot.auxiliary_details.entries.is_empty() {
+            subscription_extensions.push(
+                subscription_snapshot
+                    .auxiliary_details
+                    .extension()
+                    .expect("validated native Client subscription details"),
+            );
+        }
+        let extensions = Extensions(subscription_extensions);
         records.insert(
             session_id,
             yas_client::ClientRecord {
@@ -4956,10 +4976,9 @@ fn fixed_to_f64(value: i64) -> f64 {
     value as f64 / 4_294_967_296.0
 }
 
-fn fixed_to_view_coordinate(value: i64, maximum: u16) -> u16 {
+fn fixed_to_surface_coordinate(value: i64) -> u16 {
     let integral = value >> 32;
-    let maximum = i64::from(maximum.saturating_sub(1));
-    u16::try_from(integral.clamp(0, maximum)).unwrap_or(0)
+    u16::try_from(integral.clamp(0, i64::from(u16::MAX))).unwrap_or(0)
 }
 
 fn monotonic_millis(monotonic_ns: u64) -> u32 {
@@ -5758,6 +5777,21 @@ fn terminal_view_frame_bound(rows: u16, cols: u16) -> u32 {
         .max(TERMINAL_FRAME_FLOOR)
 }
 
+/// Bytes a codec 1 keyframe cannot shed for this geometry.
+///
+/// Optional components are already dropped by `terminal_frame_from_state`
+/// when they do not fit. CONFIGURE_VIEW therefore only needs to reopen a view
+/// when its cells and required state exceed the bound the peer reserved; using
+/// the preferred opening bound here also charged every resize for optional
+/// component headroom and made an ordinary maximize rebuild the whole view.
+fn terminal_view_required_frame_bound(rows: u16, cols: u16) -> u32 {
+    u32::from(rows)
+        .saturating_mul(u32::from(cols))
+        .saturating_mul(TERMINAL_CELL_BYTES)
+        .saturating_add(TERMINAL_FRAME_PREFIX_BYTES)
+        .saturating_add(TERMINAL_FRAME_TITLE_ALLOWANCE)
+}
+
 fn view_id_nonzero(view: &TerminalView) -> u32 {
     // Views are keyed by their ID in `TerminalRuntime`; preserve it in the
     // value as well once the bridge starts emitting frames.
@@ -5987,7 +6021,13 @@ struct Watcher {
     control: Arc<FlowControl>,
     task: tokio::task::JoinHandle<()>,
     terminal_updates: Option<tokio::sync::watch::Sender<TerminalCatalogue>>,
-    kv_namespace: Option<u64>,
+    kv: Option<KvWatcher>,
+}
+
+#[derive(Clone, Copy)]
+struct KvWatcher {
+    namespace_handle: u64,
+    state_watch_flags: u16,
 }
 
 struct RelayTransfer {
@@ -6634,13 +6674,49 @@ impl Session {
                     resource_handle: resources.handle(
                         watcher.family,
                         subscription_id,
-                        watcher.kv_namespace,
+                        watcher.kv.map(|detail| detail.namespace_handle),
                     ),
                 },
             )
             .collect();
-        let snapshot = bounded_native_active_subscriptions(terminals, surfaces, auxiliary);
-        self.native_active_subscriptions.replace(snapshot);
+        let active = bounded_native_active_subscriptions(terminals, surfaces, auxiliary);
+        let retained_auxiliary = active
+            .auxiliary
+            .iter()
+            .map(|entry| (entry.family, entry.subscription_id))
+            .collect::<BTreeSet<_>>();
+        let mut auxiliary_details = self
+            .watchers
+            .iter()
+            .filter_map(|(&subscription_id, watcher)| {
+                let detail = watcher.kv?;
+                retained_auxiliary
+                    .contains(&(family::KV, subscription_id))
+                    .then_some(())?;
+                let resource = self
+                    .kv
+                    .as_ref()?
+                    .namespaces
+                    .get(&detail.namespace_handle)?
+                    .prefix
+                    .clone();
+                Some(yas_client::AuxiliarySubscriptionDetail {
+                    family: family::KV,
+                    state_watch_flags: detail.state_watch_flags,
+                    subscription_id,
+                    request_flags: 0,
+                    resource,
+                })
+            })
+            .collect::<Vec<_>>();
+        auxiliary_details.sort_unstable_by_key(|entry| (entry.family, entry.subscription_id));
+        self.native_active_subscriptions
+            .replace(super::NativeYasSubscriptionSnapshot {
+                active,
+                auxiliary_details: yas_client::AuxiliarySubscriptionDetails {
+                    entries: auxiliary_details,
+                },
+            });
     }
 
     async fn handle_shutdown_notice(&self, notice: ShutdownNotice) -> Result<(), ()> {
@@ -7932,7 +8008,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         self.native
@@ -8443,7 +8519,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         self.native
@@ -9265,8 +9341,13 @@ impl Session {
                     Some(super::yas_surface_backend::Input::Pointer {
                         phase,
                         button,
-                        x: fixed_to_view_coordinate(value.x_32_32, view.width),
-                        y: fixed_to_view_coordinate(value.y_32_32, view.height),
+                        // Coordinates name the compositor's native physical
+                        // surface, not this subscriber's encoded view.  A 1x
+                        // viewer of a surface composited at 2x deliberately
+                        // receives a half-sized encode; clamping here to that
+                        // view made its pointer stop halfway across the app.
+                        x: fixed_to_surface_coordinate(value.x_32_32),
+                        y: fixed_to_surface_coordinate(value.y_32_32),
                         time_ms: monotonic_millis(value.client_monotonic_ns),
                     }),
                 )
@@ -9534,7 +9615,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         Ok(())
@@ -10867,7 +10948,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         Ok(())
@@ -11558,7 +11639,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         Ok(())
@@ -13160,7 +13241,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: Some(updates),
-                kv_namespace: None,
+                kv: None,
             },
         );
         Ok(())
@@ -14273,11 +14354,12 @@ impl Session {
         let next_cols = request.configuration.cols.unwrap_or(current_cols);
         let next_max_fps = request.configuration.max_fps.unwrap_or(current_max_fps);
         // The peer reserved `frame_bound` when it opened this view and has no
-        // way to learn a new one from a CONFIGURE_VIEW Result. A geometry that
-        // would outgrow the reservation is refused with the resource status,
-        // leaving the view exactly as it was; a peer that wants the larger
-        // geometry opens a new view, whose declaration is sized for it.
-        if terminal_view_frame_bound(next_rows, next_cols) > frame_bound {
+        // way to learn a new one from a CONFIGURE_VIEW Result. Refuse only
+        // when the required grid would outgrow it. Optional components are
+        // already shed by the encoder when the resized grid leaves them less
+        // headroom; charging their preferred allowance here made maximize
+        // unnecessarily close and reopen otherwise viable views.
+        if terminal_view_required_frame_bound(next_rows, next_cols) > frame_bound {
             return self
                 .send_result(&frame, Status::ResourceExhausted, Vec::new())
                 .await;
@@ -14513,7 +14595,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         Ok(())
@@ -14589,7 +14671,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         Ok(())
@@ -15078,7 +15160,8 @@ impl Session {
             .watchers
             .iter()
             .filter_map(|(&id, watcher)| {
-                (watcher.kv_namespace == Some(request.namespace_handle)).then_some(id)
+                (watcher.kv.map(|detail| detail.namespace_handle) == Some(request.namespace_handle))
+                    .then_some(id)
             })
             .collect::<Vec<_>>();
         for id in subscriptions {
@@ -15150,6 +15233,11 @@ impl Session {
                 .await;
         }
         self.send_result(&frame, Status::Ok, body).await?;
+        let state_watch_flags = if request.state.resume.is_some() {
+            yas_wire::state::WATCH_RESUME
+        } else {
+            0
+        };
         let task = tokio::spawn(run_kv_watch(
             subscription_id,
             prefix,
@@ -15167,7 +15255,10 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: Some(request.namespace_handle),
+                kv: Some(KvWatcher {
+                    namespace_handle: request.namespace_handle,
+                    state_watch_flags,
+                }),
             },
         );
         Ok(())
@@ -16823,7 +16914,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         Ok(())
@@ -18161,7 +18252,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         self.lsp
@@ -18699,7 +18790,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         Ok(())
@@ -19232,7 +19323,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         self.git
@@ -19335,7 +19426,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         self.git
@@ -20349,7 +20440,7 @@ impl Session {
                 control,
                 task,
                 terminal_updates: None,
-                kv_namespace: None,
+                kv: None,
             },
         );
         Ok(())
@@ -23659,7 +23750,7 @@ impl Session {
                         control,
                         task,
                         terminal_updates: None,
-                        kv_namespace: None,
+                        kv: None,
                     },
                 );
                 self.fs
@@ -35602,6 +35693,17 @@ mod tests {
     }
 
     #[test]
+    fn surface_pointer_is_not_clamped_to_a_downscaled_view() {
+        // A 400-wide 1x encode can be presenting a 1200-wide native surface
+        // composited for another 3x viewer.  The browser maps the centered
+        // presentation back into native coordinates before encoding input;
+        // the per-view video size must not truncate that coordinate.
+        assert_eq!(fixed_to_surface_coordinate(1199_i64 << 32), 1199);
+        assert_eq!(fixed_to_surface_coordinate(-1_i64 << 32), 0);
+        assert_eq!(fixed_to_surface_coordinate(i64::MAX), u16::MAX);
+    }
+
+    #[test]
     fn surface_codec_selection_prefers_av1_with_h264_fallback() {
         let h264 = yas_wire::schema::surface::CODEC_H264_V1 as u16;
         let av1 = yas_wire::schema::surface::CODEC_AV1_V1 as u16;
@@ -37350,15 +37452,18 @@ mod tests {
         assert_eq!(resources.handle(family::CLIENT, 6, None), 0);
         assert_eq!(resources.handle(family::FS, 7, None), 0);
 
-        let snapshot = bounded_native_active_subscriptions(
-            Vec::new(),
-            vec![surface],
-            vec![yas_client::AuxiliarySubscription {
-                family: family::KV,
-                subscription_id: 1,
-                resource_handle: resources.handle(family::KV, 1, Some(0xf1)),
-            }],
-        );
+        let snapshot = crate::NativeYasSubscriptionSnapshot {
+            active: bounded_native_active_subscriptions(
+                Vec::new(),
+                vec![surface],
+                vec![yas_client::AuxiliarySubscription {
+                    family: family::KV,
+                    subscription_id: 1,
+                    resource_handle: resources.handle(family::KV, 1, Some(0xf1)),
+                }],
+            ),
+            auxiliary_details: yas_client::AuxiliarySubscriptionDetails::default(),
+        };
         let shared = NativeYasSubscriptions::default();
         assert!(shared.replace(snapshot.clone()));
         assert_eq!(shared.snapshot(), snapshot);
@@ -37366,7 +37471,7 @@ mod tests {
         shared.clear();
         assert_eq!(
             shared.snapshot(),
-            yas_client::ActiveSubscriptions::default()
+            crate::NativeYasSubscriptionSnapshot::default()
         );
     }
 
@@ -43577,6 +43682,7 @@ mod tests {
             .snapshot();
         assert_eq!(
             projected
+                .active
                 .terminals
                 .iter()
                 .find(|view| view.view_id == opened[0].view_id)
@@ -51139,6 +51245,40 @@ mod tests {
         )
         .await;
         assert_eq!(configured.status, Status::Ok);
+
+        // Growing beyond the preferred optional-component allowance still
+        // uses the same view when its mandatory grid fits the declared bound.
+        // This is the common floating-window maximize path.
+        assert!(terminal_view_frame_bound(100, 200) > first.max_decoded_frame);
+        assert!(terminal_view_required_frame_bound(100, 200) <= first.max_decoded_frame);
+        write_request(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CONFIGURE_VIEW,
+            141,
+            &yas_terminal::ConfigureView {
+                view_id: first.view_id,
+                configuration: yas_terminal::ViewConfiguration {
+                    rows: Some(100),
+                    cols: Some(200),
+                    max_fps: None,
+                    presentation_metrics: None,
+                    queue_target: None,
+                },
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        let grown = next_terminal_result(
+            &mut client,
+            &codec,
+            yas_wire::schema::terminal::request::CONFIGURE_VIEW,
+            141,
+            &mut pending_frames,
+        )
+        .await;
+        assert_eq!(grown.status, Status::Ok);
 
         // The view declared a frame bound sized for 12x40 and its peer holds
         // exactly that reservation. A geometry that would outgrow the bound is

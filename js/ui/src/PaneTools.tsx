@@ -2,7 +2,7 @@
  * PaneTools — the multitool in a pane's corner: a grip that drags the pane's
  * content out (drop on another pane to move it there, or on the dock to park
  * it), drops or clicks to send the toolbar itself to another corner, and the
- * ✕ that closes the content.
+ * ✕ that closes the content (and, in a layout, removes its pane).
  *
  * One component for both render paths (layout leaf panes in LayoutContainer and the
  * single-view focused view in Workspace) so the two can't drift, the same reason

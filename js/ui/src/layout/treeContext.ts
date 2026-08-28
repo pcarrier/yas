@@ -14,7 +14,11 @@ import type { SurfaceTouchMode, SurfaceZoomMode } from "../storage";
 
 import { createContext, useContext } from "solid-js";
 import type { YasTerminalSurface, TerminalPalette } from "@yas-run/core";
-import type { LayoutRect, LayoutSplit } from "@yas-run/core/layout";
+import type {
+  LayoutRect,
+  LayoutSplit,
+  WindowManager,
+} from "@yas-run/core/layout";
 
 const PANE_FOCUS_OWNER_SELECTOR =
   "[data-yas-pane-id], [data-yas-workspace-focus-owner]";
@@ -75,15 +79,19 @@ export interface LayoutTreeCtx {
   connectionId: string;
   connectionLabels?: Map<string, string>;
   multiPane: boolean;
+  /** Root manager, so a framed floating window does not also draw the pane's
+   *  hover toolbar inside its content. */
+  windowManager: WindowManager;
   /** Coarse pointer: the pane's ✕ has no hover to reveal it, so it stays up. */
   isMobileTouch?: boolean;
   /** Did this pane's occupant ask to come forward (xdg_activation_v1)?  It is
    *  answered with a ring around the pane, never by taking focus. */
   hasAttention?: (assignment: string) => boolean;
   onFocusPane: (paneId: string) => void;
-  /** Close whatever the pane holds — terminal, surface, IDE tile or web pane.
-   *  Same targets, and the same order, as Ctrl+Alt+Shift+Q. */
+  /** Close whatever the pane holds and remove the pane itself. */
   onClosePane: (paneId: string) => void;
+  /** Remove a pane while leaving its occupant alive off-screen. */
+  onBackgroundPane: (paneId: string) => void;
   onCreateInPane?: (
     paneId: string,
     command?: string,

@@ -43,6 +43,7 @@ import { lineWrap, toggleLineWrap } from "./ide/editorPrefs";
 import { FileViewSwitcher } from "./ide/FileViewSwitcher";
 import { activityDescription, activityPercent } from "./activityStatus";
 import { nextCompact } from "./statusBarFit";
+import { YasMark } from "./Logo";
 
 /** One of the status bar's right-end toggles, in either of its two homes: a
  *  bare glyph in the bar, or a labelled row in the overflow menu. */
@@ -372,28 +373,17 @@ export function StatusBar(props: {
 
   return (
     <>
-      {/* A prefix with no feedback reads as a dropped keystroke: you press
-          Ctrl+B, nothing happens, and the next key does something else. This
-          is the one place that says the workspace is waiting for it. */}
-      <Show when={prefixArmed()}>
-        <span
-          style={{
-            ...ui.badge,
-            "font-size": `${scale().xs}px`,
-            background: theme().accent,
-            color: theme().bg,
-            "font-weight": "bold",
-          }}
-          title={t("statusbar.prefixArmed")}
-        >
-          {"^B"}
-        </span>
-      </Show>
       <button
         onClick={props.onSwitcher}
-        style={iconButtonStyle()}
+        style={{
+          ...buttonStyle(),
+          display: "inline-flex",
+          "align-items": "center",
+          gap: `${scale().tightGap}px`,
+        }}
         title={t("statusbar.menuTitle")}
       >
+        <YasMark size={iconSize()} />
         {tp("statusbar.terminals", { count: visible().length })}
         <Show when={exited() > 0}>
           <span style={{ opacity: 0.65 }}>
@@ -441,6 +431,23 @@ export function StatusBar(props: {
           </span>
         </Show>
       </button>
+      {/* A prefix with no feedback reads as a dropped keystroke: you press
+          Ctrl+B, nothing happens, and the next key does something else. This
+          is the one place that says the workspace is waiting for it. */}
+      <Show when={prefixArmed()}>
+        <span
+          style={{
+            ...ui.badge,
+            "font-size": `${scale().xs}px`,
+            background: theme().accent,
+            color: theme().bg,
+            "font-weight": "bold",
+          }}
+          title={t("statusbar.prefixArmed")}
+        >
+          {"^B"}
+        </span>
+      </Show>
       <span
         ref={identityEl}
         data-status-identity=""

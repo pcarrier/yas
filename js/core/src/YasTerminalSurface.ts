@@ -1669,7 +1669,7 @@ export class YasTerminalSurface {
   /** Wire rate limit for size changes. Low enough that a drag stays
    *  roughly live, high enough not to flood the server with intermediate
    *  sizes (each one can cost an encoder rebuild for h264-software). */
-  private static readonly RESIZE_THROTTLE_MS = 80;
+  private static readonly RESIZE_THROTTLE_MS = 32;
 
   private handleResize(immediate?: boolean): void {
     if (!this.container || !this._resizable) return;

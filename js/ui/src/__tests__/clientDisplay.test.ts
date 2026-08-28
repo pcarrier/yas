@@ -130,6 +130,27 @@ describe("client subscription sizes", () => {
     );
   });
 
+  it("shows a resolved KV prefix and effective flags", () => {
+    expect(
+      formatClientSubscription(YAS_FAMILY_KV, 6n, 4, {
+        resource: new TextEncoder().encode("workspace/sessions/"),
+        requestFlags: 0,
+        stateWatchFlags: 0,
+      }),
+    ).toBe(
+      'KV namespace 6 · prefix "workspace/sessions/" · flags: none · watch #4',
+    );
+    expect(
+      formatClientSubscription(YAS_FAMILY_KV, 7n, 5, {
+        resource: new Uint8Array(),
+        requestFlags: 2,
+        stateWatchFlags: 1,
+      }),
+    ).toBe(
+      "KV namespace 7 · prefix <root> · flags: request 0x2, resume · watch #5",
+    );
+  });
+
   it("separates two watches on one resource", () => {
     expect(formatClientSubscription(YAS_FAMILY_KV, 1n, 8)).not.toBe(
       formatClientSubscription(YAS_FAMILY_KV, 1n, 9),

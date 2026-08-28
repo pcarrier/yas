@@ -198,6 +198,13 @@ export interface YasClientAuxSubscription {
   /** The watch's own ID, unique per connection. Distinguishes two watches
    * that a family points at one resource. */
   subscriptionId: number;
+  /** Family-specific resource identity when the server can resolve it. For KV
+   * this is the exact namespace prefix. */
+  resource?: Uint8Array;
+  /** Family-specific flags from the WATCH request. */
+  requestFlags?: number;
+  /** Flags from the common State WATCH envelope. */
+  stateWatchFlags?: number;
 }
 
 /** What opened a connection, as the server accounts for it. */

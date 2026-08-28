@@ -1,13 +1,39 @@
 import { describe, expect, it } from "vitest";
-import type { LayoutAssignments, SurfaceId } from "@yas-run/core";
+import type { LayoutAssignments, SurfaceId, YasSession } from "@yas-run/core";
 import { surfaceAssignment } from "../layout/store";
 import {
   createMacDeadKeyHandler,
+  hasFocusedExitedTerminal,
   hasFocusedWaylandSurface,
   isCodeMirrorInputTarget,
   nextCycleTarget,
   shouldHandleNewTerminalShortcut,
 } from "../createKeyboardShortcuts";
+
+function restartFocus(state: "running" | "exited", assignment: string | null) {
+  const session = { id: "local:1", state } as YasSession;
+  return {
+    focusedSession: () => session,
+    focusedAssignment: () => assignment,
+  };
+}
+
+describe("hasFocusedExitedTerminal", () => {
+  it("recognizes the exited terminal occupying the focused slot", () => {
+    expect(hasFocusedExitedTerminal(restartFocus("exited", "local:1"))).toBe(
+      true,
+    );
+  });
+
+  it("rejects running and background terminals", () => {
+    expect(hasFocusedExitedTerminal(restartFocus("running", "local:1"))).toBe(
+      false,
+    );
+    expect(hasFocusedExitedTerminal(restartFocus("exited", "tile:editor"))).toBe(
+      false,
+    );
+  });
+});
 
 function focusState(options: {
   surfaceId?: SurfaceId | null;

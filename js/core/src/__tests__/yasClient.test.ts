@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   YAS_CLIENT_ACTIVE_SUBSCRIPTIONS_EXTENSION,
+  YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
   YAS_CLIENT_ORIGIN_EXTENSION,
   YAS_FAMILY_FS,
   YasProtocolError,
   YasWriter,
   decodeClientActiveSubscriptions,
+  decodeClientAuxiliarySubscriptionDetails,
   type YasClientRecord,
 } from "../yas";
 
@@ -69,6 +71,7 @@ function clientRecord(): YasClientRecord {
         { family: YAS_FAMILY_FS, subscriptionId: 9, resourceHandle: 30n },
       ],
     },
+    auxiliarySubscriptionDetails: null,
     bandwidthRates: null,
   };
 }
@@ -96,5 +99,34 @@ describe("YAS Client family", () => {
         ]),
       ).toThrow(YasProtocolError);
     }
+  });
+
+  it("decodes resolved auxiliary subscription details", () => {
+    const value = new YasWriter()
+      .u16(1)
+      .u16(0)
+      .u16(YAS_FAMILY_FS)
+      .u16(1)
+      .u32(9)
+      .u32(2)
+      .bytesU16(new TextEncoder().encode("/workspace"))
+      .finish();
+    const decoded = decodeClientAuxiliarySubscriptionDetails([
+      {
+        tag: YAS_CLIENT_AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION,
+        required: false,
+        value,
+      },
+    ]);
+    expect(decoded?.entries).toHaveLength(1);
+    expect(decoded?.entries[0]).toMatchObject({
+      family: YAS_FAMILY_FS,
+      stateWatchFlags: 1,
+      subscriptionId: 9,
+      requestFlags: 2,
+    });
+    expect([...decoded!.entries[0]!.resource]).toEqual([
+      ...new TextEncoder().encode("/workspace"),
+    ]);
   });
 });

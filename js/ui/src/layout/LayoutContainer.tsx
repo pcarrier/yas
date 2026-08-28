@@ -21,6 +21,7 @@ import {
   Show,
   For,
   Index,
+  type JSX,
 } from "solid-js";
 import {
   YasTerminal,
@@ -33,6 +34,7 @@ import type {
   YasTerminalSurface,
   SessionId,
   TerminalPalette,
+  YasSurface,
 } from "@yas-run/core";
 import type {
   LayoutNode,
@@ -98,6 +100,12 @@ import { mergeStyle, themeFor, ui, uiScale, z } from "../theme";
 import { t, tp } from "../i18n";
 import { registerPrefixAction } from "../keyPrefix";
 import type { SurfaceTouchMode, SurfaceZoomMode } from "../storage";
+import {
+  floatingLayerStackingStyle,
+  floatingPaneIds,
+  floatingWindowTitle,
+} from "./floatingWindow";
+import { removePaneFromLayout } from "./paneRemoval";
 
 // The tree context lives in ./treeContext so its identity survives hot
 // reloads of this module (see that file).
@@ -224,6 +232,8 @@ export function LayoutContainer(props: {
    *  pane beside the target's current occupant (which is preserved). */
   onSplitPane?: (fn: (value: string, targetPaneId: string) => void) => void;
   onClearPaneAssignment?: (fn: (paneId: string) => void) => void;
+  /** Leave layout mode with its last occupant in the single main view. */
+  onCollapseToSingle?: (assignment: string | null) => void;
   onFocusedPaneChange?: (paneId: string | null) => void;
   onRender?: (renderMs?: number) => void;
   /** Receives each terminal pane's surface as it mounts, so hyperlink hover
@@ -846,13 +856,19 @@ export function LayoutContainer(props: {
   });
 
   function clearPaneAssignment(paneId: string) {
-    forgetPendingRef(paneId);
-    setLayoutState((prev) => {
-      if (prev.assignments[paneId] == null) return prev;
-      return {
-        ...prev,
-        assignments: { ...prev.assignments, [paneId]: null },
-      };
+    // The stable-ref capture effect observes both signals. Publish their
+    // removal atomically or it can see the old occupant after the ref is
+    // forgotten and immediately recreate the ref we just removed.
+    batch(() => {
+      forgetPendingRef(paneId);
+      if (untrack(soloedPaneId) === paneId) setSoloedPaneId(null);
+      setLayoutState((prev) => {
+        if (prev.assignments[paneId] == null) return prev;
+        return {
+          ...prev,
+          assignments: { ...prev.assignments, [paneId]: null },
+        };
+      });
     });
   }
 
@@ -860,41 +876,94 @@ export function LayoutContainer(props: {
     props.onClearPaneAssignment?.(clearPaneAssignment);
   });
 
-  /**
-   * Close whatever occupies `paneId`. The dispatch mirrors Ctrl+Alt+Shift+Q
-   * (createKeyboardShortcuts) target for target, so the ✕ and the chord can't
-   * mean different things: a tile or web pane closes its tab host-wide, a
-   * surface closes on its own connection, a terminal closes its session.
-   *
-   * An assignment that parses as none of those is an unresolved ref (a tab id
-   * or connectionId:ptyId whose session never arrived). There is nothing to
-   * close on the server, so emptying the pane is the whole job.
-   */
-  function closePane(paneId: string) {
-    const assign = layoutState().assignments[paneId] ?? null;
+  /** Close one assignment using the same resource-specific dispatch as the
+   * global close action. The caller removes its layout leaf separately. */
+  function closeAssignment(assign: string | null) {
     if (assign == null) return;
     if (isTileAssignment(assign) || isWebAssignment(assign)) {
-      clearPaneAssignment(paneId);
       props.onCloseTab?.(assign);
       return;
     }
     if (isSurfaceAssignment(assign)) {
       const parsed = parseSurfaceAssignment(assign);
       if (parsed) {
-        clearPaneAssignment(paneId);
         workspace.closeSurface(parsed.connectionId, parsed.surfaceId);
-        return;
       }
-      clearPaneAssignment(paneId);
       return;
     }
     const session = liveSessions().find((item) => item.id === assign);
-    if (!session) {
-      clearPaneAssignment(paneId);
+    if (session) void workspace.closeSession(session.id);
+  }
+
+  /**
+   * Remove a leaf from the layout. `closeContent=false` parks its occupant;
+   * true closes it. In either case the layout tree itself shrinks, so floating
+   * windows cannot turn into purposeless empty shells and tiled layouts do not
+   * accumulate dead slots.
+   */
+  function removePane(paneId: string, closeContent: boolean) {
+    const currentRoot = root();
+    const currentPanes = enumeratePanes(currentRoot);
+    const previous = layoutState();
+    const removed = previous.assignments[paneId] ?? null;
+    if (closeContent) closeAssignment(removed);
+
+    // A layout-mounted container should have at least two leaves, but keep the
+    // operation well-defined during a concurrent external layout collapse.
+    if (currentPanes.length <= 1) {
+      if (!closeContent) clearPaneAssignment(paneId);
       return;
     }
-    clearPaneAssignment(paneId);
-    void workspace.closeSession(session.id);
+
+    const nextRoot = removePaneFromLayout(currentRoot, paneId);
+    if (!nextRoot || nextRoot === currentRoot) return;
+    const survivingPanes = currentPanes.filter((pane) => pane.id !== paneId);
+    const nextPanes = enumeratePanes(nextRoot);
+    const nextAssignments = carryAssignmentsToPanes({
+      currentPanes: survivingPanes,
+      nextPanes,
+      previous,
+      liveSessionIds: liveSessionIds(),
+    });
+    const nextPending: Record<string, string> = {};
+    for (let index = 0; index < survivingPanes.length; index++) {
+      const ref = pendingRefs[survivingPanes[index].id];
+      const target = nextPanes[index];
+      if (ref && target) nextPending[target.id] = ref;
+    }
+
+    if (nextPanes.length === 1) {
+      props.onCollapseToSingle?.(
+        nextAssignments.assignments[nextPanes[0].id] ?? null,
+      );
+      return;
+    }
+
+    const removedIndex = Math.max(
+      0,
+      currentPanes.findIndex((pane) => pane.id === paneId),
+    );
+    const nextFocus =
+      nextPanes[Math.min(removedIndex, nextPanes.length - 1)]?.id ??
+      nextPanes[0]?.id ??
+      null;
+    batch(() => {
+      pendingRefs = nextPending;
+      touchPendingRefs();
+      setSoloedPaneId(null);
+      setRaiseOrder([]);
+      setLayoutState(nextAssignments);
+      updateRoot(nextRoot);
+      setFocusedPaneId(nextFocus);
+    });
+  }
+
+  function closePane(paneId: string) {
+    removePane(paneId, true);
+  }
+
+  function backgroundPane(paneId: string) {
+    removePane(paneId, false);
   }
 
   function focusPane(paneId: string) {
@@ -953,6 +1022,8 @@ export function LayoutContainer(props: {
       ["m", cycleWindowManager, t("help.windowManager")],
       ["-", () => resizeColumn(1 / 1.25), t("help.narrowColumn")],
       ["=", () => resizeColumn(1.25), t("help.widenColumn")],
+      ["q", () => fpId && backgroundPane(fpId), t("help.removeFromPane")],
+      ["x", () => fpId && closePane(fpId), t("pane.close")],
     ];
     const unbind = bindings.map(([token, run, label]) =>
       registerPrefixAction(token, run, label),
@@ -1133,9 +1204,8 @@ export function LayoutContainer(props: {
       if (!fsId) return;
       const session = live.find((item) => item.id === fsId);
       if (!session || session.state !== "exited") return;
-      // Restart is Ctrl+B Enter, like every other action. Escape is not an
-      // action: it dismisses what is in front of you, and asking for a prefix
-      // to get out of something is the one place a prefix reads as a trap.
+      // Enter restarts the terminal named by the banner. Escape dismisses what
+      // is in front of you; neither action needs the workspace prefix.
       if (event.key === "Escape") {
         event.preventDefault();
         // Immediately clear the pane assignment so the exited terminal
@@ -1172,6 +1242,9 @@ export function LayoutContainer(props: {
     get multiPane() {
       return multiPane();
     },
+    get windowManager() {
+      return windowManagerOf(root());
+    },
     get isMobileTouch() {
       return props.isMobileTouch;
     },
@@ -1186,6 +1259,7 @@ export function LayoutContainer(props: {
     },
     onFocusPane: focusPane,
     onClosePane: closePane,
+    onBackgroundPane: backgroundPane,
     get onCreateInPane() {
       return props.onCreateInPane;
     },
@@ -1676,7 +1750,10 @@ function LeafPane(props: {
           a pane still resolving a tab ref falls through to EmptyPane, which
           has nothing to close. */}
       <Show
-        when={tileParsed() || webParsed() || isSurface() || session() != null}
+        when={
+          ctx.windowManager !== "floating" &&
+          (tileParsed() || webParsed() || isSurface() || session() != null)
+        }
       >
         <PaneTools
           theme={theme()}
@@ -1760,6 +1837,7 @@ function LeafPane(props: {
                 <EmptyPane
                   paneId={props.paneId}
                   isFocused={props.isFocused}
+                  showHint={!ctx.multiPane}
                   theme={theme()}
                   palette={ctx.palette}
                   fontSize={ctx.fontSize}
@@ -1833,7 +1911,7 @@ function LeafPane(props: {
                       onClick={() => workspace.restartSession(props.sessionId!)}
                       style={{ ...ui.btn, "font-size": `${scale().sm}px` }}
                     >
-                      {t("pane.restart")} <kbd style={ui.kbd}>Ctrl+B Enter</kbd>
+                      {t("pane.restart")} <kbd style={ui.kbd}>Enter</kbd>
                     </button>
                   </Show>
                   <button
@@ -1858,6 +1936,7 @@ function LeafPane(props: {
               <EmptyPane
                 paneId={props.paneId}
                 isFocused={props.isFocused}
+                showHint={!ctx.multiPane}
                 theme={theme()}
                 palette={ctx.palette}
                 fontSize={ctx.fontSize}
@@ -2040,6 +2119,42 @@ function FloatingLayer(props: {
   const ctx = useLayoutTree();
   const theme = () => themeFor(ctx.palette);
   const scale = () => uiScale(ctx.fontSize);
+  const workspace = createYasWorkspace();
+  const sessions = createYasSessions(workspace);
+  const workspaceState = createYasWorkspaceState(workspace);
+  const connectionKey = createMemo(() =>
+    workspaceState()
+      .connections.map((connection) => connection.id)
+      .sort()
+      .join("\u0000"),
+  );
+  const [surfaceRevision, setSurfaceRevision] = createSignal(0);
+  createEffect(() => {
+    connectionKey();
+    const releases: (() => void)[] = [];
+    for (const connection of untrack(() => workspaceState().connections)) {
+      const live = workspace.getConnection(connection.id);
+      if (live) {
+        releases.push(
+          live.surfaceStore.onChange(() =>
+            setSurfaceRevision((revision) => revision + 1),
+          ),
+        );
+      }
+    }
+    onCleanup(() => releases.forEach((release) => release()));
+  });
+  const surfaceFor = (assignment: string): YasSurface | null => {
+    surfaceRevision();
+    const parsed = parseSurfaceAssignment(assignment);
+    if (!parsed) return null;
+    return (
+      workspace
+        .getConnection(parsed.connectionId)
+        ?.surfaceStore.getSurfaces()
+        .get(parsed.surfaceId) ?? null
+    );
+  };
   let layer!: HTMLDivElement;
   // The frame being dragged, so the window follows the pointer without a
   // round trip through the serialized layout on every pointermove.
@@ -2103,74 +2218,184 @@ function FloatingLayer(props: {
         width: "100%",
         height: "100%",
         overflow: "hidden",
+        ...floatingLayerStackingStyle,
       }}
     >
       <Index each={props.split.children}>
         {(child, index) => {
-          const rect = () => rectOf(child(), index);
+          const paneIds = () =>
+            floatingPaneIds(child().node, [...props.path, index]);
+          const paneId = () => {
+            const ids = paneIds();
+            const focused = props.focusedPaneId;
+            if (focused && ids.includes(focused)) return focused;
+            return (
+              ids.find((id) => props.assignments[id] != null) ??
+              ids[0] ??
+              props.paneIdAt(index)
+            );
+          };
+          const assignment = () => props.assignments[paneId()] ?? null;
+          const occupied = () =>
+            paneIds().some((id) => props.assignments[id] != null);
+          const soloed = () =>
+            ctx.soloedPaneId != null && paneIds().includes(ctx.soloedPaneId);
+          const hidden = () =>
+            ctx.soloedPaneId != null && !paneIds().includes(ctx.soloedPaneId);
+          const rect = () =>
+            soloed()
+              ? { x: 0, y: 0, width: 100, height: 100 }
+              : rectOf(child(), index);
           const focused = () => props.holdsFocus(index);
+          const title = () => {
+            const value = assignment();
+            return value
+              ? floatingWindowTitle(value, sessions(), surfaceFor(value))
+              : "";
+          };
+          const frameButton = (): JSX.CSSProperties => ({
+            ...ui.btn,
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "center",
+            width: `${scale().md * 2}px`,
+            height: "100%",
+            padding: 0,
+            color: theme().fg,
+            "background-color": theme().solidPanelBg,
+            border: "none",
+            "border-left": `1px solid ${theme().border}`,
+            "border-radius": "0",
+            opacity: 1,
+            "font-size": `${scale().md}px`,
+            "touch-action": "manipulation",
+          });
           return (
-            <div
-              style={{
-                position: "absolute",
-                left: `${rect().x}%`,
-                top: `${rect().y}%`,
-                width: `${rect().width}%`,
-                height: `${rect().height}%`,
-                display: "flex",
-                "flex-direction": "column",
-                overflow: "hidden",
-                "border-radius": `${scale().tightGap}px`,
-                border: `1px solid ${focused() ? theme().accent : theme().border}`,
-                "box-shadow": focused()
-                  ? "0 10px 30px rgba(0,0,0,.45)"
-                  : "0 4px 14px rgba(0,0,0,.30)",
-                background: theme().bg,
-                // Focus wins over recency, so the window you are typing in is
-                // never behind the one you last dragged.
-                "z-index":
-                  (focused() ? 1_000 : 0) +
-                  ctx.floatingDepth(props.paneIdAt(index)),
-              }}
-              onPointerDown={() => ctx.onRaisePane(props.paneIdAt(index))}
-            >
+            <Show when={occupied()}>
               <div
-                role="presentation"
-                onPointerDown={(event) => drag(event, index, rect(), "move")}
-                style={{
-                  height: `${scale().controlY * 2 + 4}px`,
-                  flex: "0 0 auto",
-                  cursor: "move",
-                  background: focused()
-                    ? theme().selectedBg
-                    : theme().solidPanelBg,
-                  "border-bottom": `1px solid ${theme().border}`,
-                  "touch-action": "none",
-                }}
-              />
-              <div style={{ flex: 1, position: "relative", "min-height": 0 }}>
-                <PaneNode
-                  node={child().node}
-                  assignments={props.assignments}
-                  focusedPaneId={props.focusedPaneId}
-                  visible={props.visible}
-                  path={[...props.path, index]}
-                />
-              </div>
-              <div
-                role="presentation"
-                onPointerDown={(event) => drag(event, index, rect(), "resize")}
                 style={{
                   position: "absolute",
-                  right: 0,
-                  bottom: 0,
-                  width: `${scale().controlX * 2}px`,
-                  height: `${scale().controlX * 2}px`,
-                  cursor: "nwse-resize",
-                  "touch-action": "none",
+                  left: `${rect().x}%`,
+                  top: `${rect().y}%`,
+                  width: `${rect().width}%`,
+                  height: `${rect().height}%`,
+                  display: hidden() ? "none" : "flex",
+                  "flex-direction": "column",
+                  overflow: "hidden",
+                  "border-radius": soloed() ? "0" : `${scale().tightGap}px`,
+                  border: `1px solid ${focused() ? theme().accent : theme().border}`,
+                  "box-shadow": "none",
+                  background: theme().bg,
+                  // Focus wins over recency, so the window you are typing in is
+                  // never behind the one you last dragged.
+                  "z-index":
+                    (focused() ? 1_000 : 0) +
+                    ctx.floatingDepth(props.paneIdAt(index)),
                 }}
-              />
-            </div>
+                onPointerDown={() => ctx.onRaisePane(props.paneIdAt(index))}
+              >
+                <div
+                  role="presentation"
+                  onPointerDown={(event) => {
+                    if (!soloed()) drag(event, index, rect(), "move");
+                  }}
+                  style={{
+                    height: `${scale().md * 2}px`,
+                    flex: "0 0 auto",
+                    display: "flex",
+                    "align-items": "center",
+                    cursor: soloed() ? "default" : "move",
+                    "background-color": focused()
+                      ? theme().selectedBg
+                      : theme().solidPanelBg,
+                    color: theme().fg,
+                    "border-bottom": `1px solid ${theme().border}`,
+                    "touch-action": "none",
+                    "font-size": `${scale().sm}px`,
+                  }}
+                >
+                  <div
+                    title={title()}
+                    style={{
+                      flex: 1,
+                      "min-width": 0,
+                      padding: `0 ${scale().controlX}px`,
+                      overflow: "hidden",
+                      "text-overflow": "ellipsis",
+                      "white-space": "nowrap",
+                      "font-weight": focused() ? 600 : 400,
+                    }}
+                  >
+                    {title()}
+                  </div>
+                  <button
+                    type="button"
+                    title={t("help.removeFromPane")}
+                    aria-label={t("help.removeFromPane")}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      ctx.onBackgroundPane(paneId());
+                    }}
+                    style={frameButton()}
+                  >
+                    −
+                  </button>
+                  <button
+                    type="button"
+                    title={soloed() ? t("pane.unsolo") : t("pane.solo")}
+                    aria-label={soloed() ? t("pane.unsolo") : t("pane.solo")}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      ctx.onToggleSolo(paneId());
+                    }}
+                    style={frameButton()}
+                  >
+                    {soloed() ? "❐" : "□"}
+                  </button>
+                  <button
+                    type="button"
+                    title={t("pane.close")}
+                    aria-label={t("pane.close")}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      ctx.onClosePane(paneId());
+                    }}
+                    style={frameButton()}
+                  >
+                    ×
+                  </button>
+                </div>
+                <div style={{ flex: 1, position: "relative", "min-height": 0 }}>
+                  <PaneNode
+                    node={child().node}
+                    assignments={props.assignments}
+                    focusedPaneId={props.focusedPaneId}
+                    visible={props.visible && !hidden()}
+                    path={[...props.path, index]}
+                  />
+                </div>
+                <Show when={!soloed()}>
+                  <div
+                    role="presentation"
+                    onPointerDown={(event) =>
+                      drag(event, index, rect(), "resize")
+                    }
+                    style={{
+                      position: "absolute",
+                      right: 0,
+                      bottom: 0,
+                      width: `${scale().controlX * 2}px`,
+                      height: `${scale().controlX * 2}px`,
+                      cursor: "nwse-resize",
+                      "touch-action": "none",
+                    }}
+                  />
+                </Show>
+              </div>
+            </Show>
           );
         }}
       </Index>
@@ -2181,6 +2406,7 @@ function FloatingLayer(props: {
 export function EmptyPane(props: {
   paneId: string;
   isFocused: boolean;
+  showHint?: boolean;
   theme: Theme;
   palette: TerminalPalette;
   fontSize: number;
@@ -2222,7 +2448,7 @@ export function EmptyPane(props: {
         outline: "none",
       }}
     >
-      Start with C-b
+      <Show when={props.showHint !== false}>Start with C-b</Show>
     </div>
   );
 }

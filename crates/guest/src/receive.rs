@@ -3,7 +3,10 @@
 use alloc::rc::Rc;
 use core::cell::Cell;
 
-pub(crate) const DEFAULT_STATE_WINDOW: u64 = 1024 * 1024;
+/// Automatic sliding window for metadata/state streams. This is large enough
+/// for low-latency batching while allowing dozens of idle resources to share
+/// the session aggregate without caller-managed packing.
+pub(crate) const DEFAULT_STATE_WINDOW: u64 = 256 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 struct State {
@@ -170,12 +173,15 @@ mod tests {
 
     #[test]
     fn state_channel_and_finite_collectors_share_one_aggregate() {
+        const KIB: u64 = 1024;
         const MIB: u64 = 1024 * 1024;
         let budget = Budget::new(16 * MIB);
-        let mut terminal_state = budget.lease_exact(MIB).unwrap();
-        let mut surface_state = budget.lease_exact(MIB).unwrap();
-        let mut fs_state = budget.lease_exact(MIB).unwrap();
-        let mut channel = budget.lease_exact(4 * MIB).unwrap();
+        let mut terminal_state = budget.lease_exact(DEFAULT_STATE_WINDOW).unwrap();
+        let mut surface_state = budget.lease_exact(DEFAULT_STATE_WINDOW).unwrap();
+        let mut fs_state = budget.lease_exact(DEFAULT_STATE_WINDOW).unwrap();
+        let mut channel = budget
+            .lease_exact(crate::channel::DEFAULT_RECEIVE_WINDOW)
+            .unwrap();
         for lease in [
             &mut terminal_state,
             &mut surface_state,
@@ -185,12 +191,12 @@ mod tests {
             lease.commit();
         }
         let finite = budget.lease_up_to(16 * MIB);
-        assert_eq!(finite.bytes(), 9 * MIB);
+        assert_eq!(finite.bytes(), 14 * MIB + 256 * KIB);
         assert!(budget.lease_exact(1).is_none());
         drop(finite);
-        assert_eq!(budget.available(), 9 * MIB);
+        assert_eq!(budget.available(), 14 * MIB + 256 * KIB);
         channel.release();
-        assert_eq!(budget.available(), 13 * MIB);
+        assert_eq!(budget.available(), 15 * MIB + 256 * KIB);
     }
 
     #[test]
@@ -199,14 +205,18 @@ mod tests {
         let budget = Budget::new(16 * MIB);
         let mut granted = alloc::vec::Vec::new();
         for _ in 0..128 {
-            if let Some(mut lease) = budget.lease_exact(4 * MIB) {
+            if let Some(mut lease) = budget.lease_exact(crate::channel::DEFAULT_RECEIVE_WINDOW) {
                 lease.commit();
                 granted.push(lease);
             }
         }
-        assert_eq!(granted.len(), 4);
+        assert_eq!(granted.len(), 16);
         assert_eq!(budget.available(), 0);
         granted[0].release();
-        assert!(budget.lease_exact(4 * MIB).is_some());
+        assert!(
+            budget
+                .lease_exact(crate::channel::DEFAULT_RECEIVE_WINDOW)
+                .is_some()
+        );
     }
 }

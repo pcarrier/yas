@@ -59,6 +59,12 @@ Four native YAS families do the work, none of which the extension could fake:
   in bounded native query pages. It starts no shell helper and carries no
   compatibility command packets.
 
+Each existing XDG `applications` directory is also watched through native FS.
+The first settled mutation invalidates and reloads the whole precedence-aware
+catalog, then rearms that directory; this collapses a package transaction into
+one coherent refresh. Missing/new roots and lost platform watches are retried
+by the 60-second fallback refresh.
+
 ## Why `status` can be trusted
 
 `windows` is counted from the `application_id` in the native Surface catalogue,

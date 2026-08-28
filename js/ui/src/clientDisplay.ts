@@ -19,7 +19,9 @@ import {
   YAS_FAMILY_SURFACE,
   YAS_FAMILY_TERMINAL,
   YAS_FAMILY_TRANSFER,
+  YAS_STATE_WATCH_RESUME,
   formatExtensionId,
+  type YasClientAuxSubscription,
   type YasClientInfo,
 } from "@yas-run/core";
 
@@ -208,14 +210,64 @@ export function formatClientSubscription(
   kind: number,
   id: bigint,
   subscriptionId: number,
+  detail?: Pick<
+    YasClientAuxSubscription,
+    "resource" | "requestFlags" | "stateWatchFlags"
+  >,
 ): string {
   const watch = `watch #${subscriptionId}`;
   const family = FAMILY_LABELS[kind] ?? `Family ${kind}`;
   const resource = FAMILY_RESOURCE[kind];
+  const diagnostics = formatSubscriptionDiagnostics(kind, detail);
   // KV namespace 0 is a handle the peer really opened; an FS/Git/LSP watch the
   // server has no mapping for reports zero, and there the noun is dropped.
   if (resource && (id !== 0n || kind === YAS_FAMILY_KV)) {
-    return `${family} ${resource} ${id} · ${watch}`;
+    return `${family} ${resource} ${id}${diagnostics} · ${watch}`;
   }
-  return `${family} · ${watch}`;
+  return `${family}${diagnostics} · ${watch}`;
+}
+
+function formatSubscriptionDiagnostics(
+  kind: number,
+  detail:
+    | Pick<
+        YasClientAuxSubscription,
+        "resource" | "requestFlags" | "stateWatchFlags"
+      >
+    | undefined,
+): string {
+  if (!detail) return "";
+  const parts: string[] = [];
+  if (detail.resource !== undefined) {
+    const label = formatResourceBytes(detail.resource);
+    parts.push(kind === YAS_FAMILY_KV ? `prefix ${label}` : `resource ${label}`);
+  }
+  if (
+    detail.requestFlags !== undefined ||
+    detail.stateWatchFlags !== undefined
+  ) {
+    const flags: string[] = [];
+    const requestFlags = detail.requestFlags ?? 0;
+    const stateFlags = detail.stateWatchFlags ?? 0;
+    if (requestFlags !== 0) flags.push(`request 0x${requestFlags.toString(16)}`);
+    if (stateFlags & YAS_STATE_WATCH_RESUME) flags.push("resume");
+    const unknownStateFlags = stateFlags & ~YAS_STATE_WATCH_RESUME;
+    if (unknownStateFlags !== 0)
+      flags.push(`state 0x${unknownStateFlags.toString(16)}`);
+    parts.push(`flags: ${flags.join(", ") || "none"}`);
+  }
+  return parts.length === 0 ? "" : ` · ${parts.join(" · ")}`;
+}
+
+const resourceDecoder = new TextDecoder("utf-8", { fatal: true });
+
+function formatResourceBytes(resource: Uint8Array): string {
+  if (resource.length === 0) return "<root>";
+  try {
+    return JSON.stringify(resourceDecoder.decode(resource));
+  } catch {
+    return `0x${[...resource]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("")}`;
+  }
 }

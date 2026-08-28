@@ -20,7 +20,10 @@ use yas_wire::{Class, Decode, Encode, Extensions, Frame, FrameHeader, family};
 use crate::yas_native::{NativeClient, NativeFrameReader, NativeFrameSender};
 
 const STDIN_CHUNK: usize = 64 * 1024;
-const RECEIVE_WINDOW: u64 = 4 * 1024 * 1024;
+// Command frames are bounded, incremental output—not bulk file transfer. A
+// 1 MiB item/window keeps invocations reliable when an extension also owns
+// several long-lived state watches without weakening aggregate backpressure.
+const RECEIVE_WINDOW: u64 = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(31);
 
 const COMMAND_CLIENT_INVOKE: u8 = 1;

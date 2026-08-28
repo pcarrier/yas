@@ -47,9 +47,17 @@ type OpenState = {
   present: boolean;
   nextAttempt: number;
   opening: { id: number; cancelled: boolean; closed: boolean } | null;
+  /** Re-open after an unexpected channel close even when CHANNEL_WATCH keeps
+   *  reporting the name continuously present (extension attempt swaps can do
+   *  exactly that). */
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  retryDelayMs: number;
   /** Stops the `CHANNEL_WATCH` follow for this connection. */
   stopChannelWatch: (() => void) | null;
 };
+
+const SESSION_CATALOG_RETRY_MIN_MS = 50;
+const SESSION_CATALOG_RETRY_MAX_MS = 2_000;
 
 const opens = new Map<ConnectionId, OpenState>();
 /** Catalogs are proactive (opened before the switcher is shown), so cap the
@@ -106,6 +114,8 @@ export function ensureSessionCatalog(
     present: false,
     nextAttempt: 0,
     opening: null,
+    retryTimer: null,
+    retryDelayMs: SESSION_CATALOG_RETRY_MIN_MS,
     stopChannelWatch: null,
   };
   opens.set(connectionId, state);
@@ -117,9 +127,33 @@ export function ensureSessionCatalog(
     state.present = false;
     if (state.opening) state.opening.cancelled = true;
     state.opening = null;
+    if (state.retryTimer !== null) clearTimeout(state.retryTimer);
+    state.retryTimer = null;
     stopWatch?.();
     closeInstalled(state);
     if (opens.get(connectionId) === state) opens.delete(connectionId);
+  };
+
+  const scheduleOpen = (): void => {
+    if (
+      !live ||
+      !state.present ||
+      state.handle !== null ||
+      state.opening !== null ||
+      state.retryTimer !== null ||
+      opens.get(connectionId) !== state
+    ) {
+      return;
+    }
+    const delay = state.retryDelayMs;
+    state.retryDelayMs = Math.min(
+      SESSION_CATALOG_RETRY_MAX_MS,
+      state.retryDelayMs * 2,
+    );
+    state.retryTimer = setTimeout(() => {
+      state.retryTimer = null;
+      beginOpen();
+    }, delay);
   };
 
   const beginOpen = (): void => {
@@ -152,6 +186,10 @@ export function ensureSessionCatalog(
           opened.close();
           bump();
         }
+        // A replacement extension attempt can inherit the listener name with
+        // no absent/present edge. CHANNEL_WATCH therefore has nothing new to
+        // tell us; the closed data channel itself must re-arm the catalog.
+        scheduleOpen();
       },
     })
       .then((handle) => {
@@ -171,12 +209,14 @@ export function ensureSessionCatalog(
         state.opening = null;
         state.handle = handle;
         state.stopHandleSubscription = handle.subscribe(bump);
+        state.retryDelayMs = SESSION_CATALOG_RETRY_MIN_MS;
         bump();
       })
       .catch(() => {
         if (state.opening === attempt) state.opening = null;
-        // A refused open is transient while the channel is flapping; the next
-        // presence update will retry.
+        // A refused open is transient while the listener is being replaced.
+        // Presence may stay continuously true, so retry it ourselves.
+        scheduleOpen();
       });
   };
 
@@ -189,6 +229,9 @@ export function ensureSessionCatalog(
       state.present = false;
       if (state.opening) state.opening.cancelled = true;
       state.opening = null;
+      if (state.retryTimer !== null) clearTimeout(state.retryTimer);
+      state.retryTimer = null;
+      state.retryDelayMs = SESSION_CATALOG_RETRY_MIN_MS;
       if (closeInstalled(state)) bump();
     }
   }).then((release) => {

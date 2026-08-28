@@ -55,3 +55,11 @@ until session teardown. A Channel's in-memory complete-message bound is its
 negotiated `max_item_bytes`, and the SDK accepts the Channel only when it can
 reserve that full amount. Application messages larger than that bound are not
 made safe merely by fragmenting their wire representation.
+
+Convenience methods select workload-sized sliding windows automatically:
+metadata/state streams use 256 KiB and ordinary message Channels use 1 MiB.
+They share the session aggregate, so idle resources no longer consume several
+megabytes apiece or force routine callers to solve a packing problem. Advanced
+callers with genuinely larger atomic messages can opt into a larger Channel
+window. Routed admission pressure resets only the new endpoint with
+`ResourceExhausted`; it does not fail the listener event loop.

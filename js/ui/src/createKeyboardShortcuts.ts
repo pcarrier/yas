@@ -107,6 +107,19 @@ type SurfaceFocusHandlers = Pick<
   "inLayout" | "focusedSurfaceId" | "layoutFocusedPaneId" | "layoutAssignments"
 >;
 
+type RestartFocusHandlers = Pick<
+  KeyboardShortcutHandlers,
+  "focusedAssignment" | "focusedSession"
+>;
+
+/** The exited terminal must still occupy the focused slot. Core retains a
+ * focused session behind editors and surfaces, so session state alone is not
+ * enough to decide that bare Enter belongs to the restart action. */
+export function hasFocusedExitedTerminal(h: RestartFocusHandlers): boolean {
+  const session = h.focusedSession();
+  return session?.state === "exited" && h.focusedAssignment() === session.id;
+}
+
 /**
  * Whether keyboard input currently belongs to a Wayland surface.
  *
@@ -533,10 +546,6 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       ["h", () => h.splitFocused("horizontal"), t("help.splitBeside")],
       ["v", () => h.splitFocused("vertical"), t("help.splitBelow")],
       ["m", h.cycleWindowManager, t("help.windowManager")],
-      // Restarting an exited pane is an action like any other. Bare Enter
-      // belongs to whatever is in the pane, even when what is in it has
-      // exited: a dead shell still owns its scrollback and its keyboard.
-      ["Enter", () => h.handleRestartOrClose(), t("help.restartExited")],
     ];
     const unbind = bindings.map(([token, run, label]) =>
       registerPrefixAction(token, run, label),
@@ -555,6 +564,25 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       if (handlePrefixKey(e)) {
         e.preventDefault();
         e.stopImmediatePropagation();
+        return;
+      }
+
+      // An exited terminal cannot consume input, and the action displayed in
+      // its banner is deliberately immediate. Leave Enter on an actual button
+      // alone so keyboard activation of Close still means Close.
+      if (
+        e.key === "Enter" &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        !e.shiftKey &&
+        !h.overlay() &&
+        hasFocusedExitedTerminal(h) &&
+        !eventElement(e.target)?.closest("button")
+      ) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        h.handleRestartOrClose();
         return;
       }
 

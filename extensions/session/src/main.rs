@@ -144,10 +144,8 @@ yas_guest::entry!(run);
 
 /// How long the installed catalog is trusted before it is read again.
 ///
-/// It is not watched, so without this a package installed after the extension
-/// started stays invisible to `list` and `enable` for the whole session. A
-/// minute is short enough that installing something and reaching for it works,
-/// and long enough that the read never lands on a hot path.
+/// Native watches are the primary refresh path. This is a fallback for roots
+/// that appear after startup or a platform watcher that is lost.
 const CATALOG_TTL: Duration = Duration::from_secs(60);
 
 /// Most icons a panel may ask for in one request.
@@ -177,6 +175,11 @@ const MAX_ICON_REQUEST: usize = 48;
 /// third. Below that a single scroll of big artwork is guaranteed to clear the
 /// cache it is still filling, which costs a re-read of everything it just did.
 const MAX_CACHED_ICON_BYTES: usize = 12 * 1024 * 1024;
+
+/// GUI diagnostics are consumed and discarded as they arrive. A small
+/// replenished window prevents every open application from pinning the guest
+/// SDK's 4 MiB general-purpose Process default.
+const APP_PROCESS_STREAM_WINDOW: u64 = 64 * 1024;
 
 /// Icon messages a connection may have waiting on credit.
 ///
@@ -275,6 +278,9 @@ struct State {
     conns: Vec<Conn>,
     /// Attached stream resources for supervised native Process handles.
     processes: BTreeMap<u64, Process>,
+    /// One-shot launcher children, separate from the process (if any) whose
+    /// lifetime represents an enabled application's supervision state.
+    transient_process_apps: BTreeMap<u64, (String, Option<String>)>,
     /// Surface application endpoints retained until their spawned process
     /// exits. `SPAWN` copies the endpoint environment, but the child may not
     /// have connected to its Wayland socket when that request returns.
@@ -300,91 +306,98 @@ impl State {
 }
 
 fn run(mut client: Client) -> Result<(), Error> {
-    let mut state = State {
-        apps: BTreeMap::new(),
-        installed: BTreeMap::new(),
-        catalog_roots: Vec::new(),
-        catalog_watches: Vec::new(),
-        catalog_revision: 0,
-        installed_at_ns: None,
-        icon_theme_roots: Vec::new(),
-        icon_flat_roots: Vec::new(),
-        icon_dirs: Vec::new(),
-        icons: BTreeMap::new(),
-        icon_bytes: 0,
-        surface_apps: BTreeMap::new(),
-        boot_id: client.hello().boot_id,
-        data_listener: None,
-        conns: Vec::new(),
-        processes: BTreeMap::new(),
-        process_app_endpoints: BTreeMap::new(),
-        kv: None,
-    };
-
-    // Intent outlives the server, so restore it before anything else. A failure
-    // here is not fatal: serving `list` with no catalog is better than not
-    // coming up at all.
-    if let Err(error) = restore(&mut client, &mut state) {
-        let _ = error;
-    }
-
-    let listener_name = format!(
-        "yas.cli.{:016x}.{}",
-        client.context().extension_handle,
-        client.context().attempt
-    );
-    let listener = client.listen_channel(&listener_name, b"")?;
-    let mut provider = CommandProvider::register(&mut client, listener, DESCRIPTOR)?;
-    let mut process_watch = client.watch_processes(None)?;
-    let mut surface_watch = client.watch_surfaces(None)?;
-
-    // Publishing the browser panel Channel is not fatal if another attempt
-    // already owns the name; command supervision remains useful.
-    state.data_listener = client.listen_channel(CHANNEL_NAME, b"").ok();
-    // Anything already enabled starts now.
-    reconcile(&mut client, &mut state);
-    publish(&mut client, &mut state);
-
-    loop {
-        let now = client.monotonic_now();
-        let pending = next_deadline_ns(state.apps.values());
-        let deadline = match pending {
-            Some(ns) => yas_guest::MonotonicInstant::from_raw_nanos(ns.max(now.raw_nanos())),
-            // Nothing pending: wake periodically anyway, so a missed
-            // notification cannot wedge the supervisor for the whole session.
-            None => now + Duration::from_secs(30),
+    let result = (|| -> Result<(), Error> {
+        let mut state = State {
+            apps: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            catalog_roots: Vec::new(),
+            catalog_watches: Vec::new(),
+            catalog_revision: 0,
+            installed_at_ns: None,
+            icon_theme_roots: Vec::new(),
+            icon_flat_roots: Vec::new(),
+            icon_dirs: Vec::new(),
+            icons: BTreeMap::new(),
+            icon_bytes: 0,
+            surface_apps: BTreeMap::new(),
+            boot_id: client.hello().boot_id,
+            data_listener: None,
+            conns: Vec::new(),
+            processes: BTreeMap::new(),
+            transient_process_apps: BTreeMap::new(),
+            process_app_endpoints: BTreeMap::new(),
+            kv: None,
         };
-        match client.next_event_until(deadline)? {
-            None => {
-                reconcile(&mut client, &mut state);
-                publish(&mut client, &mut state);
-            }
-            Some(frame) => {
-                // A CLI invocation is the provider's; every other typed Event
-                // is offered to the exact listener/resource that owns it.
-                match provider.offer_frame(&mut client, &frame)? {
-                    Some(ProviderEvent::Invocation(invocation)) => {
-                        serve(&mut client, &mut state, *invocation)?;
-                        reconcile(&mut client, &mut state);
-                        publish(&mut client, &mut state);
-                    }
-                    Some(ProviderEvent::Closed(_)) => return Ok(()),
-                    None => {
-                        if route_frame(
-                            &mut client,
-                            &mut state,
-                            &mut process_watch,
-                            &mut surface_watch,
-                            &frame,
-                        )? {
+
+        // Intent outlives the server, so restore it before anything else. A failure
+        // here is not fatal: serving `list` with no catalog is better than not
+        // coming up at all.
+        if let Err(error) = restore(&mut client, &mut state) {
+            let _ = error;
+        }
+
+        let listener_name = format!(
+            "yas.cli.{:016x}.{}",
+            client.context().extension_handle,
+            client.context().attempt
+        );
+        let listener = client.listen_channel(&listener_name, b"")?;
+        let mut provider = CommandProvider::register(&mut client, listener, DESCRIPTOR)?;
+        let mut process_watch = client.watch_processes(None)?;
+        let mut surface_watch = client.watch_surfaces(None)?;
+
+        // Publishing the browser panel Channel is not fatal if another attempt
+        // already owns the name; command supervision remains useful.
+        state.data_listener = client.listen_channel(CHANNEL_NAME, b"").ok();
+        // Anything already enabled starts now.
+        reconcile(&mut client, &mut state);
+        publish(&mut client, &mut state);
+
+        loop {
+            let now = client.monotonic_now();
+            let pending = next_deadline_ns(state.apps.values());
+            let deadline = match pending {
+                Some(ns) => yas_guest::MonotonicInstant::from_raw_nanos(ns.max(now.raw_nanos())),
+                // Nothing pending: wake periodically anyway, so a missed
+                // notification cannot wedge the supervisor for the whole session.
+                None => now + Duration::from_secs(30),
+            };
+            match client.next_event_until(deadline)? {
+                None => {
+                    reconcile(&mut client, &mut state);
+                    publish(&mut client, &mut state);
+                }
+                Some(frame) => {
+                    // A CLI invocation is the provider's; every other typed Event
+                    // is offered to the exact listener/resource that owns it.
+                    match provider.offer_frame(&mut client, &frame)? {
+                        Some(ProviderEvent::Invocation(invocation)) => {
+                            serve(&mut client, &mut state, *invocation)?;
                             reconcile(&mut client, &mut state);
                             publish(&mut client, &mut state);
+                        }
+                        Some(ProviderEvent::Closed(_)) => return Ok(()),
+                        None => {
+                            if route_frame(
+                                &mut client,
+                                &mut state,
+                                &mut process_watch,
+                                &mut surface_watch,
+                                &frame,
+                            )? {
+                                reconcile(&mut client, &mut state);
+                                publish(&mut client, &mut state);
+                            }
                         }
                     }
                 }
             }
         }
+    })();
+    if let Err(error) = &result {
+        let _ = client.attempt_log(&error.to_string());
     }
+    result
 }
 
 /// JSON-escape a string into a buffer. Only the characters JSON requires, plus
@@ -663,7 +676,10 @@ fn refresh_icon_dirs(client: &mut Client, state: &mut State) {
     for root in icon_index_roots(client, &theme_roots) {
         // Directories only: an icon theme is a few dozen directories holding
         // tens of thousands of files, and this wants somewhere to look.
-        for rel in fs_index(client, &root, IndexKind::Directories) {
+        let Some(indexed) = fs_index(client, &root, IndexKind::Directories) else {
+            continue;
+        };
+        for rel in indexed {
             if icon::is_icon_dir(&rel) {
                 dirs.push(format!("{root}/{rel}"));
             }
@@ -774,19 +790,33 @@ fn publish(client: &mut Client, state: &mut State) {
     conns.retain(|conn| !conn.closed);
     state.conns = conns;
 
-    let payload = state_json(state, false);
-    // Nothing to say if every panel already holds this exact state.
-    if state.conns.iter().all(|conn| conn.last_sent == payload) {
+    let current = state_json(state, false);
+    // Nothing to say if every panel already holds both this exact managed
+    // state and the current installed catalog.
+    if state
+        .conns
+        .iter()
+        .all(|conn| conn.last_sent == current && conn.catalog_revision == state.catalog_revision)
+    {
         return;
     }
+    let catalog = state_json(state, true);
     let mut conns = core::mem::take(&mut state.conns);
     for conn in &mut conns {
-        if conn.last_sent == payload {
+        let needs_catalog = conn.catalog_revision != state.catalog_revision;
+        if conn.last_sent == current && !needs_catalog {
             continue;
         }
-        if send_json(client, conn, &payload) {
+        if send_json(
+            client,
+            conn,
+            if needs_catalog { &catalog } else { &current },
+        ) {
             conn.last_sent.clear();
-            conn.last_sent.push_str(&payload);
+            conn.last_sent.push_str(&current);
+            if needs_catalog {
+                conn.catalog_revision = state.catalog_revision;
+            }
         }
     }
     conns.retain(|conn| !conn.closed);
@@ -806,12 +836,14 @@ fn accept_panel(client: &mut Client, state: &mut State, channel: Channel) {
         channel,
         closed: false,
         last_sent: String::new(),
+        catalog_revision: 0,
         queued: Vec::new(),
     };
     refresh_installed_if_stale(client, state);
     let greeting = state_json(state, true);
     if send_json(client, &mut conn, &greeting) {
         conn.last_sent = state_json(state, false);
+        conn.catalog_revision = state.catalog_revision;
     }
     state.conns.push(conn);
 
@@ -851,18 +883,8 @@ fn on_panel_data(client: &mut Client, state: &mut State, index: usize, payload: 
         "disable" if !id.is_empty() => stop_app(client, state, id),
         "start" if !id.is_empty() => {
             refresh_installed_if_stale(client, state);
-            if let Some(entry) = state.installed.get(id).cloned() {
-                let app = state
-                    .apps
-                    .entry(id.to_string())
-                    .or_insert_with(|| App::new(id.to_string(), entry.argv.clone()));
-                app.argv = entry.argv;
-                app.failures = 0;
-                app.next_attempt_ns = None;
-                if app.phase != Phase::Running {
-                    app.transient = true;
-                    app.phase = Phase::Idle;
-                }
+            if state.installed.contains_key(id) {
+                let _ = launch_once(client, state, id);
             }
         }
         "stop" if !id.is_empty() => halt_app(client, state, id),
@@ -894,6 +916,7 @@ fn on_panel_data(client: &mut Client, state: &mut State, index: usize, payload: 
                 && send_json(client, conn, &payload)
             {
                 conn.last_sent = current;
+                conn.catalog_revision = state.catalog_revision;
             }
             conns.retain(|conn| !conn.closed);
             state.conns = conns;
@@ -957,9 +980,6 @@ fn halt_app(client: &mut Client, state: &mut State, id: &str) {
         return;
     };
     app.phase = Phase::Stopped;
-    // Calling off a run that was never adopted: the request goes with it, or
-    // the next reconcile would start what was just stopped.
-    app.transient = false;
     app.next_attempt_ns = None;
     app.wayland_display = None;
     app.started_at_ns = None;
@@ -1056,6 +1076,20 @@ fn route_frame(
                 StateChange::Remove(process_handle) => (process_handle, -1),
                 StateChange::Upsert(_) => continue,
             };
+            if state
+                .transient_process_apps
+                .remove(&process_handle)
+                .is_some()
+            {
+                state.processes.remove(&process_handle);
+                if let Some(app_handle) = state.process_app_endpoints.remove(&process_handle) {
+                    let _ = client.release_app_endpoint(app_handle);
+                }
+                // This may be a single-instance handoff. The short launcher
+                // exiting says nothing about windows owned by the existing
+                // application process.
+                continue;
+            }
             let Some(app) = state
                 .apps
                 .values_mut()
@@ -1102,6 +1136,29 @@ fn route_frame(
         return Ok(changed);
     }
 
+    for index in 0..state.catalog_watches.len() {
+        let update = {
+            let watched = &mut state.catalog_watches[index];
+            watched.watch.offer_frame(client, frame)?
+        };
+        let Some(update) = update else {
+            continue;
+        };
+        // Deltas are settled by the native FS family, so one package-manager
+        // transaction costs one catalog reload/publish. Retire this edge
+        // subscription before reading: remaining records from the same settled
+        // batch are already represented by the coherent reload. The reload
+        // rearms the root for the next transaction.
+        if catalog_watch_requires_refresh(update.phase) {
+            let mut watched = state.catalog_watches.swap_remove(index);
+            let _ = watched.watch.close(client);
+            let _ = watched.root.close(client);
+            refresh_installed(client, state)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
     let Some(process_handle) = state
         .processes
         .iter()
@@ -1121,6 +1178,10 @@ fn route_frame(
         process.discard(client, delivery)?;
     }
     Ok(false)
+}
+
+fn catalog_watch_requires_refresh(phase: wire::state::Phase) -> bool {
+    phase == wire::state::Phase::Delta
 }
 
 /// Start whatever is enabled and due.
@@ -1144,6 +1205,112 @@ fn reconcile(client: &mut Client, state: &mut State) {
             }
         }
     }
+}
+
+/// Launch one new instance/window without changing supervision intent.
+///
+/// This remains available while the same application is already supervised:
+/// opening another terminal or browser window is the ordinary meaning of an
+/// application picker. When an instance already has surfaces, reuse its
+/// Wayland display (or the session display when it was started elsewhere).
+/// Chromium refuses its single-instance handoff when a second invocation is
+/// pointed at a newly minted display, which made Brave work from a terminal
+/// while the picker did nothing.
+fn launch_once(client: &mut Client, state: &mut State, id: &str) -> Result<(), Error> {
+    let argv = state
+        .installed
+        .get(id)
+        .map(|entry| entry.argv.clone())
+        .ok_or(Error::Invalid("application disappeared before launch"))?;
+    if argv.is_empty() {
+        return Ok(());
+    }
+
+    let has_surfaces = state
+        .surface_apps
+        .values()
+        .any(|application_id| application_id == id);
+    let mut existing_display = state
+        .apps
+        .get(id)
+        .and_then(|app| {
+            (app.phase == Phase::Running)
+                .then(|| app.wayland_display.clone())
+                .flatten()
+        })
+        .or_else(|| {
+            state
+                .transient_process_apps
+                .values()
+                .find_map(|(application_id, display)| {
+                    (application_id == id).then(|| display.clone()).flatten()
+                })
+        });
+    let mut endpoint_handle = None;
+    let environment = if let Some(display) = existing_display.clone() {
+        vec![wire::process::EnvEntry {
+            key: b"WAYLAND_DISPLAY".to_vec(),
+            value: display.into_bytes(),
+        }]
+    } else if has_surfaces {
+        // The application was started outside this supervisor. Session
+        // inheritance carries its generic display and runtime directory.
+        Vec::new()
+    } else {
+        let endpoint = client.create_app_endpoint(id.to_string())?;
+        endpoint_handle = Some(endpoint.app_handle);
+        existing_display = endpoint
+            .environment
+            .iter()
+            .find(|entry| entry.key == b"WAYLAND_DISPLAY")
+            .map(|entry| String::from_utf8_lossy(&entry.value).into_owned());
+        endpoint
+            .environment
+            .into_iter()
+            .map(|entry| wire::process::EnvEntry {
+                key: entry.key,
+                value: entry.value,
+            })
+            .collect()
+    };
+    let extensions = match endpoint_handle {
+        Some(app_handle) => wire::Extensions(vec![wire::Extension {
+            tag: wire::schema::process::SPAWN_SURFACE_APP_EXTENSION as u16,
+            required: true,
+            value: app_handle.to_le_bytes().to_vec(),
+        }]),
+        None => wire::Extensions::default(),
+    };
+    let spawned = client.spawn_process_with_window(
+        (wire::schema::process::SPAWN_DETACHABLE | wire::schema::process::SPAWN_MERGE_STDERR)
+            as u16,
+        wire::process::EnvironmentKind::Session,
+        wire::process::Cwd::ServerDefault,
+        argv.into_iter().map(String::into_bytes).collect(),
+        environment,
+        extensions,
+        APP_PROCESS_STREAM_WINDOW,
+    );
+    let process = match spawned {
+        Ok(process) => process,
+        Err(error) => {
+            if let Some(app_handle) = endpoint_handle {
+                let _ = client.release_app_endpoint(app_handle);
+            }
+            return Err(Error::Process(error));
+        }
+    };
+    let process_handle = process.handle();
+    state.processes.insert(process_handle, process);
+    state
+        .transient_process_apps
+        .insert(process_handle, (id.to_string(), existing_display));
+    if let Some(app_handle) = endpoint_handle {
+        state
+            .process_app_endpoints
+            .insert(process_handle, app_handle);
+    }
+    Ok(())
 }
 
 /// Mint a native Surface application endpoint and spawn on its exact
@@ -1175,13 +1342,15 @@ fn start(client: &mut Client, state: &mut State, id: &str) -> Result<(), Error> 
         required: true,
         value: endpoint.app_handle.to_le_bytes().to_vec(),
     }]);
-    let spawned = client.spawn_process(
-        wire::schema::process::SPAWN_DETACHABLE as u16,
+    let spawned = client.spawn_process_with_window(
+        (wire::schema::process::SPAWN_DETACHABLE | wire::schema::process::SPAWN_MERGE_STDERR)
+            as u16,
         wire::process::EnvironmentKind::Session,
         wire::process::Cwd::ServerDefault,
         argv.into_iter().map(String::into_bytes).collect(),
         environment,
         extensions,
+        APP_PROCESS_STREAM_WINDOW,
     );
     let process = match spawned {
         Ok(process) => process,
@@ -1314,10 +1483,9 @@ fn adopt(
 
 /// Read the catalog again if it has aged past [`CATALOG_TTL`].
 ///
-/// The catalog is not watched, so the only alternatives are re-reading it on
-/// every request — a shell child and a directory walk per keystroke — or the
-/// previous rule of reading it once and never again, which made an
-/// application installed mid-session permanently invisible to `enable`.
+/// Live filesystem watches are the normal refresh path. The TTL remains a
+/// fallback for roots that did not exist when the extension started or whose
+/// platform watcher was lost.
 fn refresh_installed_if_stale(client: &mut Client, state: &mut State) {
     let now = client.monotonic_now().raw_nanos();
     let fresh = state.installed_at_ns.is_some_and(|read_at| {
@@ -1327,6 +1495,64 @@ fn refresh_installed_if_stale(client: &mut Client, state: &mut State) {
         return;
     }
     let _ = refresh_installed(client, state);
+}
+
+fn application_roots(home: &str, dirs: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    core::iter::once(home)
+        .chain(dirs.split(':'))
+        .filter(|base| !base.is_empty())
+        .map(|base| format!("{base}/applications"))
+        // Preserve XDG precedence while dropping duplicate roots.
+        .filter(|root| seen.insert(root.clone()))
+        .collect()
+}
+
+/// Keep one native recursive watch on each XDG applications directory that
+/// currently exists. Missing roots are harmless and retried by the TTL path.
+fn sync_catalog_watches(client: &mut Client, state: &mut State) {
+    let wanted: BTreeSet<String> = state.catalog_roots.iter().cloned().collect();
+    let mut kept = Vec::with_capacity(state.catalog_watches.len());
+    for mut watched in core::mem::take(&mut state.catalog_watches) {
+        if wanted.contains(&watched.path) {
+            kept.push(watched);
+        } else {
+            let _ = watched.watch.close(client);
+            let _ = watched.root.close(client);
+        }
+    }
+    state.catalog_watches = kept;
+
+    for path in state.catalog_roots.clone() {
+        if state
+            .catalog_watches
+            .iter()
+            .any(|watched| watched.path == path)
+        {
+            continue;
+        }
+        let mut root = match client.open_fs(
+            wire::fs::RootSource::PlatformPath(path.as_bytes().to_vec()),
+            0,
+        ) {
+            Ok(root) => root,
+            Err(_) => continue,
+        };
+        // Desktop entry IDs may derive from nested paths, hence recursive.
+        // Hidden entries are not launchable catalog entries and excluding them
+        // also shares the same proven watch policy as `yas fs sync`.
+        let flags = wire::schema::fs::WATCH_RECURSIVE as u16;
+        let watch = match root.watch(client, flags, 100, 0, String::new(), None) {
+            Ok(watch) => watch,
+            Err(_) => {
+                let _ = root.close(client);
+                continue;
+            }
+        };
+        state
+            .catalog_watches
+            .push(CatalogWatch { path, root, watch });
+    }
 }
 
 /// Read the installed applications: `XDG_DATA_DIRS` from the server's
@@ -1341,11 +1567,15 @@ fn refresh_installed(client: &mut Client, state: &mut State) -> Result<(), Error
             .map(str::to_string)
     };
     // The spec's defaults, so a session with these unset still finds apps.
-    let home = get("XDG_DATA_HOME").unwrap_or_else(|| {
-        let base = get("HOME").unwrap_or_default();
-        format!("{base}/.local/share")
-    });
-    let dirs = get("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    let home = get("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let base = get("HOME").unwrap_or_default();
+            format!("{base}/.local/share")
+        });
+    let dirs = get("XDG_DATA_DIRS")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
     // The icon path is the data path, so it is settled by the read that already
     // happened rather than by one of its own.
     let (theme_roots, flat_roots) = icon::roots(&home, &get("HOME").unwrap_or_default(), &dirs);
@@ -1354,15 +1584,15 @@ fn refresh_installed(client: &mut Client, state: &mut State) -> Result<(), Error
     // A package installed mid-session can bring a theme with it, and this read
     // is the moment that becomes visible.
     state.icon_dirs.clear();
+    state.icons.clear();
+    state.icon_bytes = 0;
 
-    state.installed.clear();
-    let roots: Vec<String> = core::iter::once(home.as_str())
-        .chain(dirs.split(':'))
-        .filter(|base| !base.is_empty())
-        .map(|base| format!("{base}/applications"))
-        .collect();
+    let roots = application_roots(&home, &dirs);
+    let mut installed = BTreeMap::new();
     {
-        for (path, contents) in read_desktop_files(client, &roots) {
+        let files = read_desktop_files(client, &roots)
+            .ok_or(Error::Invalid("incomplete application catalog read"))?;
+        for (path, contents) in files {
             let Some(id) = path
                 .rsplit('/')
                 .next()
@@ -1377,10 +1607,26 @@ fn refresh_installed(client: &mut Client, state: &mut State) -> Result<(), Error
                 continue;
             }
             // Earlier directories win, per the spec's precedence.
-            state.installed.entry(entry.id.clone()).or_insert(entry);
+            installed.entry(entry.id.clone()).or_insert(entry);
         }
     }
+    if installed != state.installed {
+        state.catalog_revision = state.catalog_revision.saturating_add(1).max(1);
+    }
+    state.installed = installed;
+    state.catalog_roots = roots;
+    // Persisted intent survives uninstall/reinstall. Keep each managed argv in
+    // lockstep with the live entry so a newly installed enabled app starts and
+    // a removed one is not restarted through stale arguments.
+    for (id, app) in &mut state.apps {
+        app.argv = state
+            .installed
+            .get(id)
+            .map(|entry| entry.argv.clone())
+            .unwrap_or_default();
+    }
     state.installed_at_ns = Some(client.monotonic_now().raw_nanos());
+    sync_catalog_watches(client, state);
     Ok(())
 }
 
@@ -1397,25 +1643,23 @@ const MAX_DESKTOP_BYTES: u32 = 64 * 1024;
 /// sync session — a watched tree, the wrong shape for reading a fixed set of
 /// files once at startup. A root that does not exist answers an empty listing,
 /// which matters because most of `XDG_DATA_DIRS` is absent on any given machine.
-fn read_desktop_files(client: &mut Client, roots: &[String]) -> Vec<(String, String)> {
+fn read_desktop_files(client: &mut Client, roots: &[String]) -> Option<Vec<(String, String)>> {
     let mut out = Vec::new();
     for root in roots {
         // Root-relative, so a nested `kde4/foo.desktop` keeps its subdirectory.
-        let entries: Vec<String> = fs_index(client, root, IndexKind::Files)
+        let entries: Vec<String> = fs_index(client, root, IndexKind::Files)?
             .into_iter()
             .filter(|rel| rel.ends_with(".desktop"))
             .map(|rel| format!("{root}/{rel}"))
             .collect();
         for batch in entries.chunks(wire::fs::MAX_QUERY_RECORDS) {
             let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
-            let Some(records) = fs_read(
+            let records = fs_read(
                 client,
                 ReadMode::Content,
                 MAX_DESKTOP_BYTES,
                 &[paths.as_slice()],
-            ) else {
-                return out;
-            };
+            )?;
             for (found, path, body) in records {
                 if !found {
                     continue;
@@ -1426,7 +1670,7 @@ fn read_desktop_files(client: &mut Client, roots: &[String]) -> Vec<(String, Str
             }
         }
     }
-    out
+    Some(out)
 }
 
 /// Read a batch of paths in one round trip (`docs/design/fs-read.md`).
@@ -1528,8 +1772,13 @@ fn fs_read(
     let mut root = client
         .open_fs(wire::fs::RootSource::PlatformPath(b"/".to_vec()), 0)
         .ok()?;
-    let page = root.read(client, questions).ok()?;
+    // CLOSE even when READ fails. Icon probes are allowed to fail and retry;
+    // leaking their root handle eventually exhausted this extension's FS-root
+    // allowance, after which the next catalog refresh looked like every XDG
+    // applications directory had disappeared.
+    let page = root.read(client, questions);
     let _ = root.close(client);
+    let page = page.ok()?;
 
     let mut answers = vec![None; flattened.len()];
     for record in page.records {
@@ -1593,13 +1842,26 @@ enum IndexKind {
     Directories,
 }
 
-fn fs_index(client: &mut Client, root_path: &str, kind: IndexKind) -> Vec<String> {
+fn fs_index(client: &mut Client, root_path: &str, kind: IndexKind) -> Option<Vec<String>> {
     const MAX_INDEX_PATHS: usize = 65_536;
-    let Ok(mut root) = client.open_fs(
+    let mut root = match client.open_fs(
         wire::fs::RootSource::PlatformPath(root_path.as_bytes().to_vec()),
         0,
-    ) else {
-        return Vec::new();
+    ) {
+        Ok(root) => root,
+        Err(_) => {
+            // Absent XDG roots are normal. Distinguish that from a transient
+            // OPEN failure (notably resource exhaustion), or a failed refresh
+            // would erase a previously valid application catalog.
+            let paths = [root_path];
+            let groups = [paths.as_slice()];
+            return match fs_read(client, ReadMode::Stat, u32::MAX, &groups) {
+                Some(records) if records.first().is_some_and(|record| !record.0) => {
+                    Some(Vec::new())
+                }
+                _ => None,
+            };
+        }
     };
     let flags = match kind {
         IndexKind::Files => wire::schema::fs::INDEX_INCLUDE_FILES as u16,
@@ -1607,12 +1869,16 @@ fn fs_index(client: &mut Client, root_path: &str, kind: IndexKind) -> Vec<String
     };
     let mut cursor = Vec::new();
     let mut out = Vec::new();
-    while let Ok(page) = root.index(
-        client,
-        flags,
-        wire::fs::MAX_QUERY_RECORDS.min(u16::MAX as usize) as u16,
-        cursor.clone(),
-    ) {
+    let complete = loop {
+        let page = match root.index(
+            client,
+            flags,
+            wire::fs::MAX_QUERY_RECORDS.min(u16::MAX as usize) as u16,
+            cursor.clone(),
+        ) {
+            Ok(page) => page,
+            Err(_) => break false,
+        };
         for record in page.records {
             let wire::fs::QueryRecord::Path(record) = record else {
                 continue;
@@ -1633,12 +1899,12 @@ fn fs_index(client: &mut Client, root_path: &str, kind: IndexKind) -> Vec<String
         }
         if out.len() >= MAX_INDEX_PATHS || page.next_cursor.is_empty() || page.next_cursor == cursor
         {
-            break;
+            break true;
         }
         cursor = page.next_cursor;
-    }
+    };
     let _ = root.close(client);
-    out
+    complete.then_some(out)
 }
 
 /// Persist one application's intent.
@@ -1790,27 +2056,16 @@ fn serve(
         // otherwise -- and the next session start still brings it up.
         ("start", Some(id)) => {
             refresh_installed_if_stale(client, state);
-            match state.installed.get(id) {
-                Some(entry) => {
-                    let argv = entry.argv.clone();
-                    let app = state
-                        .apps
-                        .entry(id.to_string())
-                        .or_insert_with(|| App::new(id.to_string(), argv.clone()));
-                    app.argv = argv;
-                    app.failures = 0;
-                    app.next_attempt_ns = None;
-                    if app.phase != Phase::Running {
-                        // See the channel's `start`: without this the
-                        // supervisor has been told nothing it acts on.
-                        app.transient = true;
-                        app.phase = Phase::Idle;
+            if !state.installed.contains_key(id) {
+                out.push_str(&format!("no application called {id}\n"));
+                code = 1;
+            } else {
+                match launch_once(client, state, id) {
+                    Ok(()) => out.push_str(&format!("starting {id}\n")),
+                    Err(error) => {
+                        out.push_str(&format!("could not start {id}: {error}\n"));
+                        code = 1;
                     }
-                    out.push_str(&format!("starting {id}\n"));
-                }
-                None => {
-                    out.push_str(&format!("no application called {id}\n"));
-                    code = 1;
                 }
             }
         }
@@ -2060,5 +2315,36 @@ mod tests {
         assert!(resolve_symlink_target("relative/link", b"/target").is_none());
         assert!(resolve_symlink_target("/link", b"../../escape").is_none());
         assert!(resolve_symlink_target("/link", b"bad\\target").is_none());
+    }
+
+    #[test]
+    fn xdg_application_roots_keep_precedence_and_drop_duplicates() {
+        assert_eq!(
+            application_roots(
+                "/home/me/.local/share",
+                "/opt/share:/usr/share:/opt/share::/usr/local/share",
+            ),
+            vec![
+                "/home/me/.local/share/applications",
+                "/opt/share/applications",
+                "/usr/share/applications",
+                "/usr/local/share/applications",
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_watches_refresh_only_on_settled_delta() {
+        assert!(!catalog_watch_requires_refresh(
+            wire::state::Phase::SnapshotBegin
+        ));
+        assert!(!catalog_watch_requires_refresh(
+            wire::state::Phase::SnapshotRecords
+        ));
+        assert!(!catalog_watch_requires_refresh(
+            wire::state::Phase::SnapshotEnd
+        ));
+        assert!(catalog_watch_requires_refresh(wire::state::Phase::Delta));
+        assert!(!catalog_watch_requires_refresh(wire::state::Phase::Reset));
     }
 }

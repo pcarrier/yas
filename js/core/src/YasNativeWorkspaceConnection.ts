@@ -216,7 +216,14 @@ import { YasResultError, YasWriter } from "./yas/wire";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const MAX_QUERY_BYTES = 8 * 1024 * 1024;
-const NATIVE_SURFACE_DECODER_CAPACITY = 1;
+// One slot turns the reliable Surface stream into stop-and-wait: every frame
+// has to cross the link, enter WebCodecs, and send its ACK back before the
+// server may emit the next one.  Worse, a compositor frame produced during
+// that round trip exhausts the window and makes the server request a fresh
+// keyframe.  Keep a small triple-buffered transport/decode window instead;
+// ACKs still release slots as soon as WebCodecs accepts a frame, so this does
+// not add presentation latency.
+const NATIVE_SURFACE_DECODER_CAPACITY = 3;
 
 interface NativeTerminalViewState {
   view: YasTerminalView;
@@ -252,6 +259,7 @@ interface NativeSurfaceViewState {
   removeFrames: () => void;
   width: number;
   height: number;
+  maxFps: number;
   lastReceived: bigint;
   lastPresented: bigint;
   decoderQueueDepth: number;
@@ -2150,8 +2158,23 @@ export class YasNativeWorkspaceConnection {
     for (const record of records) {
       const previous = this.surfaceRecords.get(record.surfaceHandle);
       this.surfaceRecords.set(record.surfaceHandle, record);
-      const width = Math.max(1, fixed32Integer(record.logicalWidth32_32));
-      const height = Math.max(1, fixed32Integer(record.logicalHeight32_32));
+      const logicalWidth = Math.max(
+        1,
+        fixed32Integer(record.logicalWidth32_32),
+      );
+      const logicalHeight = Math.max(
+        1,
+        fixed32Integer(record.logicalHeight32_32),
+      );
+      // SurfaceRecord dimensions are logical; bufferScale is the missing half
+      // of the compositor's physical coordinate space.  PointerMotion is
+      // intentionally encoded in physical composite pixels and converted back
+      // to logical coordinates by the compositor.  Treating the catalogue's
+      // logical width as physical made a 2x client send only half that range,
+      // which the compositor then divided by two again.
+      const bufferScale = Math.max(1, record.bufferScale);
+      const width = Math.max(1, logicalWidth * bufferScale);
+      const height = Math.max(1, logicalHeight * bufferScale);
       if (!previous) {
         this.surfaceStore.handleSurfaceCreated(
           record.surfaceHandle,
@@ -2160,6 +2183,18 @@ export class YasNativeWorkspaceConnection {
           height,
           record.title,
           record.applicationId,
+        );
+        // Unlike the legacy compositor event, the native create catalogue
+        // already carries both halves of the size. Publish the logical half
+        // immediately as well; presentation sizing and cursor artwork must
+        // not spend the surface's entire lifetime waiting for a later resize
+        // that may never happen.
+        this.surfaceStore.handleSurfaceResized(
+          record.surfaceHandle,
+          width,
+          height,
+          logicalWidth,
+          logicalHeight,
         );
       } else {
         if (previous.title !== record.title)
@@ -2174,14 +2209,15 @@ export class YasNativeWorkspaceConnection {
           );
         if (
           previous.logicalWidth32_32 !== record.logicalWidth32_32 ||
-          previous.logicalHeight32_32 !== record.logicalHeight32_32
+          previous.logicalHeight32_32 !== record.logicalHeight32_32 ||
+          previous.bufferScale !== record.bufferScale
         )
           this.surfaceStore.handleSurfaceResized(
             record.surfaceHandle,
             width,
             height,
-            width,
-            height,
+            logicalWidth,
+            logicalHeight,
           );
       }
       const activation = surfaceActivationRevision(record);
@@ -2302,19 +2338,28 @@ export class YasNativeWorkspaceConnection {
     );
     const existing = this.surfaceViews.get(surfaceId);
     if (existing) {
-      existing.width = parameters.width;
-      existing.height = parameters.height;
-      try {
-        await existing.view.configure({
-          width: parameters.width,
-          height: parameters.height,
-          maxFps: parameters.maxFps,
-          decoderCapacity: NATIVE_SURFACE_DECODER_CAPACITY,
-          latencyTargetNs: 0n,
-        });
-      } catch (error) {
-        if (!pending.cancelled) throw error;
-        return;
+      const configurationChanged =
+        existing.width !== parameters.width ||
+        existing.height !== parameters.height ||
+        existing.maxFps !== parameters.maxFps;
+      if (configurationChanged) {
+        try {
+          await existing.view.configure({
+            width: parameters.width,
+            height: parameters.height,
+            maxFps: parameters.maxFps,
+            decoderCapacity: NATIVE_SURFACE_DECODER_CAPACITY,
+            latencyTargetNs: 0n,
+          });
+        } catch (error) {
+          if (!pending.cancelled) throw error;
+          return;
+        }
+        // Publish only after CONFIGURE succeeds. A rejected reconfiguration
+        // leaves the remote view unchanged and must remain retryable.
+        existing.width = parameters.width;
+        existing.height = parameters.height;
+        existing.maxFps = parameters.maxFps;
       }
       if (
         pending.cancelled ||
@@ -2322,7 +2367,9 @@ export class YasNativeWorkspaceConnection {
         this.surfaceViews.get(surfaceId) !== existing
       )
         return;
-      if (forceReset) {
+      // CONFIGURE already invalidates the encoder and requests a keyframe.
+      // RESET is only useful when the configuration itself was unchanged.
+      if (forceReset && !configurationChanged) {
         try {
           await existing.view.reset();
         } catch (error) {
@@ -2360,6 +2407,7 @@ export class YasNativeWorkspaceConnection {
       removeFrames: () => undefined,
       width: parameters.width,
       height: parameters.height,
+      maxFps: parameters.maxFps,
       lastReceived: view.result.firstSequence - 1n,
       lastPresented: view.result.firstSequence - 1n,
       decoderQueueDepth: 0,

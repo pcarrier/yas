@@ -1,9 +1,9 @@
 //! YAS Client family version 1 payload codecs.
 
 use crate::codec::{
-    Decode, Decoder, Encode, Error, Extension, Extensions, Result, limit_u32, put_bytes_u32,
-    put_len_u16, put_len_u32, put_string_u16, put_string_u32, put_u16, put_u32, put_u64,
-    read_limit_u32, reject_unknown_required_extensions,
+    Decode, Decoder, Encode, Error, Extension, Extensions, Result, limit_u32, put_bytes_u16,
+    put_bytes_u32, put_len_u16, put_len_u32, put_string_u16, put_string_u32, put_u16, put_u32,
+    put_u64, read_limit_u32, reject_unknown_required_extensions,
 };
 use crate::prelude::*;
 use crate::state::{Record, RecordKind};
@@ -326,6 +326,11 @@ impl ClientRecord {
         decode_active_subscriptions(&self.extensions)
     }
 
+    /// Decode optional family-specific details for auxiliary subscriptions.
+    pub fn auxiliary_subscription_details(&self) -> Result<Option<AuxiliarySubscriptionDetails>> {
+        decode_auxiliary_subscription_details(&self.extensions)
+    }
+
     /// Decode the optional current sampled traffic rates.
     pub fn bandwidth_rates(&self) -> Result<Option<BandwidthRates>> {
         decode_bandwidth_rates(&self.extensions)
@@ -396,6 +401,11 @@ impl ClientPatch {
     /// patch carries one.
     pub fn active_subscriptions(&self) -> Result<Option<ActiveSubscriptions>> {
         decode_active_subscriptions(&self.extensions)
+    }
+
+    /// Decode updated family-specific auxiliary subscription details.
+    pub fn auxiliary_subscription_details(&self) -> Result<Option<AuxiliarySubscriptionDetails>> {
+        decode_auxiliary_subscription_details(&self.extensions)
     }
 
     /// Decode updated current sampled traffic rates, when present.
@@ -654,6 +664,96 @@ impl Decode for ActiveSubscriptions {
     }
 }
 
+/// Optional diagnostic information that resolves an auxiliary subscription's
+/// connection-local resource handle and preserves its effective watch flags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuxiliarySubscriptionDetail {
+    pub family: u16,
+    pub state_watch_flags: u16,
+    pub subscription_id: u32,
+    pub request_flags: u32,
+    pub resource: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuxiliarySubscriptionDetails {
+    pub entries: Vec<AuxiliarySubscriptionDetail>,
+}
+
+impl AuxiliarySubscriptionDetails {
+    fn validate(&self) -> Result<()> {
+        if self.entries.len() > crate::schema::client::MAX_ACTIVE_SUBSCRIPTIONS as usize {
+            return Err(Error::LimitExceeded {
+                limit: "Client auxiliary subscription details",
+                actual: self.entries.len() as u64,
+                maximum: crate::schema::client::MAX_ACTIVE_SUBSCRIPTIONS,
+            });
+        }
+        let mut previous = None;
+        for entry in &self.entries {
+            if entry.subscription_id == 0
+                || entry.resource.len() > u16::MAX as usize
+                || previous.is_some_and(|key| key >= (entry.family, entry.subscription_id))
+            {
+                return Err(Error::Invalid("Client auxiliary subscription detail"));
+            }
+            previous = Some((entry.family, entry.subscription_id));
+        }
+        Ok(())
+    }
+
+    pub fn extension(&self) -> Result<Extension> {
+        Ok(Extension {
+            tag: crate::schema::client::AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION as u16,
+            required: false,
+            value: self.encode()?,
+        })
+    }
+}
+
+impl Encode for AuxiliarySubscriptionDetails {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.validate()?;
+        put_len_u16(out, self.entries.len())?;
+        put_u16(out, 0);
+        for entry in &self.entries {
+            put_u16(out, entry.family);
+            put_u16(out, entry.state_watch_flags);
+            put_u32(out, entry.subscription_id);
+            put_u32(out, entry.request_flags);
+            put_bytes_u16(out, &entry.resource)?;
+        }
+        Ok(())
+    }
+}
+
+impl Decode for AuxiliarySubscriptionDetails {
+    fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(input);
+        let count = usize::from(decoder.u16()?);
+        if decoder.u16()? != 0
+            || count > crate::schema::client::MAX_ACTIVE_SUBSCRIPTIONS as usize
+            || count > decoder.remaining() / 14
+        {
+            return Err(Error::Invalid("Client auxiliary subscription detail count"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            entries.push(AuxiliarySubscriptionDetail {
+                family: decoder.u16()?,
+                state_watch_flags: decoder.u16()?,
+                subscription_id: decoder.u32()?,
+                request_flags: decoder.u32()?,
+                resource: decoder.len_bytes_u16()?.to_vec(),
+            });
+        }
+        decoder.finish()?;
+        let value = Self { entries };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
 fn decode_active_subscriptions(extensions: &Extensions) -> Result<Option<ActiveSubscriptions>> {
     extensions.validate()?;
     extensions
@@ -663,6 +763,20 @@ fn decode_active_subscriptions(extensions: &Extensions) -> Result<Option<ActiveS
             extension.tag == crate::schema::client::ACTIVE_SUBSCRIPTIONS_EXTENSION as u16
         })
         .map(|extension| ActiveSubscriptions::decode(&extension.value))
+        .transpose()
+}
+
+fn decode_auxiliary_subscription_details(
+    extensions: &Extensions,
+) -> Result<Option<AuxiliarySubscriptionDetails>> {
+    extensions.validate()?;
+    extensions
+        .0
+        .iter()
+        .find(|extension| {
+            extension.tag == crate::schema::client::AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION as u16
+        })
+        .map(|extension| AuxiliarySubscriptionDetails::decode(&extension.value))
         .transpose()
 }
 
@@ -685,6 +799,11 @@ fn validate_record_extensions(extensions: &Extensions) -> Result<()> {
             }
             tag if tag == crate::schema::client::BANDWIDTH_RATES_EXTENSION as u16 => {
                 BandwidthRates::decode(&extension.value)?;
+            }
+            tag if tag
+                == crate::schema::client::AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION as u16 =>
+            {
+                AuxiliarySubscriptionDetails::decode(&extension.value)?;
             }
             _ if extension.required => {
                 return Err(Error::Invalid("unknown required Client record extension"));
@@ -918,6 +1037,29 @@ mod tests {
             extensions: Extensions(vec![value.extension().unwrap()]),
         };
         assert_eq!(record.active_subscriptions().unwrap(), Some(value));
+    }
+
+    #[test]
+    fn auxiliary_subscription_details_resolve_resources_and_flags() {
+        let value = AuxiliarySubscriptionDetails {
+            entries: vec![AuxiliarySubscriptionDetail {
+                family: crate::family::KV,
+                state_watch_flags: crate::state::WATCH_RESUME,
+                subscription_id: 5,
+                request_flags: 0,
+                resource: b"workspace/sessions/".to_vec(),
+            }],
+        };
+        let bytes = value.encode().unwrap();
+        assert_eq!(AuxiliarySubscriptionDetails::decode(&bytes).unwrap(), value);
+        for end in 0..bytes.len() {
+            assert!(AuxiliarySubscriptionDetails::decode(&bytes[..end]).is_err());
+        }
+        let patch = ClientPatch {
+            session_id: [1; 16],
+            extensions: Extensions(vec![value.extension().unwrap()]),
+        };
+        assert_eq!(patch.auxiliary_subscription_details().unwrap(), Some(value));
     }
 
     #[test]

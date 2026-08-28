@@ -289,6 +289,7 @@ Every Request kind has a correlated Result with the same family and kind.
 | `origin_extension` | extension_id:u64,definition_revision:u64,attempt:u64,task_id:u32,name:string_u16 |
 | `active_subscriptions` | terminal_count:u16,surface_count:u16,aux_count:u16,reserved:u16=0; repeated terminal_handle:u64,view_id:u32,rows:u16,cols:u16; repeated surface_handle:u64,view_id:u32,width:u32,height:u32,scale_120:u16,reserved:u16=0; repeated family:u16,reserved:u16=0,subscription_id:u32,resource_handle:u64; each section strictly key-sorted |
 | `bandwidth_rates` | ClientRecord/ClientPatch extension tag 2 exact value received_bytes_per_second:u64,sent_bytes_per_second:u64,sample_window_ns:u64; sample_window_ns is nonzero; cumulative bytes_received/bytes_sent remain required in ClientRecord |
+| `auxiliary_subscription_details` | ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the family-specific resource identity (the namespace prefix for KV), request_flags are family-specific, and state_watch_flags use StateWatch flags |
 | `family_limits` | ordered optional extensions: tag 1 max published client records:u32, tag 2 max active subscriptions represented per client:u32; both tags are present in a selected family descriptor |
 
 ## `yas.surface` (`0x0020`/v1)

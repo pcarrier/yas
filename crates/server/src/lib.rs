@@ -907,21 +907,32 @@ struct NativeYasClient {
 /// mutex so catalogue readers never invert an async lock with a session lock.
 #[derive(Default)]
 struct NativeYasSubscriptions {
-    snapshot: std::sync::RwLock<yas_wire::client::ActiveSubscriptions>,
+    snapshot: std::sync::RwLock<NativeYasSubscriptionSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NativeYasSubscriptionSnapshot {
+    active: yas_wire::client::ActiveSubscriptions,
+    auxiliary_details: yas_wire::client::AuxiliarySubscriptionDetails,
 }
 
 impl NativeYasSubscriptions {
-    fn snapshot(&self) -> yas_wire::client::ActiveSubscriptions {
+    fn snapshot(&self) -> NativeYasSubscriptionSnapshot {
         self.snapshot.read().map_or_else(
-            |_| yas_wire::client::ActiveSubscriptions::default(),
+            |_| NativeYasSubscriptionSnapshot::default(),
             |value| value.clone(),
         )
     }
 
-    fn replace(&self, snapshot: yas_wire::client::ActiveSubscriptions) -> bool {
+    fn replace(&self, snapshot: NativeYasSubscriptionSnapshot) -> bool {
         snapshot
+            .active
             .extension()
             .expect("server-built native Client subscriptions are valid");
+        snapshot
+            .auxiliary_details
+            .extension()
+            .expect("server-built native Client subscription details are valid");
         let Ok(mut current) = self.snapshot.write() else {
             return false;
         };
@@ -934,7 +945,7 @@ impl NativeYasSubscriptions {
 
     fn clear(&self) {
         if let Ok(mut current) = self.snapshot.write() {
-            *current = yas_wire::client::ActiveSubscriptions::default();
+            *current = NativeYasSubscriptionSnapshot::default();
         }
     }
 }

@@ -1064,17 +1064,47 @@ impl Client {
         env: Vec<wire::EnvEntry>,
         extensions: Extensions,
     ) -> Result<Process, Error> {
+        self.spawn_process_with_window(
+            flags,
+            environment_kind,
+            cwd,
+            argv,
+            env,
+            extensions,
+            DEFAULT_STREAM_WINDOW,
+        )
+    }
+
+    /// Spawn with an explicit replenished output window.
+    ///
+    /// Long-lived consumers normally want [`DEFAULT_STREAM_WINDOW`]. A guest
+    /// which continuously discards GUI child diagnostics can use a much
+    /// smaller window without reserving several MiB for every open window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_process_with_window(
+        &mut self,
+        flags: u16,
+        environment_kind: wire::EnvironmentKind,
+        cwd: wire::Cwd,
+        argv: Vec<Vec<u8>>,
+        env: Vec<wire::EnvEntry>,
+        extensions: Extensions,
+        stream_window: u64,
+    ) -> Result<Process, Error> {
         if !self.supports(family::PROCESS, Class::Request, wire::request_kind::SPAWN) {
             return Err(Error::FeatureMissing);
+        }
+        if stream_window == 0 {
+            return Err(Error::Protocol("Process stream window is zero"));
         }
         let operation_id = operation_id(self)?;
         let cleanup_operation_id = distinct_operation_id(self, operation_id)?;
         let merged = flags & yas_wire::schema::process::SPAWN_MERGE_STDERR as u16 != 0;
-        let mut stdout_lease = self.receive_credit_exact(DEFAULT_STREAM_WINDOW)?;
+        let mut stdout_lease = self.receive_credit_exact(stream_window)?;
         let mut stderr_lease = if merged {
             None
         } else {
-            Some(self.receive_credit_exact(DEFAULT_STREAM_WINDOW)?)
+            Some(self.receive_credit_exact(stream_window)?)
         };
         let request = wire::Spawn {
             operation_id,
@@ -1083,8 +1113,8 @@ impl Client {
             cwd,
             argv,
             env,
-            stdout_receive_credit: DEFAULT_STREAM_WINDOW,
-            stderr_receive_credit: if merged { 0 } else { DEFAULT_STREAM_WINDOW },
+            stdout_receive_credit: stream_window,
+            stderr_receive_credit: if merged { 0 } else { stream_window },
             extensions,
         };
         let bundle: wire::StreamBundle = if let Some(stderr) = stderr_lease.as_mut() {

@@ -87,6 +87,7 @@ const settle = async (): Promise<void> => {
 
 afterEach(async () => {
   dropSessionCatalog(CONNECTION_ID);
+  vi.useRealTimers();
   await settle();
 });
 
@@ -152,6 +153,30 @@ describe("session catalog channel lifecycle", () => {
     first?.options.onClosed?.(0, "late close from old generation");
     expect(sessionHandle(CONNECTION_ID)).toBe(replacement);
     expect(second?.close).not.toHaveBeenCalled();
+  });
+
+  it("reopens an unexpectedly closed channel while its name stays present", async () => {
+    vi.useFakeTimers();
+    const remote = fakeRemote();
+    ensureSessionCatalog(remote.workspace, CONNECTION_ID, 1);
+    await settle();
+
+    remote.watches[0]?.publish(true);
+    const first = remote.opens[0];
+    first?.result.resolve(first.channel);
+    await settle();
+    expect(sessionHandle(CONNECTION_ID)).not.toBeNull();
+
+    first?.options.onClosed?.(0, "extension attempt replaced");
+    expect(sessionHandle(CONNECTION_ID)).toBeNull();
+    expect(remote.opens).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(50);
+    expect(remote.opens).toHaveLength(2);
+    const replacement = remote.opens[1];
+    replacement?.result.resolve(replacement.channel);
+    await settle();
+    expect(sessionHandle(CONNECTION_ID)).not.toBeNull();
   });
 
   it("generation replacement closes the earlier pending open on resolution", async () => {

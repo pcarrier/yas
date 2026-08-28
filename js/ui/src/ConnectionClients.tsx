@@ -416,6 +416,7 @@ export function ConnectionClients(props: {
                               subscription().kind,
                               subscription().id,
                               subscription().subscriptionId,
+                              subscription(),
                             )}
                           </div>
                         )}

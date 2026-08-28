@@ -15,7 +15,9 @@ import {
   fetchRegistry,
   installFromRegistry,
   isOutdated,
+  mergeExtensionInventory,
   mergeExtensions,
+  upsertExtensionRecord,
   type Registry,
   type RegistryEntry,
 } from "../extensionRegistry";
@@ -58,6 +60,7 @@ describe("extension registry", () => {
     const registry = await fetchRegistry(PUBLIC_REGISTRY, fetcher as never);
     expect(fetcher).toHaveBeenCalledWith("https://yas.run/ext/manifest.json", {
       mode: "cors",
+      cache: "no-store",
     });
     expect(registry.extensions.map((entry) => entry.name)).toEqual([
       "doctor",
@@ -148,9 +151,13 @@ describe("extension registry", () => {
       registry.extensions[0]!,
       fetcher as never,
     );
-    expect(fetcher).toHaveBeenCalledWith("https://yas.run/ext/systemd.wasm", {
-      mode: "cors",
-    });
+    expect(fetcher).toHaveBeenCalledWith(
+      `https://yas.run/ext/systemd.wasm?blake3=${DIGEST}`,
+      {
+        mode: "cors",
+        cache: "no-store",
+      },
+    );
   });
 
   it("carries the CAS token of the definition it replaces", async () => {
@@ -293,6 +300,22 @@ describe("merging installed with the registry", () => {
     expect(isOutdated(stale!)).toBe(true);
     expect(isOutdated(uninstalled!)).toBe(false);
     expect(isOutdated(unoffered!)).toBe(false);
+  });
+});
+
+describe("extension inventory updates", () => {
+  it("shows an update result immediately and does not regress to an older revision", () => {
+    const old = record("session", OTHER_DIGEST, 7n);
+    const updated = {
+      ...record("session", DIGEST, 7n),
+      definitionRevision: 2n,
+    };
+    const optimistic = upsertExtensionRecord([old], updated);
+    expect(optimistic[0]!.contentHash).toEqual(updated.contentHash);
+    expect(mergeExtensionInventory(optimistic, [old])[0]).toBe(updated);
+
+    const settled = { ...updated, phase: YAS_EXTENSION_PHASE_STOPPED };
+    expect(mergeExtensionInventory(optimistic, [settled])[0]).toBe(settled);
   });
 });
 

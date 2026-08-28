@@ -47,8 +47,10 @@ import {
   formatNativeExtensionHandle,
   installFromRegistry,
   isOutdated,
+  mergeExtensionInventory,
   mergeExtensions,
   nativeExtensionHost,
+  upsertExtensionRecord,
   type ExtensionRow,
   type Registry,
 } from "./extensionRegistry";
@@ -99,7 +101,7 @@ export function ExtensionsPanel(props: {
     try {
       const records = await connection.listExtensions();
       if (request !== inventoryRequest) return;
-      setInstalled(records);
+      setInstalled((previous) => mergeExtensionInventory(previous, records));
       setInventoryError(null);
     } catch (failure) {
       if (request !== inventoryRequest) return;
@@ -182,7 +184,12 @@ export function ExtensionsPanel(props: {
     const source = registry();
     if (!connection || !source || !row.offered) return;
     void act(row.label, async () => {
-      await installFromRegistry(connection, source, row.offered!);
+      const updated = await installFromRegistry(
+        connection,
+        source,
+        row.offered!,
+      );
+      setInstalled((records) => upsertExtensionRecord(records, updated));
       setNote(tp("extensions.installed", { name: row.label }));
     });
   };

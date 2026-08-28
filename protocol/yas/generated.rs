@@ -998,6 +998,7 @@ pub const ORIGIN_WEBRTC: u64 = 4;
 pub const ORIGIN_EXTENSION: u64 = 5;
 pub const ACTIVE_SUBSCRIPTIONS_EXTENSION: u64 = 1;
 pub const BANDWIDTH_RATES_EXTENSION: u64 = 2;
+pub const AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION: u64 = 3;
 pub const MAX_ACTIVE_SUBSCRIPTIONS: u64 = 4096;
 pub const MAX_PUBLISHED_CLIENTS: u64 = 4096;
 pub const LIMIT_MAX_PUBLISHED_CLIENTS: u64 = 1;
@@ -1019,6 +1020,7 @@ super::TypeMetadata { name: "origin_webrtc", layout: "peer_id:string_u16" },
 super::TypeMetadata { name: "origin_extension", layout: "extension_id:u64,definition_revision:u64,attempt:u64,task_id:u32,name:string_u16" },
 super::TypeMetadata { name: "active_subscriptions", layout: "terminal_count:u16,surface_count:u16,aux_count:u16,reserved:u16=0; repeated terminal_handle:u64,view_id:u32,rows:u16,cols:u16; repeated surface_handle:u64,view_id:u32,width:u32,height:u32,scale_120:u16,reserved:u16=0; repeated family:u16,reserved:u16=0,subscription_id:u32,resource_handle:u64; each section strictly key-sorted" },
 super::TypeMetadata { name: "bandwidth_rates", layout: "ClientRecord/ClientPatch extension tag 2 exact value received_bytes_per_second:u64,sent_bytes_per_second:u64,sample_window_ns:u64; sample_window_ns is nonzero; cumulative bytes_received/bytes_sent remain required in ClientRecord" },
+super::TypeMetadata { name: "auxiliary_subscription_details", layout: "ClientRecord/ClientPatch extension tag 3 exact value count:u16,reserved:u16=0; repeated family:u16,state_watch_flags:u16,subscription_id:u32,request_flags:u32,resource:bytes_u16; entries strictly sorted by family then subscription_id; entries are an optional diagnostic refinement of matching active_subscriptions auxiliary entries; resource is the family-specific resource identity (the namespace prefix for KV), request_flags are family-specific, and state_watch_flags use StateWatch flags" },
 super::TypeMetadata { name: "family_limits", layout: "ordered optional extensions: tag 1 max published client records:u32, tag 2 max active subscriptions represented per client:u32; both tags are present in a selected family descriptor" },
 ];
 pub static LIMITS: &[super::LimitMetadata] = &[
@@ -1034,6 +1036,7 @@ super::ConstantMetadata { name: "ORIGIN_WEBRTC", value: 4 },
 super::ConstantMetadata { name: "ORIGIN_EXTENSION", value: 5 },
 super::ConstantMetadata { name: "ACTIVE_SUBSCRIPTIONS_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "BANDWIDTH_RATES_EXTENSION", value: 2 },
+super::ConstantMetadata { name: "AUXILIARY_SUBSCRIPTION_DETAILS_EXTENSION", value: 3 },
 super::ConstantMetadata { name: "MAX_ACTIVE_SUBSCRIPTIONS", value: 4096 },
 super::ConstantMetadata { name: "MAX_PUBLISHED_CLIENTS", value: 4096 },
 super::ConstantMetadata { name: "LIMIT_MAX_PUBLISHED_CLIENTS", value: 1 },

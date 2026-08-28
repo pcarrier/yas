@@ -53,6 +53,7 @@ import { tileDisplay } from "./ide/tileDisplay";
 import { t, tp } from "./i18n";
 import { getInstallPrompt, clearInstallPrompt } from "./installPrompt";
 import { stabilizeSections } from "./switcherStabilize";
+import { placeApplicationSection } from "./switcherSections";
 import { createLazyIcons } from "./lazyIcons";
 import { AppIcon } from "./panelKit";
 import {
@@ -122,7 +123,6 @@ type ActionItem = {
     | "install-app"
     | "clear-layout"
     | "clear-local-storage"
-    | "change-layout"
     | "open-web"
     | "open-search";
   connectionId?: string;
@@ -390,20 +390,6 @@ function ActionGlyph(props: {
             <path d="M12 4v12" stroke={props.fg} />
             <path d="M8 12l4 4 4-4" stroke={props.fg} />
             <path d="M5 18h14" stroke={props.dimFg} />
-          </svg>
-        );
-      case "change-layout":
-        return (
-          <svg
-            viewBox="0 0 24 24"
-            width="24"
-            height="24"
-            fill="none"
-            aria-hidden="true"
-          >
-            <rect x="4.5" y="4.5" width="15" height="15" stroke={props.dimFg} />
-            <path d="M11 4.5v15" stroke={props.dimFg} />
-            <path d="M4.5 12h15" stroke={props.dimFg} />
           </svg>
         );
       case "clear-layout":
@@ -736,7 +722,7 @@ export function SwitcherOverlay(props: {
    * the surface once it appears; the switcher itself does not know the active
    * panel or the surface's id ahead of time.
    */
-  onStartApplication?: (connectionId: string, appId: string) => void;
+  onStartApplication?: (connectionId: string, appId: string) => boolean;
   /** Synchronous "@query" search over the locally cached file index
    *  (ide/fileIndex.ts) — per-keystroke, no round trip. Null while the
    *  native index is unavailable or still fetching — the list stays empty
@@ -810,7 +796,6 @@ export function SwitcherOverlay(props: {
   // Track whether the pointer actually moved so that scroll-triggered
   // mouseenter events (from keyboard navigation) don't hijack selection.
   let pointerMovedSinceKey = true;
-  const [layoutMode, setLayoutMode] = createSignal(false);
   const [newTerminalMode, setNewTerminalMode] = createSignal(
     props.initialNewTerminalMode ?? false,
   );
@@ -1373,16 +1358,16 @@ export function SwitcherOverlay(props: {
       subtitle: layout.dsl,
       layout,
     }));
-    if (!layoutMode() && paneMatches().length > 0) {
+    if (paneMatches().length > 0) {
       next.push({ title: t("switcher.sectionPanes"), items: paneMatches() });
     }
-    if (!layoutMode() && backgroundMatches().length > 0) {
+    if (backgroundMatches().length > 0) {
       next.push({
         title: t("switcher.sectionBackground"),
         items: backgroundMatches(),
       });
     }
-    if (!layoutMode() && sessionMatches().length > 0) {
+    if (sessionMatches().length > 0) {
       if (props.multiConnection && props.connectionLabels) {
         // Group sessions and surfaces together by connection.
         const sessionGroups = new Map<string, SessionItem[]>();
@@ -1423,7 +1408,7 @@ export function SwitcherOverlay(props: {
           });
         }
       }
-    } else if (!layoutMode() && surfaceMatches().length > 0) {
+    } else if (surfaceMatches().length > 0) {
       if (props.multiConnection && props.connectionLabels) {
         // No sessions — still group surfaces by connection.
         const surfaceGroups = new Map<string, SurfaceItem[]>();
@@ -1450,7 +1435,7 @@ export function SwitcherOverlay(props: {
         items: customLayouts,
       });
     }
-    if ((searching() || layoutMode()) && recent.length > 0) {
+    if (searching() && recent.length > 0) {
       next.push({ title: t("switcher.sectionRecentLayouts"), items: recent });
     }
 
@@ -1538,15 +1523,6 @@ export function SwitcherOverlay(props: {
         });
       }
     }
-    actions.push({
-      type: "action",
-      key: "action:change-layout",
-      title: t("switcher.layout"),
-      subtitle: props.activeLayout
-        ? props.activeLayout.dsl
-        : t("switcher.chooseLayout"),
-      action: "change-layout",
-    });
     if (props.activeLayout && props.onClearLayout) {
       actions.push({
         type: "action",
@@ -1563,7 +1539,7 @@ export function SwitcherOverlay(props: {
       subtitle: t("switcher.clearLocalStorageDesc"),
       action: "clear-local-storage",
     });
-    if (!layoutMode()) {
+    {
       const dp = destPrefix();
       if (dp) {
         // Destination prefix matched — only show the resolved new-terminal action.
@@ -1599,7 +1575,7 @@ export function SwitcherOverlay(props: {
 
     // Remotes section — show configured remotes with connection status.
     // Disabled remotes are kept on disk but not actionable from the switcher.
-    if (props.remotes && props.remotes.length > 0 && !layoutMode()) {
+    if (props.remotes && props.remotes.length > 0) {
       const q = searchPart().toLowerCase();
       const remoteItems: RemoteItem[] = props.remotes
         .filter((r) => !r.disabled)
@@ -1635,7 +1611,7 @@ export function SwitcherOverlay(props: {
     // Managed applications are skipped. The supervisor already runs those, and
     // an entry that would restart something already up is not what "start" is
     // being offered for here.
-    if (!layoutMode()) {
+    {
       const q = searchPart().toLowerCase();
       const appItems: AppItem[] = [];
       for (const remote of sessionCatalogs(connectionIds())) {
@@ -1671,7 +1647,13 @@ export function SwitcherOverlay(props: {
         }
       }
       if (appItems.length > 0) {
-        next.push({ title: t("switcher.sectionApps"), items: appItems });
+        const section = { title: t("switcher.sectionApps"), items: appItems };
+        // A typed application name is an explicit launch request. Put its
+        // desktop entries before matching existing windows so `C-b k`,
+        // "brave", Enter starts Brave rather than merely focusing a stale or
+        // already-visible surface. With an empty query the huge catalog stays
+        // at the bottom as before.
+        placeApplicationSection(next, section, searching());
       }
     }
 
@@ -1995,12 +1977,13 @@ export function SwitcherOverlay(props: {
       // Start, not enable: this is trying an application, not adopting it for
       // every future session. The window it opens arrives as a surface on its
       // own, so let the workspace place it in the active panel once it appears.
-      if (props.onStartApplication) {
-        props.onStartApplication(item.connectionId, item.appId);
-      } else {
-        startApplication(item.connectionId, item.appId);
-      }
-      props.onClose();
+      const accepted = props.onStartApplication
+        ? props.onStartApplication(item.connectionId, item.appId)
+        : startApplication(item.connectionId, item.appId);
+      // Never turn a dead catalog channel into a successful-looking action.
+      // Its lifecycle reconnects in the background; leaving the picker open
+      // makes Enter retryable.
+      if (accepted !== false) props.onClose();
       return;
     }
     if (item.action === "install-app") {
@@ -2025,21 +2008,6 @@ export function SwitcherOverlay(props: {
     if (item.action === "manage-sessions") {
       props.onClose();
       props.onManageSessions?.();
-      return;
-    }
-    if (item.action === "change-layout") {
-      setLayoutMode(true);
-      if (props.activeLayout) {
-        setQuery(
-          props.activeLayout.name !== props.activeLayout.dsl
-            ? `${props.activeLayout.name}:${props.activeLayout.dsl}`
-            : props.activeLayout.dsl,
-        );
-      } else {
-        setQuery("");
-      }
-      searchRef?.focus();
-      searchRef?.select();
       return;
     }
     if (item.action === "clear-layout") {
@@ -2137,13 +2105,6 @@ export function SwitcherOverlay(props: {
       event.preventDefault();
       event.stopPropagation();
       setNewTerminalMode(false);
-      setQuery("");
-      return;
-    }
-    if (event.key === "Escape" && layoutMode()) {
-      event.preventDefault();
-      event.stopPropagation();
-      setLayoutMode(false);
       setQuery("");
       return;
     }
