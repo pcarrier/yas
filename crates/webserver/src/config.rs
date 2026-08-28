@@ -556,36 +556,65 @@ pub fn yas_socket_for_name(name: &str) -> String {
     local_socket_for_name(name)
 }
 
-/// The NixOS/systemd system socket is deliberately outside the private user
-/// runtime directory so PID 1 can create it. Probe it only when every path
-/// component controlled by the service is root-owned/non-writable and the
-/// socket itself is owned by this client UID. A prebind in `/tmp` never enters
-/// this packaged-system path.
+/// Probe packaged system-service sockets only when every path component has
+/// the expected owner and permissions. The NixOS module uses a private
+/// per-user directory because the server now binds its own socket; the legacy
+/// systemd socket unit places its PID-1-created listener directly below
+/// `/run/yas`.
 #[cfg(unix)]
 fn packaged_system_socket(name: &str) -> Option<String> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
     let user = std::env::var("USER").ok()?;
     if !valid_server_name(&user) || !valid_server_name(name) {
         return None;
     }
-    let parent = std::path::Path::new("/run/yas");
+    packaged_system_socket_from(
+        std::path::Path::new("/run/yas"),
+        &user,
+        name,
+        0,
+        crate::local_ipc::effective_uid(),
+    )
+}
+
+#[cfg(unix)]
+fn packaged_system_socket_from(
+    parent: &std::path::Path,
+    user: &str,
+    name: &str,
+    system_uid: u32,
+    client_uid: u32,
+) -> Option<String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
     let parent_metadata = std::fs::symlink_metadata(parent).ok()?;
     if !parent_metadata.file_type().is_dir()
-        || parent_metadata.uid() != 0
+        || parent_metadata.uid() != system_uid
         || parent_metadata.mode() & 0o022 != 0
     {
         return None;
     }
-    let path = parent.join(format!("{user}-{name}.sock"));
-    let metadata = std::fs::symlink_metadata(&path).ok()?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != crate::local_ipc::effective_uid()
-        || metadata.mode() & 0o077 != 0
+    let private = parent.join(user);
+    if let Ok(private_metadata) = std::fs::symlink_metadata(&private)
+        && private_metadata.file_type().is_dir()
+        && private_metadata.uid() == client_uid
+        && private_metadata.mode() & 0o077 == 0
     {
-        return None;
+        let path = private.join(format!("yas-{name}.sock"));
+        if let Ok(metadata) = std::fs::symlink_metadata(&path)
+            && metadata.file_type().is_socket()
+            && metadata.uid() == client_uid
+            && metadata.mode() & 0o077 == 0
+        {
+            return Some(path.to_string_lossy().into_owned());
+        }
     }
-    Some(path.to_string_lossy().into_owned())
+
+    let legacy = parent.join(format!("{user}-{name}.sock"));
+    let metadata = std::fs::symlink_metadata(&legacy).ok()?;
+    (metadata.file_type().is_socket()
+        && metadata.uid() == client_uid
+        && metadata.mode() & 0o077 == 0)
+        .then(|| legacy.to_string_lossy().into_owned())
 }
 
 /// Resolve the canonical native YAS server IPC pipe path (Windows).
@@ -1127,6 +1156,33 @@ fn parse_config_str(contents: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_system_socket_prefers_private_user_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let private = root.path().join("alice");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = private.join("yas-default.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = crate::local_ipc::effective_uid();
+
+        assert_eq!(
+            packaged_system_socket_from(root.path(), "alice", "default", uid, uid),
+            Some(socket.to_string_lossy().into_owned())
+        );
+
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            packaged_system_socket_from(root.path(), "alice", "default", uid, uid),
+            None
+        );
+    }
 
     // ── parse_config_str ──
 

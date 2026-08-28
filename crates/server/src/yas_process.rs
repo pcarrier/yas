@@ -372,6 +372,10 @@ impl Session {
             .then(|| self.inner.session_env.lock().unwrap().clone())
             .flatten();
         let clear_environment = request.environment_kind == wire::EnvironmentKind::Empty;
+        let preserve_residual = request
+            .surface_app_handle()
+            .map_err(|error| Error::Invalid(error.to_string()))?
+            .is_some();
         let started = self
             .inner
             .manager
@@ -379,6 +383,7 @@ impl Session {
                 process::NativeSpawnRequest {
                     process_id,
                     flags,
+                    preserve_residual,
                     cwd,
                     argv: request.argv.clone(),
                     env: request
@@ -1014,7 +1019,7 @@ fn backend_error(error: process::NativeError) -> Error {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use yas_wire::{Extensions, process::EnvEntry};
+    use yas_wire::{Extension, Extensions, process::EnvEntry};
 
     #[test]
     fn exit_replays_are_bounded_retryable_and_fifo_evicted() {
@@ -1063,6 +1068,49 @@ mod tests {
             .as_os_str()
             .as_bytes()
             .to_vec()
+    }
+
+    #[tokio::test]
+    async fn surface_app_launcher_keeps_its_process_group_alive() {
+        let server = Server::new(false, true);
+        let runtime = Runtime::new(server.clone());
+        let session = runtime.session([8; 16], None).unwrap();
+        let sleep = String::from_utf8(executable("sleep")).unwrap();
+        let mut request = spawn_request(
+            vec![
+                executable("sh"),
+                b"-c".to_vec(),
+                format!("({sleep} 0.15; printf survived) &").into_bytes(),
+            ],
+            Vec::new(),
+        );
+        request.flags =
+            (schema::process::SPAWN_DETACHABLE | schema::process::SPAWN_MERGE_STDERR) as u16;
+        request.stderr_receive_credit = 0;
+        request.extensions = Extensions(vec![Extension {
+            tag: schema::process::SPAWN_SURFACE_APP_EXTENSION as u16,
+            required: true,
+            value: 1u64.to_le_bytes().to_vec(),
+        }]);
+
+        let mut attachment = session.spawn(&request, None).await.unwrap();
+        let mut output = Vec::new();
+        let exit = loop {
+            match tokio::time::timeout(Duration::from_secs(2), attachment.next())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Event::Output { data, .. } => output.extend_from_slice(&data),
+                Event::Exit(exit) => break exit,
+                Event::StdinProgress { .. } => {}
+            }
+        };
+        assert_eq!(output, b"survived");
+        assert_eq!(exit.kind, wire::ExitKind::Code);
+        assert_eq!(exit.code, 0);
+        session.shutdown().await;
+        server.shutdown().await;
     }
 
     #[tokio::test]

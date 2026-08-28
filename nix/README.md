@@ -95,16 +95,16 @@ contents into a Nix expression, which would copy credentials to the Nix store.
 Each file must be readable by the server that reads it.
 
 Automatic Unix sockets are owner-only. On NixOS the YAS listener for user
-`alice` is `/run/yas/alice-default.sock`. An edge verifies the connected
+`alice` is `/run/yas/alice/yas-default.sock`. An edge verifies the connected
 server's kernel peer UID and normally runs as the same `user`. For an
 intentional explicit cross-UID socket, set the edge's `expectedServerUid` to
 the server's numeric UID; this changes the required identity and never
 disables the check.
 
-The NixOS module socket-activates each per-user server, so those listeners
-carry systemd's credentials and authenticate as root rather than as `user`.
-That is accepted without configuration; leave `expectedServerUid` unset unless
-you really are pointing an edge at another account's server.
+The NixOS module starts each per-user server at boot and the server binds its
+own listener. There is no socket unit and peer credentials identify `user`
+directly. Leave `expectedServerUid` unset unless you really are pointing an
+edge at another account's server.
 
 An edge passphrase grants full authority over its home server, including every
 published Relay route. The built-in edge listener is plaintext, so `addr`

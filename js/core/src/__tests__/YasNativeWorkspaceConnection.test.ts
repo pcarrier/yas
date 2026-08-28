@@ -898,7 +898,7 @@ describe("YasNativeWorkspaceConnection", () => {
     const second = lifecycle.refreshNativeSurfaceView(1n);
     expect(openView).toHaveBeenCalledOnce();
     expect(openView).toHaveBeenLastCalledWith(
-      expect.objectContaining({ decoderCapacity: 3, maxFps: 120 }),
+      expect.objectContaining({ decoderCapacity: 16, maxFps: 120 }),
     );
     result.resolve(view);
     await Promise.all([first, second]);
@@ -950,7 +950,7 @@ describe("YasNativeWorkspaceConnection", () => {
       const first = lifecycle.refreshNativeSurfaceView(1n);
       expect(openView).toHaveBeenCalledWith(
         expect.objectContaining({
-          decoderCapacity: 3,
+          decoderCapacity: 16,
           codecVersions: expect.arrayContaining([YAS_SURFACE_CODEC_H264_V1]),
         }),
       );
@@ -966,7 +966,7 @@ describe("YasNativeWorkspaceConnection", () => {
       expect(lifecycle.surfaceViews.has(1n)).toBe(false);
       expect(openView).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          decoderCapacity: 3,
+          decoderCapacity: 16,
           codecVersions: expect.arrayContaining([YAS_SURFACE_CODEC_AV1_V1]),
         }),
       );
@@ -1262,7 +1262,7 @@ describe("YasNativeWorkspaceConnection", () => {
       expect(oldView.reset).not.toHaveBeenCalled();
       expect(openView).toHaveBeenCalledWith(
         expect.objectContaining({
-          decoderCapacity: 3,
+          decoderCapacity: 16,
           codecVersions: expect.arrayContaining([YAS_SURFACE_CODEC_AV1_V1]),
         }),
       );

@@ -218,12 +218,12 @@ const textDecoder = new TextDecoder();
 const MAX_QUERY_BYTES = 8 * 1024 * 1024;
 // One slot turns the reliable Surface stream into stop-and-wait: every frame
 // has to cross the link, enter WebCodecs, and send its ACK back before the
-// server may emit the next one.  Worse, a compositor frame produced during
-// that round trip exhausts the window and makes the server request a fresh
-// keyframe.  Keep a small triple-buffered transport/decode window instead;
-// ACKs still release slots as soon as WebCodecs accepts a frame, so this does
-// not add presentation latency.
-const NATIVE_SURFACE_DECODER_CAPACITY = 3;
+// server may emit the next one. Worse, browser/native scheduling can batch
+// otherwise-immediate decode ACKs for about 100 ms. Cover that at 120 Hz plus
+// four scheduling slots. Byte credit independently bounds queued video, so
+// this sequence window supplies RTT headroom for small frames without
+// admitting a second oversized frame.
+const NATIVE_SURFACE_DECODER_CAPACITY = 16;
 
 interface NativeTerminalViewState {
   view: YasTerminalView;

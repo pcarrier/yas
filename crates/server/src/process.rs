@@ -275,6 +275,10 @@ pub(crate) struct NativeExit {
 pub(crate) struct NativeSpawnRequest {
     pub(crate) process_id: u32,
     pub(crate) flags: u8,
+    /// A surface application launcher may exit after handing ownership to a
+    /// process-group descendant. Keep that group alive and represent it as the
+    /// running Process until the group is actually empty.
+    pub(crate) preserve_residual: bool,
     pub(crate) cwd: Option<Vec<u8>>,
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<(Vec<u8>, Vec<u8>)>,
@@ -796,6 +800,7 @@ struct Pending {
     generation: u64,
     process_id: u32,
     detachable: bool,
+    preserve_residual: bool,
     request_bytes: usize,
     endpoint: Weak<Endpoint>,
     server: Weak<ServerInner>,
@@ -897,6 +902,7 @@ struct RecordInner {
 struct Record {
     generation: u64,
     detachable: bool,
+    preserve_residual: bool,
     pid: ProcessId,
     argv0: Vec<u8>,
     /// Absolute launch cwd. Linux PROCESS_CWD prefers the child's live cwd
@@ -1023,6 +1029,7 @@ impl Manager {
             generation,
             process_id: owned.process_id,
             detachable,
+            preserve_residual: request.preserve_residual,
             request_bytes,
             endpoint: Arc::downgrade(&self.endpoint),
             server: Arc::downgrade(&self.server.0),
@@ -1171,6 +1178,7 @@ impl Manager {
         let record = Arc::new(Record {
             generation: pending.generation,
             detachable: pending.detachable,
+            preserve_residual: pending.preserve_residual,
             pid,
             argv0: req.argv[0].to_vec(),
             cwd: process_cwd,
@@ -1438,7 +1446,10 @@ impl Manager {
             let Some(binding) = binding_index(&inner, self.endpoint.id, process_id) else {
                 return Err(NativeError::NotFound);
             };
-            if inner.child_outcome.is_some() || inner.terminal_queued {
+            let residual_running = record.preserve_residual
+                && inner.child_outcome.is_some()
+                && !inner.tree_cleanup_done;
+            if inner.terminal_queued || (inner.child_outcome.is_some() && !residual_running) {
                 return Err(NativeError::Conflict);
             }
             match action {
@@ -2515,13 +2526,44 @@ async fn wait_child(record: Arc<Record>, mut child: Child) {
     }
     record.mark_reaped();
     #[cfg(unix)]
-    let _ = graceful_terminate(&record);
+    if !record.preserve_residual {
+        let _ = graceful_terminate(&record);
+    }
     schedule_residual_cleanup(record.clone());
     try_queue_terminal(&record);
 }
 
 fn schedule_residual_cleanup(record: Arc<Record>) {
     tokio::spawn(async move {
+        #[cfg(unix)]
+        if record.preserve_residual {
+            let mut poll = tokio::time::interval(Duration::from_millis(50));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let changed = record.changed.notified();
+                let io_done = io_tasks_done(&record.inner.lock().unwrap());
+                let group_absent = process_group_absent(&record);
+                if io_done && group_absent {
+                    break;
+                }
+                tokio::select! {
+                    _ = changed => {}
+                    _ = poll.tick() => {}
+                }
+            }
+            {
+                let mut inner = record.inner.lock().unwrap();
+                if inner.tree_cleanup_done {
+                    return;
+                }
+                inner.tree_cleanup_done = true;
+                inner.terminate_timeout_armed = false;
+            }
+            record.changed.notify_waiters();
+            try_queue_terminal(&record);
+            return;
+        }
+
         let deadline = tokio::time::sleep(record.server.0.policy.kill_grace);
         tokio::pin!(deadline);
         loop {
@@ -2592,7 +2634,12 @@ fn io_tasks_done(inner: &RecordInner) -> bool {
 fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
     {
         let mut inner = record.inner.lock().unwrap();
-        if inner.child_outcome.is_some() || inner.terminal_queued || inner.terminate_timeout_armed {
+        let residual_running =
+            record.preserve_residual && inner.child_outcome.is_some() && !inner.tree_cleanup_done;
+        if (inner.child_outcome.is_some() && !residual_running)
+            || inner.terminal_queued
+            || inner.terminate_timeout_armed
+        {
             return;
         }
         inner.terminate_timeout_armed = true;
@@ -2604,13 +2651,21 @@ fn schedule_terminate_timeout(record: Arc<Record>, cause: u8) {
         .terminate_timeout_tasks
         .fetch_add(1, Ordering::AcqRel);
     tokio::spawn(async move {
-        let reaped = tokio::select! {
-            _ = record.wait_reaped() => true,
+        let finished = tokio::select! {
+            _ = async {
+                if record.preserve_residual {
+                    record.wait_tree_cleanup().await;
+                } else {
+                    record.wait_reaped().await;
+                }
+            } => true,
             _ = tokio::time::sleep(record.server.0.policy.kill_grace) => false,
         };
-        if !reaped {
+        if !finished {
             let mut inner = record.inner.lock().unwrap();
-            if inner.child_outcome.is_none() && !inner.terminal_queued {
+            let process_tree_running = inner.child_outcome.is_none()
+                || (record.preserve_residual && !inner.tree_cleanup_done);
+            if process_tree_running && !inner.terminal_queued {
                 if force_kill(&record).is_ok() {
                     inner.exit_override = Some(ExitOverride {
                         reason: PROCESS_EXIT_KILLED,
@@ -2839,7 +2894,9 @@ async fn terminate_record(record: &Arc<Record>, cause: u8, grace: Duration) {
     {
         let mut inner = record.inner.lock().unwrap();
         inner.stdin_tx.take();
-        if inner.child_outcome.is_none()
+        let process_tree_running =
+            inner.child_outcome.is_none() || (record.preserve_residual && !inner.tree_cleanup_done);
+        if process_tree_running
             && inner.exit_override.is_none()
             && cleanup_terminate(record).is_ok()
         {
@@ -2850,21 +2907,33 @@ async fn terminate_record(record: &Arc<Record>, cause: u8, grace: Duration) {
         }
     }
     record.changed.notify_waiters();
-    if tokio::time::timeout(grace, record.wait_reaped())
-        .await
-        .is_err()
-    {
+    let graceful = async {
+        if record.preserve_residual {
+            record.wait_tree_cleanup().await;
+        } else {
+            record.wait_reaped().await;
+        }
+    };
+    if tokio::time::timeout(grace, graceful).await.is_err() {
         {
             let mut inner = record.inner.lock().unwrap();
-            if inner.child_outcome.is_none() && force_kill(record).is_ok() {
+            let process_tree_running = inner.child_outcome.is_none()
+                || (record.preserve_residual && !inner.tree_cleanup_done);
+            if process_tree_running && force_kill(record).is_ok() {
                 inner.exit_override = Some(ExitOverride {
                     reason: PROCESS_EXIT_KILLED,
                     kill_cause: cause,
                 });
             }
         }
-        let _ =
-            tokio::time::timeout(grace.max(Duration::from_millis(100)), record.wait_reaped()).await;
+        let forced = async {
+            if record.preserve_residual {
+                record.wait_tree_cleanup().await;
+            } else {
+                record.wait_reaped().await;
+            }
+        };
+        let _ = tokio::time::timeout(grace.max(Duration::from_millis(100)), forced).await;
     }
     abort_pipes(record);
     let _ = tokio::time::timeout(
@@ -2965,6 +3034,13 @@ fn force_kill(record: &Record) -> io::Result<()> {
 #[cfg(unix)]
 fn process_tree_already_absent(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn process_group_absent(record: &Record) -> bool {
+    signal_group(record.pid, 0)
+        .err()
+        .is_some_and(|error| process_tree_already_absent(&error))
 }
 
 #[cfg(windows)]

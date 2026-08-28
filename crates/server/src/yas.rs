@@ -125,6 +125,10 @@ const TERMINAL_FRAME_COMPONENT_ALLOWANCE: u32 = 256 * 1024;
 // Below this floor the arithmetic is noise next to a round reservation, and it
 // leaves ordinary resizes inside the bound they were opened with.
 const TERMINAL_FRAME_FLOOR: u32 = 512 * 1024;
+// Cover a 60 Hz terminal across roughly one ordinary network RTT without
+// turning resize/output into an unbounded queue. Every codec-1 frame is an
+// independent keyframe, so presentation does not depend on its predecessor.
+const TERMINAL_MAX_INFLIGHT_FRAMES: u8 = 3;
 // Above the floor, a bound sized to the exact opening geometry leaves a view
 // no room to grow: CONFIGURE_VIEW refuses the first extra cell, the peer's
 // only recovery is to close the view and reopen it, and the frames it had go
@@ -4393,6 +4397,7 @@ struct TerminalView {
     // refuses a geometry that would outgrow it.
     frame_bound: u32,
     presentation_metrics: Option<yas_terminal::PresentationMetrics>,
+    max_inflight_frames: u8,
     queue_target: u8,
     decoder_queue_depth: u8,
     available_frame_slots: u8,
@@ -4403,8 +4408,9 @@ struct TerminalView {
     scroll_offset: i64,
     focused: bool,
     final_state: bool,
-    // Terminal advertises one in-flight decoded frame. This reservation shares
-    // the peer's aggregate receive budget with State, Transfer, and Surface.
+    // Terminal advertises a small in-flight decoded-frame window. This
+    // reservation shares the peer's aggregate receive budget with State,
+    // Transfer, and Surface.
     _outbound_credit: CreditLease,
     // The writer preserves FIFO within the Data lane. A receipt for the
     // newest queued frame therefore covers every older frame for this view.
@@ -5506,7 +5512,7 @@ fn terminal_feedback_advance(
     presented: u32,
 ) -> Result<Option<u32>, ()> {
     let sent = last_sent.wrapping_sub(acknowledged);
-    debug_assert!(sent <= 1);
+    debug_assert!(sent <= u32::from(TERMINAL_MAX_INFLIGHT_FRAMES));
     let advance = presented.wrapping_sub(acknowledged);
     if advance <= sent {
         Ok(Some(advance))
@@ -5520,7 +5526,7 @@ fn terminal_feedback_advance(
 fn terminal_view_has_frame_credit(view: &TerminalView) -> bool {
     let last_sent = view.next_sequence.wrapping_sub(1);
     let outstanding = last_sent.wrapping_sub(view.acknowledged_sequence);
-    outstanding < 1
+    outstanding < u32::from(view.max_inflight_frames)
         && view.available_frame_slots != 0
         && view.decoder_queue_depth < view.queue_target
 }
@@ -8603,6 +8609,7 @@ impl Session {
             width,
             height,
             max_fps: request.max_fps,
+            decoder_capacity: request.decoder_capacity,
             codec: surface_backend_codec(codec_version).ok_or(())?,
         };
         let Some(backend_client_id) = super::yas_surface_backend::register(
@@ -8720,6 +8727,7 @@ impl Session {
             width,
             height,
             max_fps: request.max_fps,
+            decoder_capacity: request.decoder_capacity,
             codec: surface_backend_codec(codec_version).ok_or(())?,
         };
         if !super::yas_surface_backend::configure(&state, backend_client_id, surface_id, config)
@@ -14190,12 +14198,20 @@ impl Session {
         }) {
             return Err(Status::ResourceExhausted);
         }
-        // One in-flight frame, bounded by what this view will declare. Sizing
-        // this by the session-wide `receive_max_decoded` charged every view
-        // 4 MiB of the outbound budget and ran it dry after two terminals.
+        // A small in-flight window, bounded by what this view will declare.
+        // Sizing this by the session-wide `receive_max_decoded` charged every
+        // view 4 MiB per slot and ran it dry after two terminals. Prefer the
+        // RTT-covering window, but shrink it before refusing a view when other
+        // panes already hold the peer's aggregate receive authority.
         let frame_bound =
             terminal_view_frame_bound(rows, cols).min(self.negotiated.peer_receive.max_decoded);
-        let Some(outbound_credit) = self.outbound_credit.try_lease_exact(u64::from(frame_bound))
+        let Some((max_inflight_frames, outbound_credit)) =
+            (1..=TERMINAL_MAX_INFLIGHT_FRAMES).rev().find_map(|frames| {
+                let view_window = u64::from(frame_bound) * u64::from(frames);
+                self.outbound_credit
+                    .try_lease_exact(view_window)
+                    .map(|credit| (frames, credit))
+            })
         else {
             return Err(Status::ResourceExhausted);
         };
@@ -14273,9 +14289,10 @@ impl Session {
                     max_fps,
                     frame_bound,
                     presentation_metrics: None,
-                    queue_target: 1,
+                    max_inflight_frames,
+                    queue_target: max_inflight_frames,
                     decoder_queue_depth: 0,
-                    available_frame_slots: 1,
+                    available_frame_slots: max_inflight_frames,
                     frame_owed: false,
                     frame_owed_final_guard: None,
                     next_sequence: 1,
@@ -14290,7 +14307,7 @@ impl Session {
         Ok(yas_terminal::OpenViewResult {
             view_id,
             codec_version: 1,
-            max_inflight_frames: 1,
+            max_inflight_frames,
             max_encoded_frame: frame_bound,
             max_decoded_frame: frame_bound,
             first_sequence: 1,
@@ -25974,6 +25991,7 @@ impl Session {
         &mut self,
         event: super::yas_surface_backend::Event,
     ) -> Result<(), ()> {
+        let state = self.services.app_state.clone().ok_or(())?;
         match event {
             super::yas_surface_backend::Event::Frame(frame) => {
                 if frame.data.is_empty() {
@@ -26002,11 +26020,25 @@ impl Session {
                     .saturating_sub(1)
                     .saturating_sub(view.acknowledged_sequence);
                 if outstanding >= u64::from(view.decoder_capacity) {
+                    let backend_client_id = view.backend_client_id;
                     view.needs_keyframe = true;
                     view.keyframe_requested = false;
+                    super::yas_surface_backend::discard_frame(
+                        &state,
+                        backend_client_id,
+                        frame.surface_id,
+                    )
+                    .await;
                     return Ok(());
                 }
                 if view.needs_keyframe && !frame.keyframe {
+                    let backend_client_id = view.backend_client_id;
+                    super::yas_surface_backend::discard_frame(
+                        &state,
+                        backend_client_id,
+                        frame.surface_id,
+                    )
+                    .await;
                     return Ok(());
                 }
                 if frame.keyframe {
@@ -26141,9 +26173,20 @@ impl Session {
             flags
         };
         let datagram_maximum = self.outbound_datagram_max() as usize;
+        let datagram_payload_maximum = datagram_maximum
+            .saturating_sub(5 + 48)
+            .min(yas_wire::frame::HARD_MAX_BULK_CHUNK as usize);
+        // A logical video frame is useful only when every fragment arrives.
+        // Splitting one across unreliable datagrams made loss probability
+        // compound with fragment count (dozens for an ordinary AV1 delta),
+        // creating sequence gaps, keyframe churn, and an ACK window full of
+        // bytes the browser could never retire. Keep the low-latency lane for
+        // complete single-packet frames; larger frames use bounded reliable
+        // delivery.
         let use_datagram = flags & yas_wire::schema::surface::FRAME_DATAGRAM_ELIGIBLE as u16 != 0
             && datagram_maximum > 5 + 48
-            && datagram_maximum <= reliable_maximum;
+            && datagram_maximum <= reliable_maximum
+            && payload.len() <= datagram_payload_maximum;
         let maximum = if use_datagram {
             reliable_maximum.min(datagram_maximum)
         } else {
@@ -26442,19 +26485,17 @@ impl Session {
             }
             let mut rearm = None;
             if outcome == TerminalFrameWriteOutcome::Discarded {
-                if view.next_sequence != receipt.sequence.wrapping_add(1)
-                    || view.acknowledged_sequence != receipt.sequence.wrapping_sub(1)
-                {
+                if view.next_sequence != receipt.sequence.wrapping_add(1) {
                     return Err(());
                 }
                 view.next_sequence = receipt.sequence;
                 view.available_frame_slots = view.available_frame_slots.checked_add(1).ok_or(())?;
                 view.final_state = false;
-                if rearm_owed && view.frame_owed && terminal_view_has_frame_credit(view) {
-                    let owed_final_guard = view.frame_owed_final_guard.take();
-                    view.frame_owed = false;
-                    rearm = Some((state, view.pty_id, view.backend_view, owed_final_guard));
-                }
+            }
+            if rearm_owed && view.frame_owed && terminal_view_has_frame_credit(view) {
+                let owed_final_guard = view.frame_owed_final_guard.take();
+                view.frame_owed = false;
+                rearm = Some((state, view.pty_id, view.backend_view, owed_final_guard));
             }
             rearm
         };
@@ -49409,6 +49450,48 @@ mod tests {
             &mut observer_frames,
         )
         .await;
+        write_event(
+            &mut observer,
+            &observer_codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::FRAME_ACK,
+            &yas_terminal::ViewFeedback {
+                view_id: opened.view_id,
+                presented_sequence: first.frame_sequence,
+                decoder_queue_depth: 0,
+                available_frame_slots: 0,
+            },
+        )
+        .await;
+        // Synchronize the observer connection before the owner stops the PTY;
+        // otherwise the wider frame window can legitimately admit the final
+        // frame before zero-slot feedback reaches the server.
+        write_request(
+            &mut observer,
+            &observer_codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::request::CWD,
+            67,
+            &yas_terminal::CwdQuery {
+                terminal_handle: created.terminal_handle,
+                generation: created.generation,
+                initial_receive_credit: 4096,
+                extensions: Extensions::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_sensitive_result(
+                &mut observer,
+                &observer_codec,
+                family::TERMINAL,
+                yas_wire::schema::terminal::request::CWD,
+                67,
+            )
+            .await
+            .status,
+            Status::Ok,
+        );
 
         write_request(
             &mut owner,
@@ -50671,6 +50754,7 @@ mod tests {
         .await;
         assert_eq!(opened.status, Status::Ok);
         let opened = yas_terminal::OpenViewResult::decode(&opened.body).unwrap();
+        assert_eq!(opened.max_inflight_frames, TERMINAL_MAX_INFLIGHT_FRAMES);
         let first =
             next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames).await;
 
@@ -50686,67 +50770,19 @@ mod tests {
             },
         )
         .await;
-        assert!(
-            timeout(
-                Duration::from_millis(150),
-                next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames,),
-            )
-            .await
-            .is_err(),
-            "a second frame crossed the one-frame in-flight window",
-        );
-
-        let feedback = |decoder_queue_depth, available_frame_slots| yas_terminal::ViewFeedback {
-            view_id: opened.view_id,
-            presented_sequence: first.frame_sequence,
-            decoder_queue_depth,
-            available_frame_slots,
-        };
-        write_event(
-            &mut client,
-            &codec,
-            family::TERMINAL,
-            yas_wire::schema::terminal::event::FRAME_ACK,
-            &feedback(0, 0),
-        )
-        .await;
-        assert!(
-            timeout(
-                Duration::from_millis(100),
-                next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames,),
-            )
-            .await
-            .is_err(),
-            "zero available slots did not withhold the coalesced frame",
-        );
-        write_event(
-            &mut client,
-            &codec,
-            family::TERMINAL,
-            yas_wire::schema::terminal::event::FRAME_ACK,
-            &feedback(1, 1),
-        )
-        .await;
-        assert!(
-            timeout(
-                Duration::from_millis(100),
-                next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames,),
-            )
-            .await
-            .is_err(),
-            "decoder depth at queue target did not withhold the coalesced frame",
-        );
-        write_event(
-            &mut client,
-            &codec,
-            family::TERMINAL,
-            yas_wire::schema::terminal::event::FRAME_ACK,
-            &feedback(0, 1),
-        )
-        .await;
-        let second =
+        let mut second =
             next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames).await;
         assert_eq!(second.frame_sequence, first.frame_sequence.wrapping_add(1),);
+        // PTY echo and the title escape can dirty the same terminal more than
+        // once. Consume the bounded burst before testing feedback gates.
+        while let Ok(frame) = timeout(
+            Duration::from_millis(50),
+            next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames),
+        )
+        .await
+        {
+            second = frame;
+        }
         assert_eq!(
             second
                 .decode_grid_codec1(SERVER_MAX_DECODED, None)
@@ -50755,6 +50791,94 @@ mod tests {
                 .as_deref(),
             Some("blocked-latest"),
         );
+
+        let feedback = |presented_sequence, decoder_queue_depth, available_frame_slots| {
+            yas_terminal::ViewFeedback {
+                view_id: opened.view_id,
+                presented_sequence,
+                decoder_queue_depth,
+                available_frame_slots,
+            }
+        };
+        write_event(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::FRAME_ACK,
+            &feedback(second.frame_sequence, 0, 0),
+        )
+        .await;
+        // A frame already admitted before zero-slot feedback crossed the
+        // connection is legitimate. Drain and acknowledge that race, then
+        // establish the zero-slot gate for the output below.
+        while let Ok(frame) = timeout(
+            Duration::from_millis(50),
+            next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames),
+        )
+        .await
+        {
+            second = frame;
+        }
+        write_event(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::FRAME_ACK,
+            &feedback(second.frame_sequence, 0, 0),
+        )
+        .await;
+        write_event(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::WRITE,
+            &yas_terminal::Write {
+                terminal_handle: created.terminal_handle,
+                data: b"printf '\x1b]0;blocked-slots\x07'\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames,),
+            )
+            .await
+            .is_err(),
+            "zero available slots did not withhold the next frame",
+        );
+        write_event(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::FRAME_ACK,
+            &feedback(
+                second.frame_sequence,
+                TERMINAL_MAX_INFLIGHT_FRAMES,
+                TERMINAL_MAX_INFLIGHT_FRAMES,
+            ),
+        )
+        .await;
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames,),
+            )
+            .await
+            .is_err(),
+            "decoder depth at queue target did not withhold the next frame",
+        );
+        write_event(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::FRAME_ACK,
+            &feedback(second.frame_sequence, 0, TERMINAL_MAX_INFLIGHT_FRAMES),
+        )
+        .await;
+        let third =
+            next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames).await;
+        assert_eq!(third.frame_sequence, second.frame_sequence.wrapping_add(1),);
 
         write_event(
             &mut client,
@@ -50772,31 +50896,58 @@ mod tests {
             &codec,
             family::TERMINAL,
             yas_wire::schema::terminal::event::FRAME_ACK,
-            &feedback(0, 1),
+            &feedback(first.frame_sequence, 0, 0),
         )
         .await;
-        assert!(
-            timeout(
-                Duration::from_millis(150),
-                next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames,),
+        let fourth = timeout(TEST_TIMEOUT, async {
+            let mut previous = third.frame_sequence;
+            loop {
+                let frame = next_terminal_frame_for(
+                    &mut client,
+                    &codec,
+                    opened.view_id,
+                    &mut pending_frames,
+                )
+                .await;
+                assert_eq!(frame.frame_sequence, previous.wrapping_add(1));
+                previous = frame.frame_sequence;
+                if frame
+                    .decode_grid_codec1(SERVER_MAX_DECODED, None)
+                    .unwrap()
+                    .title
+                    .as_deref()
+                    == Some("after-stale")
+                {
+                    break frame;
+                }
+                acknowledge_terminal_frame(&mut client, &codec, &frame).await;
+            }
+        })
+        .await
+        .expect("Terminal produced the title written after stale feedback");
+        acknowledge_terminal_frame(&mut client, &codec, &fourth).await;
+        let mut last = fourth;
+        let mut settled = false;
+        for _ in 0..8 {
+            match timeout(
+                Duration::from_millis(100),
+                next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames),
             )
             .await
-            .is_err(),
-            "stale feedback changed the current frame credit",
-        );
-        acknowledge_terminal_frame(&mut client, &codec, &second).await;
-        let third =
-            next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames).await;
-        assert_eq!(third.frame_sequence, second.frame_sequence.wrapping_add(1),);
-        assert_eq!(
-            third
-                .decode_grid_codec1(SERVER_MAX_DECODED, None)
-                .unwrap()
-                .title
-                .as_deref(),
-            Some("after-stale"),
-        );
-        acknowledge_terminal_frame(&mut client, &codec, &third).await;
+            {
+                Ok(frame) => {
+                    assert_eq!(frame.frame_sequence, last.frame_sequence.wrapping_add(1));
+                    acknowledge_terminal_frame(&mut client, &codec, &frame).await;
+                    last = frame;
+                }
+                Err(_) => {
+                    settled = true;
+                    break;
+                }
+            }
+        }
+        assert!(settled, "Terminal frame stream did not settle while idle");
+        acknowledge_terminal_frame(&mut client, &codec, &last).await;
         assert!(
             timeout(
                 Duration::from_millis(150),
@@ -50920,6 +51071,19 @@ mod tests {
         let opened = yas_terminal::OpenViewResult::decode(&opened.body).unwrap();
         let first =
             next_terminal_frame_for(&mut client, &codec, opened.view_id, &mut pending_frames).await;
+        write_event(
+            &mut client,
+            &codec,
+            family::TERMINAL,
+            yas_wire::schema::terminal::event::FRAME_ACK,
+            &yas_terminal::ViewFeedback {
+                view_id: opened.view_id,
+                presented_sequence: first.frame_sequence,
+                decoder_queue_depth: 0,
+                available_frame_slots: 0,
+            },
+        )
+        .await;
 
         write_request(
             &mut client,
@@ -50971,7 +51135,7 @@ mod tests {
             )
             .await
             .is_err(),
-            "FINAL_STATE crossed the outstanding one-frame window",
+            "FINAL_STATE crossed a zero-slot decoder window",
         );
 
         acknowledge_terminal_frame(&mut client, &codec, &first).await;

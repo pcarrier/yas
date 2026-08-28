@@ -2230,6 +2230,10 @@ struct SurfaceSubState {
     decoder_pressure_depth: u8,
     /// Start of the current continuously-high decoder-queue episode.
     decoder_queue_high_since: Option<Instant>,
+    /// Maximum complete frames this subscriber permits in flight. Native
+    /// Surface views set this from their negotiated decoder window; `None`
+    /// leaves legacy subscribers governed only by byte credit.
+    max_inflight_frames: Option<usize>,
     /// True while an encoder-creation spawn_blocking task is running
     /// for this surface.  Prevents dispatching a second creation in
     /// parallel and (via the `needs_new_encoder` path) skips encode
@@ -2325,6 +2329,11 @@ struct SurfaceSubState {
     /// `None` — the default — means the client participates in mediation via
     /// Surface Resize like any other viewer.
     scaled_target: Option<(u16, u16)>,
+    /// `scaled_target` is normally literal (for previews), but native Surface
+    /// views also use it to name their independent physical viewport. Those
+    /// views opt into transport downscaling while preserving that requested
+    /// box as the upper bound.
+    allow_adaptive_scale: bool,
     /// Explicit cadence ceiling from Surface Subscribe. `None` uses the
     /// client's display rate; thumbnails set a lower value without changing
     /// the cadence of a full-size view of another surface.
@@ -2344,6 +2353,17 @@ struct SurfaceSubState {
     /// otherwise a saturated link alternates between one expensive stall
     /// and an immediate walk back to maximum quality.
     congested_at: Option<Instant>,
+    /// Power-of-two server-side downscale applied after the ordinary
+    /// per-viewer target is chosen. This is transport adaptation only: it
+    /// never changes the compositor's logical size or the coordinate space
+    /// used for pointer input.
+    adaptive_scale_shift: u8,
+    /// Last time adaptive delivery changed the encoded extent.
+    scale_stepped_at: Option<Instant>,
+    /// Most recent time the ACK-derived delivery window could not carry one
+    /// frame at the requested display cadence. Recovery probes are measured
+    /// from this rather than from ordinary full bandwidth-delay pipelines.
+    delivery_pressure_at: Option<Instant>,
     /// Bit per Vulkan Video encoder whose 4:2:0 profile the compositor has
     /// refused for this client and surface (see
     /// [`SurfaceEncoderPreference::vulkan_refusal_bit`]). Latched at one
@@ -2454,19 +2474,28 @@ fn surface_encode_cap(
         .copied()
         .filter(|p| p.supported_by_client(codec_support))
         .collect();
-    let (cw, ch) = if sub.is_some_and(|s| s.encoder_cap_degraded) {
-        SurfaceEncoderPreference::tightest_for_list(&eligible)
-    } else if let Some(pref) = sub.and_then(|s| s.selected_encoder) {
-        Some(pref.max_dimensions())
-    } else {
-        SurfaceEncoderPreference::widest_for_list(&eligible)
-    }?;
+    let selected = sub.and_then(|s| s.selected_encoder);
     let (dw, dh) = match client.surface_max_decode {
         // Undeclared: hold at the H.264 ceiling. This is the conservative
         // limit for any session that omits an explicit decoder maximum.
         (0, 0) => SurfaceEncoderPreference::H264Software.max_dimensions(),
         declared => declared,
     };
+    let (cw, ch) = if sub.is_some_and(|s| s.encoder_cap_degraded) {
+        SurfaceEncoderPreference::tightest_for_list(&eligible)
+    } else if let Some(pref) = selected {
+        // Software AV1's performance limit is a pixel budget, not a 16:9
+        // rectangle. Preserve an already-declared non-16:9 target when its
+        // total work fits that budget instead of forcing it through 2160p.
+        if pref == SurfaceEncoderPreference::AV1Software && pref.fits(u32::from(dw), u32::from(dh))
+        {
+            Some((dw, dh))
+        } else {
+            Some(pref.max_dimensions())
+        }
+    } else {
+        SurfaceEncoderPreference::widest_for_list(&eligible)
+    }?;
     Some((cw.min(dw), ch.min(dh)))
 }
 
@@ -2797,6 +2826,10 @@ const SURFACE_INFLIGHT_HARD_MAX: usize = 8_192;
 /// reliable and ordered, so a larger window directly delays audio and input
 /// once the link is saturated.
 const SURFACE_CREDIT_QUEUE_SECS: f32 = 0.1;
+/// Small frames retain a two-frame bootstrap so a fresh path does not begin in
+/// RTT-bound stop-and-wait. Frames larger than the measured path window stay
+/// at one: their serialization time already covers the feedback interval.
+const SURFACE_CREDIT_BOOTSTRAP_FRAMES: usize = 2;
 /// Surface ACK callbacks arrive in batches. Aggregate long enough to smooth
 /// the JavaScript scheduling noise before changing the client-wide window.
 const SURFACE_GOODPUT_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
@@ -3181,17 +3214,52 @@ fn surface_credit_used_bytes(client: &ClientState) -> usize {
 fn surface_credit_limit_bytes(client: &ClientState, next_frame_bytes: usize) -> usize {
     let window_secs = path_rtt_ms(client).max(0.0) / 1_000.0 + SURFACE_CREDIT_QUEUE_SECS;
     let measured = (client.surface_goodput_bps.max(1.0) * window_secs).ceil() as usize;
-    measured.max(next_frame_bytes.max(1_024))
+    let next = next_frame_bytes.max(1_024);
+    // Two small frames avoid RTT-bound stop-and-wait when both fit inside the
+    // measured path window. An oversized frame already takes at least that
+    // whole window to serialize; admitting a second one only adds old video
+    // in front of input and audio without increasing useful throughput.
+    if next <= measured {
+        measured.max(next.saturating_mul(SURFACE_CREDIT_BOOTSTRAP_FRAMES))
+    } else {
+        next
+    }
 }
 
 /// Admit one more surface frame against a client-wide byte window. An empty
 /// window always admits one frame, even a keyframe larger than its estimate;
-/// reliable delivery then blocks every successor until that frame is ACKed.
+/// its bytes still count in full, so ordinary successors remain blocked until
+/// enough of that oversized frame is ACKed.
 fn surface_credit_open_for(client: &ClientState, next_frame_bytes: usize) -> bool {
     let used = surface_credit_used_bytes(client);
     used == 0
         || used.saturating_add(next_frame_bytes)
             <= surface_credit_limit_bytes(client, next_frame_bytes)
+}
+
+/// Admit a frame only when both the shared byte window and this surface's
+/// negotiated decoder window have room. The latter must be enforced before
+/// encoding: producing a delta which the protocol view then rejects advances
+/// the encoder reference chain without advancing the decoder's, forcing the
+/// next admitted frame to be another expensive keyframe.
+fn surface_frame_credit_open_for(
+    client: &ClientState,
+    surface_id: u16,
+    next_frame_bytes: usize,
+) -> bool {
+    let slot_open = client
+        .surface_subs
+        .get(&surface_id)
+        .and_then(|sub| sub.max_inflight_frames)
+        .is_none_or(|maximum| {
+            client
+                .surface_inflight_frames
+                .iter()
+                .filter(|frame| frame.surface_id == surface_id)
+                .count()
+                < maximum
+        });
+    slot_open && surface_credit_open_for(client, next_frame_bytes)
 }
 
 fn surface_work_order(client: &mut ClientState) -> SmallVec<[u16; 4]> {
@@ -3410,6 +3478,21 @@ const ADAPTIVE_STEP: u8 = 6;
 /// A backend that cannot retarget in place has to be rebuilt, which costs a
 /// keyframe — only worth it past this much accumulated drift.
 const ADAPTIVE_REBUILD_STEP: u8 = 24;
+/// Maximum linear downscale is 8x (64x fewer pixels). A 3400x2424 remote
+/// desktop can therefore prefer a roughly 424x302 stream at 120 Hz to a
+/// full-size stream that reaches the viewer only three times per second.
+const ADAPTIVE_MAX_SCALE_SHIFT: u8 = 3;
+/// A failed resolution probe can return to its sustainable target quickly,
+/// but not quickly enough to rebuild the encoder repeatedly on batched ACKs.
+const ADAPTIVE_SCALE_BACKOFF_INTERVAL: Duration = Duration::from_millis(750);
+/// Spare path capacity is unknowable from an app-limited stream. Probe one
+/// resolution step upward occasionally; pressure returns it to the prior
+/// extent if the link cannot carry it.
+const ADAPTIVE_SCALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
+/// A full delivery window is congestion evidence only when a frame is much
+/// larger than its share at the requested cadence. Filling an ordinary BDP
+/// with small frames is healthy pipelining, not a reason to degrade them.
+const ADAPTIVE_DELIVERY_PRESSURE_RATIO: f32 = 1.5;
 /// Blocked-write time within one step interval that counts as congestion.
 /// A write that blocks for a tenth of the interval means the socket, not the
 /// encoder, is setting the pace.
@@ -3543,6 +3626,37 @@ struct AdaptiveStep {
     /// A compositor-resident encoder is retargeted with this; a local one
     /// has already been retargeted in place.
     quantizer: Option<u8>,
+    /// Delivery pressure changed this client's encoded extent. The caller
+    /// must retire the old encoder and wait for the next tick, which derives
+    /// and registers the new target.
+    target_changed: bool,
+}
+
+/// Number of additional 2x linear downscale steps needed for the observed
+/// frame to fit its per-frame path budget. Each step quarters pixel count and
+/// therefore approximates a 4x byte reduction at a fixed quantizer.
+fn adaptive_scale_steps(observed_bytes: f32, budget_bytes: f32) -> u8 {
+    if observed_bytes <= 0.0 || budget_bytes <= 0.0 {
+        return 1;
+    }
+    let mut ratio = observed_bytes / budget_bytes;
+    let mut steps = 0;
+    while ratio > ADAPTIVE_DELIVERY_PRESSURE_RATIO && steps < ADAPTIVE_MAX_SCALE_SHIFT {
+        ratio /= 4.0;
+        steps += 1;
+    }
+    steps.max(1)
+}
+
+/// Apply transport adaptation to an already aspect-preserving encode target.
+/// Both axes use the same divisor; even rounding is required by every video
+/// backend and differs from the exact aspect by at most one source pixel.
+fn adaptive_surface_target(width: u32, height: u32, shift: u8) -> (u32, u32) {
+    let divisor = 1u32 << shift.min(ADAPTIVE_MAX_SCALE_SHIFT);
+    (
+        ((width / divisor) & !1).max(2),
+        ((height / divisor) & !1).max(2),
+    )
 }
 
 ///
@@ -3563,9 +3677,15 @@ fn step_adaptive_bandwidth(
         .surface_subs
         .get(&surface_id)
         .is_some_and(|sub| sub.decoder_pressure_depth > SURFACE_DECODE_QUEUE_ALLOWANCE);
+    let estimated_bytes = estimated_surface_frame_bytes(client, surface_id, false);
+    let budget_bytes = surface_budget_bytes(client, surface_id);
+    let delivery_window_full = !surface_frame_credit_open_for(client, surface_id, estimated_bytes)
+        && (budget_bytes <= 0.0
+            || estimated_bytes as f32 > budget_bytes * ADAPTIVE_DELIVERY_PRESSURE_RATIO);
     let congested = blocked_us.saturating_sub(client.write_blocked_us_seen)
         > WRITE_BLOCKED_CONGESTED_US
-        || decoder_backlogged;
+        || decoder_backlogged
+        || delivery_window_full;
     let previous_congestion = client
         .surface_subs
         .get(&surface_id)
@@ -3573,11 +3693,11 @@ fn step_adaptive_bandwidth(
     let recovering = previous_congestion.is_some();
     let recovery_hold = !congested
         && previous_congestion.is_some_and(|at| now.duration_since(at) < ADAPTIVE_CONGESTION_HOLD);
-    // Pressure evidence: the writer blocking on the socket, the outbox
-    // filling, or this surface's explicit WebCodecs queue growing.  Raw ACK
-    // depth and frame-arrival timing are deliberately absent: both include
-    // ordinary path / JavaScript scheduling jitter and produced false
-    // quality backoff on otherwise healthy links, especially Wi-Fi.
+    // Pressure evidence: the writer blocking on the socket, this surface's
+    // explicit WebCodecs queue growing, or its ACK-derived delivery window
+    // refusing the next estimated frame. Raw ACK age and callback timing are
+    // deliberately absent: both include ordinary JavaScript scheduling
+    // jitter and produced false quality backoff on otherwise healthy links.
     //
     // Deliberately *not* `browser_backlog_frames`, for the reason
     // `surface_pacing_fps` spells out: that counter is `pendingAppliedFrames`,
@@ -3595,7 +3715,6 @@ fn step_adaptive_bandwidth(
     // browser has temporarily batched.  Treat that link as app-limited so
     // the self-measured budget cannot walk quality down by itself.
     let app_limited = !congested && !recovery_hold;
-    let budget_bytes = surface_budget_bytes(client, surface_id);
     let ceiling = client
         .surface_subs
         .get(&surface_id)
@@ -3606,10 +3725,14 @@ fn step_adaptive_bandwidth(
     let held = AdaptiveStep {
         rebuild: false,
         quantizer: None,
+        target_changed: false,
     };
     let Some(sub) = client.surface_subs.get_mut(&surface_id) else {
         return held;
     };
+    if delivery_window_full {
+        sub.delivery_pressure_at = Some(now);
+    }
     let interval = if unchanged {
         STILL_REFRESH_INTERVAL
     } else if recovering && !congested {
@@ -3638,6 +3761,12 @@ fn step_adaptive_bandwidth(
         }
     } else if recovery_hold {
         current
+    } else if sub.adaptive_scale_shift > 0 && current == ADAPTIVE_MAX_QUANTIZER {
+        // While resolution is adapted, spend spare bytes on probing a larger
+        // picture, not on making the small picture more expensive. If the
+        // source stops, the `unchanged` arm may still refine the image that
+        // will remain on screen.
+        current
     } else {
         next_quantizer(RateSample {
             ceiling: ceiling_q,
@@ -3653,7 +3782,55 @@ fn step_adaptive_bandwidth(
     if !congested && !recovery_hold && next <= ceiling_q {
         sub.congested_at = None;
     }
-    if next == current {
+
+    let can_scale = sub.scaled_target.is_none() || sub.allow_adaptive_scale;
+    let pressure_scale_ready = sub
+        .scale_stepped_at
+        .is_none_or(|at| now.duration_since(at) >= ADAPTIVE_SCALE_BACKOFF_INTERVAL);
+    let recovery_scale_ready = sub
+        .scale_stepped_at
+        .is_none_or(|at| now.duration_since(at) >= ADAPTIVE_SCALE_RECOVERY_INTERVAL);
+    let mut target_changed = false;
+    let previous_shift = sub.adaptive_scale_shift;
+    if can_scale
+        && next == ADAPTIVE_MAX_QUANTIZER
+        && delivery_window_full
+        && pressure_scale_ready
+        && previous_shift < ADAPTIVE_MAX_SCALE_SHIFT
+    {
+        let additional = adaptive_scale_steps(sub.frame_bytes, budget_bytes);
+        sub.adaptive_scale_shift = previous_shift
+            .saturating_add(additional)
+            .min(ADAPTIVE_MAX_SCALE_SHIFT);
+        target_changed = sub.adaptive_scale_shift != previous_shift;
+    } else if can_scale
+        && previous_shift > 0
+        && !congested
+        && !recovery_hold
+        && !delivery_window_full
+        && recovery_scale_ready
+        && sub
+            .delivery_pressure_at
+            .is_some_and(|at| now.duration_since(at) >= ADAPTIVE_SCALE_RECOVERY_INTERVAL)
+    {
+        sub.adaptive_scale_shift -= 1;
+        target_changed = true;
+    }
+    if target_changed {
+        sub.scale_stepped_at = Some(now);
+        let shift_delta = sub.adaptive_scale_shift.abs_diff(previous_shift);
+        let area_factor = 4f32.powi(i32::from(shift_delta));
+        if sub.adaptive_scale_shift > previous_shift {
+            sub.frame_bytes = (sub.frame_bytes / area_factor).max(1.0);
+        } else {
+            sub.frame_bytes *= area_factor;
+        }
+        sub.has_keyframe = false;
+        sub.last_encoded_gen = None;
+        sub.pending_encode = None;
+    }
+
+    if next == current && !target_changed {
         // Nothing moved.  Reporting a step anyway would be harmless for a
         // live surface (a redundant set to the rate already in effect) but
         // a still one reads it as "the picture improved" and spends a
@@ -3682,6 +3859,7 @@ fn step_adaptive_bandwidth(
     AdaptiveStep {
         rebuild,
         quantizer: Some(next),
+        target_changed,
     }
 }
 
@@ -3762,6 +3940,12 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
         .filter_map(|s| s.adaptive_quantizer)
         .max();
     let adaptive_q_log = adaptive_q.map_or(-1i32, |q| q as i32);
+    let adaptive_scale_divisor = 1u16
+        << c.surface_subs
+            .values()
+            .map(|s| s.adaptive_scale_shift)
+            .max()
+            .unwrap_or(0);
     let encode_jobs = sess.surface_encode_jobs.max(1) as u64;
     let encode_queue_avg_us = sess.surface_encode_queue_us / encode_jobs;
     let encode_work_avg_us = sess.surface_encode_work_us / encode_jobs;
@@ -3793,7 +3977,7 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
         });
         let (surf_count, surf_pending, surf_subs) = surf_info.unwrap_or((0, 0, 0));
         eprintln!(
-            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms surface_decode_q={surface_decode_q} surface_decode_pressure={surface_decode_pressure} | tick_fires={} tick_snaps={} frame_req={} | surfaces={surf_count} subs={surf_subs} own_subs={own_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} enc_queue={encode_queue_avg_us}/{}us enc_work={encode_work_avg_us}/{}us enc_handoff={encode_handoff_avg_us}/{}us px_empty_ticks={} px_snap_len={} loop_iters={loop_iters} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} skip_no_subs={skip_no_subs} skip_not_subbed={skip_not_subbed} skip_mismatch={skip_mismatch} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst} adaptive_q={adaptive_q_log}",
+            "client {client_id}: sent={frames_sent} acks={acks_recv} rtt={rtt_ms:.0}ms min_rtt={min_rtt_ms:.0}ms eff_rtt={eff_rtt_ms:.0}ms window={window_frames}f/{window_bytes}B probe={probe_frames:.0}f goodput={goodput_bps:.0}B/s goodput_ewma={goodput_ewma_bps:.0}B/s jitter={goodput_jitter_bps:.0}/{max_goodput_jitter_bps:.0}B/s rate={delivery_bps:.0}B/s avg_frame={avg_frame_bytes:.0}B lead_frame={avg_paced_frame_bytes:.0}B preview_frame={avg_preview_frame_bytes:.0}B need={display_need_bps_v:.0}B/s display_fps={display_fps:.0} paced_fps={paced_fps:.0} surface_fps={surface_fps:.0} surface_frame={avg_surface_frame_bytes:.0}B backlog={browser_backlog_frames} ack_ahead={browser_ack_ahead_frames} apply={browser_apply_ms:.1}ms surface_decode_q={surface_decode_q} surface_decode_pressure={surface_decode_pressure} | tick_fires={} tick_snaps={} frame_req={} | surfaces={surf_count} subs={surf_subs} own_subs={own_subs} pending_req={surf_pending} commits={} encodes={} enc_bytes={} surf_sent={} enc_queue={encode_queue_avg_us}/{}us enc_work={encode_work_avg_us}/{}us enc_handoff={encode_handoff_avg_us}/{}us px_empty_ticks={} px_snap_len={} loop_iters={loop_iters} skip_same_gen={skip_same_gen} skip_in_flight={skip_in_flight} skip_pacing={skip_pacing} skip_vk_await={skip_vk_await} skip_no_subs={skip_no_subs} skip_not_subbed={skip_not_subbed} skip_mismatch={skip_mismatch} vk_surfs={vk_surfs} enc_in_flight_set={in_flight_set_len} burst={surface_burst} adaptive_q={adaptive_q_log} adaptive_scale=1/{adaptive_scale_divisor}",
             sess.tick_fires,
             sess.tick_snaps,
             sess.frame_requests,
@@ -4334,6 +4518,23 @@ fn record_surface_ack(client: &mut ClientState, surface_id: u16) {
     }
 }
 
+/// Retire a backend frame which the native protocol view did not admit.
+///
+/// The compositor delivery client accounts a frame when it enters the native
+/// event queue. A view can still reject that event when its decoder window is
+/// full or it is waiting for a replacement keyframe. Such a frame can never
+/// receive a browser ACK, so leaving it in the byte window permanently
+/// throttles unrelated future frames.
+fn discard_surface_frame(client: &mut ClientState, surface_id: u16) {
+    let matched = client
+        .surface_inflight_frames
+        .iter()
+        .rposition(|frame| frame.surface_id == surface_id);
+    if let Some(frame) = matched.and_then(|index| client.surface_inflight_frames.remove(index)) {
+        client.surface_inflight_bytes = client.surface_inflight_bytes.saturating_sub(frame.bytes);
+    }
+}
+
 /// Forget every unacked frame for `surface_id`.
 ///
 /// A surface that has gone away (unsubscribed, destroyed, resized) will
@@ -4374,7 +4575,16 @@ fn invalidate_client_surface(client: &mut ClientState, surface_id: u16, destroye
     if still_subscribed && let Some(previous) = previous {
         let state = client.surface_subs.entry(surface_id).or_default();
         state.scaled_target = previous.scaled_target;
+        state.allow_adaptive_scale = previous.allow_adaptive_scale;
         state.max_fps = previous.max_fps;
+        state.max_inflight_frames = previous.max_inflight_frames;
+        state.frame_bytes = previous.frame_bytes;
+        state.adaptive_quantizer = previous.adaptive_quantizer;
+        state.rate_stepped_at = previous.rate_stepped_at;
+        state.congested_at = previous.congested_at;
+        state.adaptive_scale_shift = previous.adaptive_scale_shift;
+        state.scale_stepped_at = previous.scale_stepped_at;
+        state.delivery_pressure_at = previous.delivery_pressure_at;
     }
 
     let had_vulkan = client.vulkan_video_surfaces.remove(&surface_id).is_some();
@@ -6277,9 +6487,7 @@ impl Session {
         &mut self,
         owner: [u8; 16],
         surface_id: u16,
-        width: u16,
-        height: u16,
-        scale_120: u16,
+        (width, height, scale_120): (u16, u16, u16),
         encoder_preferences: &[SurfaceEncoderPreference],
         verbose: bool,
     ) {
@@ -8971,7 +9179,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                         ),
                     );
                 }
-                continue;
             }
             // Per-surface pacing is checked in the inner loop below so
             // that each surface can run at full frame rate independently.
@@ -9143,10 +9350,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // (passing no logical size below): those pixels are a
                 // literal request, not a pane at a DPR to be reinterpreted.
                 let scaled = client.surface_subs.get(&sid).and_then(|s| s.scaled_target);
+                let adaptive_scale_shift = client
+                    .surface_subs
+                    .get(&sid)
+                    .map_or(0, |s| s.adaptive_scale_shift);
                 let view = scaled
                     .map(|(w, h)| (w, h, 120))
                     .or_else(|| client.surface_view_sizes.get(&sid).copied());
-                let (target_w, target_h) = Session::per_client_encode_target(
+                let target = Session::per_client_encode_target(
                     view,
                     native_w,
                     native_h,
@@ -9157,6 +9368,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                     },
                     surface_encode_cap(&state.config.surface_encoders, client, sid),
                 );
+                let (target_w, target_h) =
+                    adaptive_surface_target(target.0, target.1, adaptive_scale_shift);
                 // A target under a hardware encoder's minimum extent would
                 // fall through the whole chain to the compositor-resident
                 // tier.  Grow it to the floor instead: a sidebar preview is
@@ -9327,12 +9540,18 @@ async fn tick(state: &AppState) -> TickOutcome {
                     now,
                     actually_still,
                 );
-                if step.rebuild {
+                if step.rebuild || step.target_changed {
                     let sub = client.surface_subs.entry(sid).or_default();
                     retire_encoder(sub.encoder.take());
                     if sub.encode_in_flight || sub.creation_in_flight {
                         sub.encoder_invalidated = true;
                     }
+                }
+                if step.target_changed {
+                    // `target_w` above belongs to the previous scale. Let the
+                    // next tick derive the new extent and perform the normal
+                    // compositor target / Vulkan-session replacement once.
+                    continue;
                 }
                 // A compositor-resident encoder takes the new rate from the
                 // next frame on — no rebuild, no keyframe.  This is only
@@ -9459,7 +9678,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 0
                             };
                         let estimated_bytes = data.len().saturating_add(64);
-                        if !surface_credit_open_for(client, estimated_bytes) {
+                        if !surface_frame_credit_open_for(client, sid, estimated_bytes) {
                             client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
                             continue;
                         }
@@ -9727,7 +9946,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     resize_destination
                         .filter(|_| needs_new_encoder)
                         .map(|(cw, ch, cs120)| {
-                            let (w, h) = Session::per_client_encode_target(
+                            let target = Session::per_client_encode_target(
                                 view,
                                 cw as u32,
                                 ch as u32,
@@ -9746,6 +9965,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 },
                                 surface_encode_cap(&state.config.surface_encoders, client, sid),
                             );
+                            let (w, h) =
+                                adaptive_surface_target(target.0, target.1, adaptive_scale_shift);
                             // Grown against the native the configure is
                             // heading for, exactly as the live target above
                             // was grown against the current one.  Comparing a
@@ -10050,7 +10271,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // much finer the quantizer is.
                 let needs_kf = owes_keyframe || needs_new_encoder || still_refresh;
                 let reserved_bytes = estimated_surface_frame_bytes(client, sid, needs_kf);
-                if !surface_credit_open_for(client, reserved_bytes) {
+                if !surface_frame_credit_open_for(client, sid, reserved_bytes) {
                     client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
                     continue;
                 }
@@ -10536,7 +10757,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         estimated_surface_frame_bytes(client, result.sid, chained_needs_keyframe);
                     let can_chain = sent
                         && !surface_delivery_is_throttled(client, result.sid)
-                        && surface_credit_open_for(client, reserved_bytes);
+                        && surface_frame_credit_open_for(client, result.sid, reserved_bytes);
                     let state = client.surface_subs.entry(result.sid).or_default();
                     if can_chain
                         && let Some(pending) = pending
@@ -12974,6 +13195,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn surface_encode_cap_preserves_non_widescreen_software_av1_within_4k_pixels() {
+        let prefs = SurfaceEncoderPreference::defaults();
+        let mut c = decoder_client(CODEC_SUPPORT_AV1, (3400, 2424));
+        c.surface_subs.entry(1).or_default().selected_encoder =
+            Some(SurfaceEncoderPreference::AV1Software);
+
+        assert_eq!(surface_encode_cap(&prefs, &c, 1), Some((3400, 2424)));
+    }
+
     /// After a creation refused for size, the retry must be sized to what
     /// every eligible backend clears — otherwise the surface asks for the
     /// same impossible frame forever and never shows a picture.
@@ -14408,6 +14639,158 @@ mod tests {
     }
 
     #[test]
+    fn a_full_surface_delivery_window_backs_quality_off() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        client.rtt_ms = 50.0;
+        client.min_rtt_ms = 50.0;
+        client.surface_goodput_bps = 3_000_000.0;
+        let sid = 1;
+        let sub = client.surface_subs.entry(sid).or_default();
+        sub.frame_bytes = 800_000.0;
+        sub.max_inflight_frames = Some(3);
+        record_surface_frame_sent(&mut client, sid, 800_000, false, Instant::now());
+
+        let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+        let step = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Medium,
+            sid,
+            Instant::now(),
+            false,
+        );
+        assert!(step.quantizer.is_some_and(|quantizer| quantizer > ceiling));
+    }
+
+    #[test]
+    fn oversized_frames_adapt_resolution_at_the_quantizer_floor() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        client.rtt_ms = 50.0;
+        client.min_rtt_ms = 50.0;
+        client.surface_goodput_bps = 130_000.0;
+        let sid = 1;
+        let sub = client.surface_subs.entry(sid).or_default();
+        sub.frame_bytes = 40_000.0;
+        sub.max_inflight_frames = Some(8);
+        sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
+        sub.scaled_target = Some((3_400, 2_424));
+        sub.allow_adaptive_scale = true;
+        record_surface_frame_sent(&mut client, sid, 40_000, false, Instant::now());
+
+        let step = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Medium,
+            sid,
+            Instant::now(),
+            false,
+        );
+
+        assert!(step.target_changed);
+        assert_eq!(
+            client.surface_subs[&sid].adaptive_scale_shift,
+            ADAPTIVE_MAX_SCALE_SHIFT
+        );
+        assert_eq!(client.surface_subs[&sid].last_encoded_gen, None);
+        assert!(!client.surface_subs[&sid].has_keyframe);
+    }
+
+    #[test]
+    fn a_still_surface_recovers_its_full_resolution() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        client.surface_goodput_bps = 10_000_000.0;
+        let sid = 1;
+        let started = Instant::now();
+        let sub = client.surface_subs.entry(sid).or_default();
+        sub.frame_bytes = 1_000.0;
+        sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
+        sub.adaptive_scale_shift = ADAPTIVE_MAX_SCALE_SHIFT;
+        sub.scale_stepped_at = Some(started);
+        sub.delivery_pressure_at = Some(started);
+        sub.scaled_target = Some((3_400, 2_424));
+        sub.allow_adaptive_scale = true;
+
+        for step in 1..=ADAPTIVE_MAX_SCALE_SHIFT {
+            let result = step_adaptive_bandwidth(
+                &mut client,
+                SurfaceBandwidth::Medium,
+                sid,
+                started + ADAPTIVE_SCALE_RECOVERY_INTERVAL * u32::from(step),
+                true,
+            );
+            assert!(result.target_changed);
+            assert_eq!(
+                client.surface_subs[&sid].adaptive_scale_shift,
+                ADAPTIVE_MAX_SCALE_SHIFT - step,
+            );
+        }
+    }
+
+    #[test]
+    fn literal_scaled_subscriptions_do_not_adapt_their_requested_extent() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        client.rtt_ms = 50.0;
+        client.min_rtt_ms = 50.0;
+        client.surface_goodput_bps = 130_000.0;
+        let sid = 1;
+        let sub = client.surface_subs.entry(sid).or_default();
+        sub.frame_bytes = 40_000.0;
+        sub.max_inflight_frames = Some(8);
+        sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
+        sub.scaled_target = Some((314, 176));
+        record_surface_frame_sent(&mut client, sid, 40_000, false, Instant::now());
+
+        let step = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Medium,
+            sid,
+            Instant::now(),
+            false,
+        );
+
+        assert!(!step.target_changed);
+        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 0);
+    }
+
+    #[test]
+    fn a_healthy_full_decoder_window_does_not_adapt_resolution() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        client.rtt_ms = 50.0;
+        client.min_rtt_ms = 50.0;
+        client.surface_goodput_bps = 150_000.0;
+        let sid = 1;
+        let sub = client.surface_subs.entry(sid).or_default();
+        sub.frame_bytes = 1_000.0;
+        sub.max_inflight_frames = Some(8);
+        sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
+        for _ in 0..8 {
+            record_surface_frame_sent(&mut client, sid, 1_000, false, Instant::now());
+        }
+
+        let step = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Medium,
+            sid,
+            Instant::now(),
+            false,
+        );
+
+        assert!(!step.target_changed);
+        assert_eq!(client.surface_subs[&sid].adaptive_scale_shift, 0);
+    }
+
+    #[test]
+    fn adaptive_target_reduces_both_axes_and_keeps_encoder_parity() {
+        assert_eq!(adaptive_surface_target(3_400, 2_424, 0), (3_400, 2_424));
+        assert_eq!(adaptive_surface_target(3_400, 2_424, 1), (1_700, 1_212));
+        assert_eq!(adaptive_surface_target(3_400, 2_424, 3), (424, 302));
+        assert_eq!(adaptive_surface_target(2, 2, 3), (2, 2));
+    }
+
+    #[test]
     fn surface_budget_splits_by_measured_share() {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.goodput_bps = 1_000_000.0;
@@ -14719,6 +15102,27 @@ mod tests {
         record_surface_ack(&mut client, 2);
         assert_eq!(client.surface_inflight_frames.len(), 1);
         assert_eq!(client.surface_inflight_frames[0].surface_id, 1);
+    }
+
+    #[test]
+    fn rejected_native_surface_frame_returns_credit_without_goodput() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.surface_subs.entry(1).or_default();
+        client.surface_subs.entry(2).or_default();
+        let now = Instant::now();
+        record_surface_frame_sent(&mut client, 1, 1_000, false, now);
+        record_surface_frame_sent(&mut client, 2, 2_000, false, now);
+        record_surface_frame_sent(&mut client, 1, 3_000, false, now);
+
+        discard_surface_frame(&mut client, 1);
+
+        assert_eq!(client.surface_inflight_bytes, 3_000);
+        assert_eq!(client.acked_bytes_since_log, 0);
+        assert_eq!(client.surface_goodput_window_bytes, 0);
+        assert_eq!(client.surface_inflight_frames.len(), 2);
+        assert_eq!(client.surface_inflight_frames[0].surface_id, 1);
+        assert_eq!(client.surface_inflight_frames[0].bytes, 1_000);
+        assert_eq!(client.surface_inflight_frames[1].surface_id, 2);
     }
 
     #[test]
@@ -15340,6 +15744,26 @@ mod tests {
     }
 
     #[test]
+    fn surface_frame_credit_stops_at_the_negotiated_decoder_window() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.surface_goodput_bps = 1_000_000_000.0;
+        client
+            .surface_subs
+            .entry(1)
+            .or_default()
+            .max_inflight_frames = Some(3);
+
+        for _ in 0..3 {
+            assert!(surface_frame_credit_open_for(&client, 1, 1_000));
+            record_surface_frame_sent(&mut client, 1, 1_000, false, Instant::now());
+        }
+        assert!(!surface_frame_credit_open_for(&client, 1, 1_000));
+
+        record_surface_ack(&mut client, 1);
+        assert!(surface_frame_credit_open_for(&client, 1, 1_000));
+    }
+
+    #[test]
     fn surface_credit_reserves_parallel_encodes_before_they_finish() {
         let mut client = test_client();
         client.rtt_ms = 0.0;
@@ -15351,7 +15775,26 @@ mod tests {
             .or_default()
             .reserved_encode_bytes = 6_000;
 
+        assert!(surface_credit_open_for(&client, 6_000));
+        client
+            .surface_subs
+            .entry(2)
+            .or_default()
+            .reserved_encode_bytes = 6_000;
         assert!(!surface_credit_open_for(&client, 6_000));
+    }
+
+    #[test]
+    fn surface_credit_bootstraps_two_frames_that_fit_the_measured_window() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.rtt_ms = 0.0;
+        client.min_rtt_ms = 0.0;
+        client.surface_goodput_bps = 200_000.0;
+
+        record_surface_frame_sent(&mut client, 1, 2_000, false, Instant::now());
+        assert!(surface_credit_open_for(&client, 10_000));
+        record_surface_frame_sent(&mut client, 1, 10_000, false, Instant::now());
+        assert!(!surface_credit_open_for(&client, 10_000));
     }
 
     #[test]
@@ -15363,6 +15806,7 @@ mod tests {
 
         assert!(surface_credit_open_for(&client, 300_000));
         record_surface_frame_sent(&mut client, 1, 300_000, true, Instant::now());
+        assert!(!surface_credit_open_for(&client, 300_000));
         assert!(!surface_credit_open_for(&client, 1_000));
     }
 

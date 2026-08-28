@@ -36,11 +36,12 @@ const AV1_HW_MAX_HEIGHT: u16 = 4352;
 
 /// Software AV1 (rav1e) cap.  rav1e imposes no dimension limit of its own,
 /// but it is CPU-bound: past 4K even speed preset 10 falls far enough behind
-/// that the stream stops being interactive.  Held at the H.264 ceiling so the
-/// software fallback degrades into a lower frame rate rather than into a
-/// surface that never finishes a frame.
+/// that the stream stops being interactive. The dimensions define a 4K pixel
+/// budget; [`SurfaceEncoderPreference::fits`] applies it by area so taller
+/// aspect ratios do not get needlessly reduced to 2160 rows.
 const AV1_SW_MAX_WIDTH: u16 = 3840;
 const AV1_SW_MAX_HEIGHT: u16 = 2160;
+const AV1_SW_MAX_PIXELS: u64 = AV1_SW_MAX_WIDTH as u64 * AV1_SW_MAX_HEIGHT as u64;
 
 impl SurfaceEncoderPreference {
     pub fn parse(value: &str) -> Option<Self> {
@@ -215,6 +216,14 @@ impl SurfaceEncoderPreference {
 
     /// Whether this encoder can carry a `width`x`height` frame.
     pub fn fits(self, width: u32, height: u32) -> bool {
+        if self == Self::AV1Software {
+            // rav1e has no 16:9 dimension restriction. This is a CPU-work
+            // budget, so a tall or square frame with no more pixels than 4K
+            // is just as viable as 3840x2160.
+            return width <= u32::from(AV1_HW_MAX_WIDTH)
+                && height <= u32::from(AV1_HW_MAX_HEIGHT)
+                && u64::from(width).saturating_mul(u64::from(height)) <= AV1_SW_MAX_PIXELS;
+        }
         let (max_w, max_h) = self.max_dimensions();
         width <= max_w as u32 && height <= max_h as u32
     }
@@ -3164,6 +3173,8 @@ mod tests {
         // so it is held at the H.264 ceiling deliberately.
         assert!(!SurfaceEncoderPreference::AV1Software.fits(5120, 2880));
         assert!(SurfaceEncoderPreference::AV1Software.fits(3840, 2160));
+        assert!(SurfaceEncoderPreference::AV1Software.fits(3400, 2424));
+        assert!(!SurfaceEncoderPreference::AV1Software.fits(3840, 2162));
     }
 
     /// A backend that cannot carry the frame must be refused here, so the

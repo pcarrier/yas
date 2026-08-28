@@ -54,6 +54,7 @@ import { t, tp } from "./i18n";
 import { getInstallPrompt, clearInstallPrompt } from "./installPrompt";
 import { stabilizeSections } from "./switcherStabilize";
 import { placeApplicationSection } from "./switcherSections";
+import { retainSwitcherFocus } from "./switcherFocus";
 import { createLazyIcons } from "./lazyIcons";
 import { AppIcon } from "./panelKit";
 import {
@@ -883,10 +884,9 @@ export function SwitcherOverlay(props: {
       : query().trim();
   const searching = () => !isCommand() && searchPart().length > 0;
 
-  // Application rows fetch their artwork as they scroll into view; the token
-  // has to name the server as well as the application, since two of them can
-  // have the same id.
-  const lazyIcons = createLazyIcons((tokens) => {
+  // The token has to name the server as well as the application, since two of
+  // them can have the same id.
+  const requestIconTokens = (tokens: string[]) => {
     const byConnection = new Map<string, string[]>();
     for (const token of tokens) {
       const space = token.indexOf(" ");
@@ -899,7 +899,10 @@ export function SwitcherOverlay(props: {
     for (const [connectionId, ids] of byConnection) {
       requestApplicationIcons(connectionId, ids);
     }
-  });
+  };
+  // Rows outside the first screen still load lazily; asking for a whole
+  // machine's catalog can mean hundreds of icons and tens of megabytes.
+  const lazyIcons = createLazyIcons(requestIconTokens);
 
   /** Every connection the workspace holds, in its own order. The catalog store
    *  answers only for the ones whose server runs a supervisor, so this needs no
@@ -956,7 +959,8 @@ export function SwitcherOverlay(props: {
   });
 
   onMount(() => {
-    searchRef?.focus();
+    if (!wrapperRef || !searchRef) return;
+    onCleanup(retainSwitcherFocus(wrapperRef, searchRef));
   });
 
   const sessionsById = createMemo(
@@ -1690,6 +1694,17 @@ export function SwitcherOverlay(props: {
       if (len === 0) return 0;
       return Math.min(current, len - 1);
     });
+  });
+
+  // IntersectionObserver does not run until after the first paint. Prime the
+  // first screen synchronously so a typed application result does not spend a
+  // frame showing its fallback glyph before its icon request even starts.
+  createEffect(() => {
+    const tokens = flatItems()
+      .filter((item): item is AppItem => item.type === "app")
+      .slice(0, 16)
+      .map((item) => `${item.connectionId} ${item.appId}`);
+    if (tokens.length > 0) requestIconTokens(tokens);
   });
 
   // Reset selection when query changes.

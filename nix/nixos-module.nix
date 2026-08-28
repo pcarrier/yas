@@ -117,8 +117,8 @@ in
         "bob"
       ];
       description = ''
-        Users to enable yas for. Each user gets a socket-activated
-        yas server instance at /run/yas/<user>-default.sock.
+        Users to enable yas for. Each user gets a continuously running
+        yas server instance at /run/yas/<user>/yas-default.sock.
       '';
     };
 
@@ -457,7 +457,7 @@ in
         name = "yas-server@${user}";
         value = {
           description = "yas terminal multiplexer for ${user}";
-          requires = [ "yas-server@${user}.socket" ];
+          wantedBy = [ "multi-user.target" ];
           # Audio spawns pipewire / wireplumber / dbus-daemon by name,
           # so they need to be on $PATH.  Language servers likewise are
           # spawned by name and discovered via PATH (docs/design/lsp.md).
@@ -486,8 +486,8 @@ in
             ++ cfg.languageServers
             # Whatever the extensions on this server shell out to.
             ++ cfg.extensions.path
-            # A socket-activated system service does not source /etc/profile,
-            # but exact-argv terminals and extensions still need the user's
+            # A system service does not source /etc/profile, but exact-argv
+            # terminals and extensions still need the user's
             # normal Nix profiles. In particular, muster can find `direnv`
             # in the per-user profile and `nix` in the default profile before
             # entering a checkout's flake environment.
@@ -499,6 +499,8 @@ in
             ExecStart = "${cfg.package}/bin/yas server";
             RuntimeDirectory = "yas/${user}";
             RuntimeDirectoryMode = "0700";
+            Restart = "on-failure";
+            RestartSec = "1s";
             # Let PipeWire's module-rt put the graph thread on SCHED_FIFO.
             #
             # The audio graph runs a 21 ms cycle and shares this host with
@@ -530,7 +532,7 @@ in
               ++ lib.optional (cfg.fonts.dirs != [ ]) "YAS_FONT_DIRS=${lib.concatStringsSep ":" cfg.fonts.dirs}"
               ++ lib.optional (!cfg.relay.enable) "YAS_RELAY=0"
               ++ lib.optional (lib.hasAttr user cfg.relay.remoteFiles) "YAS_REMOTES=${cfg.relay.remoteFiles.${user}}"
-              ++ [ "YAS_SOCK=/run/yas/${user}-default.sock" ]
+              ++ [ "YAS_SOCK=/run/yas/${user}/yas-default.sock" ]
               ++ hostedEnvFor user;
           }
           // lib.optionalAttrs (hostedPassFilesFor user != [ ]) {
@@ -540,21 +542,5 @@ in
       }) cfg.users
     );
 
-    systemd.sockets = builtins.listToAttrs (
-      map (user: {
-        name = "yas-server@${user}";
-        value = {
-          description = "yas terminal multiplexer socket for ${user}";
-          wantedBy = [ "sockets.target" ];
-          socketConfig = {
-            ListenStream = "/run/yas/${user}-default.sock";
-            SocketUser = user;
-            SocketMode = "0700";
-            RuntimeDirectory = "yas";
-            RuntimeDirectoryMode = "0755";
-          };
-        };
-      }) cfg.users
-    );
   };
 }

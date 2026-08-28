@@ -42,7 +42,7 @@ const SOCKET_SEARCH_CANDIDATES: &str = r#"if [ -n "$XDG_RUNTIME_DIR" ] && priv "
 fn socket_search_script() -> String {
     let prefix = "P=yas; ";
     let explicit = r#"[ -n "$YAS_SOCK" ] && { printf "%s\n" "$YAS_SOCK"; exit 0; }; "#;
-    let packaged = r#"if [ -n "$U" ] && system_dir "/run/yas"; then S="/run/yas/$U-$N.sock"; sock "$S" && emit "$S"; fi; "#;
+    let packaged = r#"if [ -n "$U" ] && system_dir "/run/yas"; then D="/run/yas/$U"; S="$D/yas-$N.sock"; priv "$D" && sock "$S" && emit "$S"; S="/run/yas/$U-$N.sock"; sock "$S" && emit "$S"; fi; "#;
     [
         "sh -c '",
         prefix,
@@ -763,6 +763,8 @@ mod tests {
                 .success()
         );
         assert!(native.contains("$YAS_SOCK"));
+        assert!(native.contains("D=\"/run/yas/$U\""));
+        assert!(native.contains("S=\"$D/yas-$N.sock\""));
         assert!(native.contains("/run/yas/$U-$N.sock"));
         assert!(native.contains("system_dir \"/run/yas\""));
         assert!(!native.contains("$XDG_RUNTIME_DIR/$P-$N.sock"));

@@ -169,6 +169,7 @@ export {
   GIT_REF_PEELED_VALID,
   GIT_REF_SYMBOLIC,
   GIT_STATUS_ENTRY_CONFLICTED,
+  GIT_STATUS_NOT_FOUND,
   GIT_STATUS_OK,
   GIT_UPSTREAM_COUNTS_VALID,
   GIT_UPSTREAM_GONE,
@@ -180,6 +181,7 @@ export {
   GIT_WORKTREE_PRUNABLE,
   gitOidFromHex,
   gitOidHex,
+  gitStatusText,
 } from "./gitModel";
 export type { GitOid, GitPatchRecord, GitWorktreeRecord } from "./gitModel";
 export { GitStateMirror, GitStatusError } from "./gitModel";

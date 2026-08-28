@@ -1,4 +1,4 @@
-import { For, onCleanup } from "solid-js";
+import { For, Show, onCleanup } from "solid-js";
 import type { TerminalPalette } from "@yas-run/core";
 import type { WorkspaceSessionController } from "./workspaceSession";
 import { mergeStyle, themeFor, ui, uiScale } from "./theme";
@@ -22,6 +22,12 @@ export function WorkspaceSessionTabs(props: {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
   const tabRefs = new Map<string, HTMLButtonElement>();
+  const managerNotice = () => {
+    const error = props.controller.error();
+    if (error) return error;
+    const count = props.controller.warnings().length;
+    return count > 0 ? `${count} workspace session warning${count === 1 ? "" : "s"}` : null;
+  };
 
   const selectAt = (index: number) => {
     const sessions = orderedWorkspaceSessionTabs(props.controller);
@@ -159,8 +165,12 @@ export function WorkspaceSessionTabs(props: {
       </div>
       <button
         type="button"
-        aria-label={t("sessions.openManager")}
-        title={t("sessions.openManager")}
+        aria-label={
+          managerNotice()
+            ? `${t("sessions.openManager")}: ${managerNotice()}`
+            : t("sessions.openManager")
+        }
+        title={managerNotice() ?? t("sessions.openManager")}
         style={mergeStyle(ui.btn, {
           color: theme().fg,
           opacity: 1,
@@ -173,6 +183,7 @@ export function WorkspaceSessionTabs(props: {
           display: "grid",
           "place-items": "center",
           "outline-color": theme().accent,
+          position: "relative",
         })}
         onClick={() => openWorkspaceSessionManager(props.controller)}
       >
@@ -189,6 +200,20 @@ export function WorkspaceSessionTabs(props: {
           <rect x="2" y="6.5" width="12" height="3" />
           <rect x="2" y="11" width="12" height="3" />
         </svg>
+        <Show when={managerNotice()}>
+          <span
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              top: "1px",
+              right: "1px",
+              width: "5px",
+              height: "5px",
+              "border-radius": "50%",
+              "background-color": theme().error,
+            }}
+          />
+        </Show>
       </button>
     </nav>
   );

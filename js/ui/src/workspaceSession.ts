@@ -23,7 +23,6 @@ export interface WorkspaceSessionBinding {
   setRemoteActive(name: string, active: boolean): Promise<void>;
   /** Workspace calls after its first stable-reference resolution pass. */
   finishRestoring(): void;
-  openManager(): void;
 }
 
 export interface WorkspaceSessionAttachmentLike {
@@ -228,7 +227,6 @@ export function createWorkspaceSessionController(
     const next = snapshot.device?.attachedSessionIds ?? [];
     setAttachedIds(next);
     setDeviceStoreError(snapshot.error ? snapshot.error.message : null);
-    if (snapshot.error) setManagerOpen(true);
     schedulePruneDeleted();
 
     const selectedId = current()?.id;
@@ -258,7 +256,6 @@ export function createWorkspaceSessionController(
       (record) => `${record.key}: ${record.message}`,
     );
     setWarnings(invalidWarnings);
-    if (invalidWarnings.length > 0) setManagerOpen(true);
     // A ready catalogue reports quarantined documents through both `error`
     // and `invalidRecords`; those are warnings, not a transport failure.
     const operationalError =
@@ -266,7 +263,6 @@ export function createWorkspaceSessionController(
         ? null
         : snapshot.error;
     setSessionStoreError(operationalError?.message ?? null);
-    if (operationalError) setManagerOpen(true);
     schedulePruneDeleted();
   };
 
@@ -356,7 +352,6 @@ export function createWorkspaceSessionController(
       )
         .catch((cause) => {
           setActionError(message(cause));
-          setManagerOpen(true);
         })
         .finally(() => {
           pruneScheduled = false;
@@ -413,7 +408,6 @@ export function createWorkspaceSessionController(
       if (attachment?.id === id) setCurrent(updated);
     } catch (cause) {
       setActionError(message(cause));
-      setManagerOpen(true);
       failedAction = () => patchSession(id, value);
       throw cause;
     }
@@ -433,7 +427,6 @@ export function createWorkspaceSessionController(
       if (attachment?.id === id) setCurrent(updated);
     } catch (cause) {
       setActionError(message(cause));
-      setManagerOpen(true);
       failedAction = () => enqueueRemoteActiveFor(id, name, active);
       throw cause;
     }
@@ -488,7 +481,6 @@ export function createWorkspaceSessionController(
         if (disposed || ticket !== operation) return;
         latestSelectionIntentId = attachment.id;
         setActionError(message(cause));
-        setManagerOpen(true);
         failedAction = () => selectSession(id, "replace", true);
         schedulePostMutationReconcile();
         throw cause;
@@ -559,7 +551,6 @@ export function createWorkspaceSessionController(
         finishRestoring: () => {
           if (attachment === next) setRestoring(false);
         },
-        openManager: () => setManagerOpen(true),
       });
       failedAction = null;
       writeWorkspaceSessionUrl(value.id, mode);
@@ -571,7 +562,6 @@ export function createWorkspaceSessionController(
       if (disposed || ticket !== operation) return;
       latestSelectionIntentId = attachment?.id ?? null;
       setActionError(message(cause));
-      setManagerOpen(true);
       schedulePostMutationReconcile();
       throw cause;
     }
@@ -589,11 +579,11 @@ export function createWorkspaceSessionController(
       try {
         await selectSession(target, "replace", false);
       } catch {
-        // selectSession exposes the backend error and opens the manager.
+        // selectSession retains the backend error for the tab-bar badge and
+        // the manager's next explicit opening.
       }
     } else {
       writeWorkspaceSessionUrl(null, "replace");
-      setManagerOpen(true);
     }
   }
 
@@ -607,7 +597,6 @@ export function createWorkspaceSessionController(
     }
     const before = attachedIds();
     setActionError("The selected workspace session no longer exists");
-    setManagerOpen(true);
     let after = before.filter((candidate) => candidate !== id);
     try {
       const device = await withLocalDeviceMutation(() =>
@@ -624,7 +613,7 @@ export function createWorkspaceSessionController(
       try {
         await selectSession(target, "replace", false);
       } catch {
-        // The manager already contains the actionable error.
+        // The manager will contain the actionable error when opened.
       }
     } else {
       writeWorkspaceSessionUrl(null, "replace");
@@ -663,7 +652,6 @@ export function createWorkspaceSessionController(
       if (reservedTicket !== operation) return;
       clearSelected(false);
       writeWorkspaceSessionUrl(null, mode);
-      setManagerOpen(true);
       return;
     }
 
@@ -718,7 +706,6 @@ export function createWorkspaceSessionController(
       clearSelected(false);
       writeWorkspaceSessionUrl(null, mode);
       if (cleanupError) setActionError(cleanupError);
-      setManagerOpen(true);
     }
   };
 
@@ -758,18 +745,15 @@ export function createWorkspaceSessionController(
       if (request.present && !request.id) {
         reserveSelectionIntent(attachment?.id ?? null);
         setActionError("The URL contains an invalid workspace session ID");
-        setManagerOpen(true);
       } else if (requested) {
         await selectSession(requested, "replace", true);
       } else {
         await selectBase("replace");
       }
 
-      if (warnings().length > 0) setManagerOpen(true);
     } catch (cause) {
       if (!disposed) {
         setActionError(message(cause));
-        setManagerOpen(true);
       }
     } finally {
       if (!disposed) setLoading(false);
@@ -807,7 +791,6 @@ export function createWorkspaceSessionController(
     if (request.present && !request.id) {
       reserveSelectionIntent(attachment?.id ?? null);
       setActionError("The URL contains an invalid workspace session ID");
-      setManagerOpen(true);
       navigationTarget = undefined;
       return;
     }
@@ -876,7 +859,6 @@ export function createWorkspaceSessionController(
         if (target) await selectSession(target, mode, false);
         else {
           writeWorkspaceSessionUrl(null, mode);
-          setManagerOpen(true);
         }
       } catch (cause) {
         if (selected && ticket === operation) {
@@ -884,7 +866,6 @@ export function createWorkspaceSessionController(
           schedulePostMutationReconcile();
         }
         setActionError(message(cause));
-        setManagerOpen(true);
         throw cause;
       } finally {
         if (removingSessionId === id) removingSessionId = null;
@@ -900,7 +881,6 @@ export function createWorkspaceSessionController(
         );
       } catch (cause) {
         setActionError(message(cause));
-        setManagerOpen(true);
         throw cause;
       }
     },
@@ -917,7 +897,6 @@ export function createWorkspaceSessionController(
         syncStore();
       } catch (cause) {
         setActionError(message(cause));
-        setManagerOpen(true);
         throw cause;
       }
     },
@@ -948,7 +927,6 @@ export function createWorkspaceSessionController(
           // The deleted record cannot remain a visible tab; the catalogue
           // pruner will retry removing the stale device membership.
           setActionError(message(cause));
-          setManagerOpen(true);
         }
       } catch (cause) {
         if (selected && ticket === operation) {
@@ -956,7 +934,6 @@ export function createWorkspaceSessionController(
           schedulePostMutationReconcile();
         }
         setActionError(message(cause));
-        setManagerOpen(true);
         throw cause;
       } finally {
         removingSessionId = null;
@@ -974,10 +951,8 @@ export function createWorkspaceSessionController(
       clearSelected();
       if (target) {
         await selectSession(target, mode, false);
-        setManagerOpen(true);
       } else {
         writeWorkspaceSessionUrl(null, mode);
-        setManagerOpen(true);
       }
     },
     async setRemoteActive(name, active) {
@@ -989,7 +964,7 @@ export function createWorkspaceSessionController(
       setManagerOpen(true);
     },
     closeManager() {
-      if (attachment) setManagerOpen(false);
+      setManagerOpen(false);
     },
     dispose() {
       if (disposed) return;

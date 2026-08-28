@@ -1,11 +1,74 @@
 import { describe, expect, it, vi } from "vitest";
 import { YasNativeChannelFacade } from "../yas/nativeChannelFacade";
 import { YasChannelCatalogue, type YasChannelConnection } from "../yas/channel";
-import type { YasConnection } from "../yas/session";
+import { YasConnection } from "../yas/session";
 import { YasStateSubscription } from "../yas/state";
 import type { YasTransfer } from "../yas/transfer";
+import { MockYasTransport } from "./mock-yas-transport";
 
 describe("YasNativeChannelFacade", () => {
+  it("wakes queued adapters when an asynchronous send releases its reservation", async () => {
+    let finishSend!: () => void;
+    const sending = new Promise<void>((resolve) => {
+      finishSend = resolve;
+    });
+    const credit = vi.fn();
+    const transfer = {
+      descriptor: { maxItemBytes: 1024n },
+      outgoingCreditOutstanding: 5n,
+      subscribeOutgoingCredit: vi.fn(() => () => undefined),
+      sendMessage: vi.fn(() => sending),
+      readMessage: vi.fn(() => new Promise<null>(() => undefined)),
+      closeWrite: vi.fn(),
+      reset: vi.fn(),
+    };
+    const client = {
+      catalogue: {
+        firstSnapshot: vi.fn().mockResolvedValue({
+          revision: 1n,
+          listeners: [
+            {
+              listenerHandle: 1n,
+              generation: 1n,
+              ownerKind: 0,
+              ownerSession: new Uint8Array(16),
+              name: "yas.test.v1",
+              metadata: new Uint8Array(),
+              extensions: [],
+            },
+          ],
+        }),
+        subscribe: vi.fn(() => () => undefined),
+      },
+      connect: vi.fn().mockResolvedValue({
+        channelHandle: 2n,
+        peerChannelHandle: 3n,
+        peerSession: new Uint8Array(16),
+        listenerMetadata: new Uint8Array(),
+      connectorMetadata: new Uint8Array(),
+      transfer,
+      }),
+    };
+    const connection = new YasConnection(
+      new MockYasTransport("disconnected"),
+    );
+    const facade = new YasNativeChannelFacade(connection, client);
+    const handle = await facade.connectChannel("yas.test.v1", {
+      onCredit: credit,
+    });
+
+    expect(handle.send("five!".slice(0, 5))).toBe(true);
+    expect(handle.availableCredit).toBe(0n);
+    finishSend();
+    await sending;
+    await Promise.resolve();
+
+    expect(credit).toHaveBeenCalledWith(5n);
+    expect(handle.availableCredit).toBe(5n);
+    facade.dispose();
+    connection.close();
+  });
+
   it("keeps high-bit listener and channel handles opaque", async () => {
     const listenerHandle = 0xfedc_ba98_7654_3210n;
     const generation = 0x8000_0000_0000_0011n;

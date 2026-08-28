@@ -1800,6 +1800,44 @@ impl Muster {
                 }
                 continue;
             }
+            let policy = {
+                let unit = self.units.get(&name).expect("checked");
+                adoption_policy(unit.phase, unit.pty)
+            };
+            match policy {
+                AdoptionPolicy::Observe(owned) => {
+                    // A state snapshot is allowed to describe the run we
+                    // already own, but any other live run with this unit's tag
+                    // is an orphan from an older race. Never leave it around
+                    // to become the next adoption candidate.
+                    for (_, pty) in runs {
+                        if pty == owned {
+                            continue;
+                        }
+                        if self.exited.contains_key(&pty) {
+                            let _ = client.close_terminal(pty);
+                        } else {
+                            let _ = client.signal_terminal(pty, terminal_wire::SignalKind::Kill);
+                        }
+                    }
+                    continue;
+                }
+                AdoptionPolicy::Reject => {
+                    // `Held` is durable user intent. In particular, once its
+                    // tracked PTY exits, a duplicate terminal from a racing
+                    // snapshot must not resurrect the unit.
+                    for (_, pty) in runs {
+                        if self.exited.contains_key(&pty) {
+                            let _ = client.close_terminal(pty);
+                        } else {
+                            let _ = client.signal_terminal(pty, terminal_wire::SignalKind::Kill);
+                        }
+                    }
+                    continue;
+                }
+                AdoptionPolicy::Adopt => {}
+            }
+
             let unit = self.units.get_mut(&name).expect("checked");
             let highest = runs.last().expect("non-empty").0;
             unit.seq = highest + 1;
@@ -1811,6 +1849,7 @@ impl Muster {
                 .rev()
                 .find(|(_, pty)| !self.exited.contains_key(pty))
                 .copied();
+
             for (seq, pty) in runs.iter().rev() {
                 if live.is_some_and(|(_, live_pty)| live_pty == *pty) {
                     continue;
@@ -2856,6 +2895,21 @@ impl Muster {
 
 // ------------------------------------------------------------------ helpers
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdoptionPolicy {
+    Adopt,
+    Observe(u64),
+    Reject,
+}
+
+fn adoption_policy(phase: Phase, current: Option<u64>) -> AdoptionPolicy {
+    match current {
+        Some(pty) => AdoptionPolicy::Observe(pty),
+        None if phase == Phase::Held => AdoptionPolicy::Reject,
+        None => AdoptionPolicy::Adopt,
+    }
+}
+
 fn same_spec(a: &UnitFile, b: &UnitFile) -> bool {
     a.requires == b.requires
         && a.wants == b.wants
@@ -3181,5 +3235,15 @@ mod spec_tests {
         let changed =
             file(r#"{"command":["api"],"description":"new","restartOnFailure":false,"keep":4}"#);
         assert!(same_spec(&base, &changed));
+    }
+
+    #[test]
+    fn terminal_snapshot_observes_owned_rejects_held_and_adopts_unowned_runs() {
+        assert_eq!(
+            adoption_policy(Phase::Running, Some(41)),
+            AdoptionPolicy::Observe(41)
+        );
+        assert_eq!(adoption_policy(Phase::Held, None), AdoptionPolicy::Reject);
+        assert_eq!(adoption_policy(Phase::Stopped, None), AdoptionPolicy::Adopt);
     }
 }

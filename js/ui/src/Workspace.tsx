@@ -530,7 +530,19 @@ export function Workspace(props: {
   return (
     <YasWorkspaceProvider workspace={workspace}>
       {sessionBoundary.managed ? (
-        <Show when={sessionBoundary.current()} keyed>
+        <Show
+          when={sessionBoundary.current()}
+          keyed
+          fallback={
+            <WorkspaceScreen
+              connectionSpecs={connectionSpecs}
+              wasm={props.wasm}
+              onAuthError={props.onAuthError}
+              relayRoutes={props.relayRoutes}
+              workspaceSessions={props.workspaceSessions}
+            />
+          }
+        >
           {(workspaceSession) => (
             <WorkspaceScreen
               connectionSpecs={connectionSpecs}
@@ -1515,6 +1527,10 @@ function WorkspaceScreen(props: {
       if (!(input instanceof HTMLTextAreaElement)) return;
       if (!input.matches(surfaceInputSelector) || !isMobileTouch()) return;
       if (!waylandKeyboardRequests()) return;
+      // A modal overlay owns keyboard focus. The pane remains marked focused
+      // behind it, so accepting a late Wayland text-input update here would
+      // pull focus out of inputs such as the C-b k search box.
+      if (overlay()) return;
 
       const state = event.detail;
       if (!state.enabled) {
@@ -5570,7 +5586,6 @@ function WorkspaceScreen(props: {
               }}
               onStartApplication={startAppFromSwitcher}
               workspaceSessionId={props.workspaceSession?.id}
-              onManageSessions={props.workspaceSession?.openManager}
               fileSearchLocal={(q) => {
                 const s = activeSession();
                 const root = s?.root() ?? "";

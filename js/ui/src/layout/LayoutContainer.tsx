@@ -98,6 +98,7 @@ import {
 import type { Theme } from "../theme";
 import { mergeStyle, themeFor, ui, uiScale, z } from "../theme";
 import { t, tp } from "../i18n";
+import { prefixChordLabel } from "../keyPrefix";
 import { registerPrefixAction } from "../keyPrefix";
 import type { SurfaceTouchMode, SurfaceZoomMode } from "../storage";
 import {
@@ -2448,7 +2449,9 @@ export function EmptyPane(props: {
         outline: "none",
       }}
     >
-      <Show when={props.showHint !== false}>Start with C-b</Show>
+      <Show when={props.showHint !== false}>
+        Start with {prefixChordLabel()}
+      </Show>
     </div>
   );
 }

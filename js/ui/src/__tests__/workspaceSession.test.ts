@@ -404,7 +404,7 @@ afterEach(() => {
 });
 
 describe("workspace session controller", () => {
-  it("surfaces backend startup failure and retries without a local fallback", async () => {
+  it("retains backend startup failure without opening the manager", async () => {
     const store = new FakeStore([record(A, "Backend", 10)]);
     store.startFailure = new Error("home KV unavailable");
     const deviceStore = new FakeDeviceStore(new FakeDeviceBackend(device([A])));
@@ -412,15 +412,19 @@ describe("workspace session controller", () => {
 
     await controller.start();
     expect(controller.binding()).toBeNull();
-    expect(controller.managerOpen()).toBe(true);
+    expect(controller.managerOpen()).toBe(false);
     expect(controller.error()).toBe("home KV unavailable");
+    controller.openManager();
+    expect(controller.managerOpen()).toBe(true);
+    controller.closeManager();
+    expect(controller.managerOpen()).toBe(false);
 
     await controller.retry();
     expect(controller.current()?.id).toBe(A);
     dispose();
   });
 
-  it("surfaces and retries a failed durable patch", async () => {
+  it("retains and retries a failed durable patch without opening the manager", async () => {
     const store = new FakeStore([record(A, "Backend", 10)]);
     const { controller, dispose } = setup(
       store,
@@ -434,7 +438,7 @@ describe("workspace session controller", () => {
     await expect(
       controller.binding()!.patch({ name: "Retried" }),
     ).rejects.toThrow("durable commit failed");
-    expect(controller.managerOpen()).toBe(true);
+    expect(controller.managerOpen()).toBe(false);
     expect(controller.error()).toBe("durable commit failed");
 
     await controller.retry();
@@ -443,7 +447,7 @@ describe("workspace session controller", () => {
     dispose();
   });
 
-  it("surfaces and retries a failed current-tab device reattach", async () => {
+  it("retains and retries a failed current-tab device reattach", async () => {
     const store = new FakeStore([record(A, "Backend", 10)]);
     const backend = new FakeDeviceBackend(device([A]));
     const deviceStore = new FakeDeviceStore(backend);
@@ -456,7 +460,7 @@ describe("workspace session controller", () => {
       "device attach unavailable",
     );
     expect(controller.current()?.id).toBe(A);
-    expect(controller.managerOpen()).toBe(true);
+    expect(controller.managerOpen()).toBe(false);
     expect(controller.error()).toBe("device attach unavailable");
 
     await controller.retry();
@@ -484,7 +488,7 @@ describe("workspace session controller", () => {
 
     expect(controller.current()?.name).toBe("Valid");
     expect(controller.binding()).not.toBeNull();
-    expect(controller.managerOpen()).toBe(true);
+    expect(controller.managerOpen()).toBe(false);
     expect(controller.warnings()).toEqual([
       "ui/workspace-sessions/v1/broken: invalid JSON",
     ]);
@@ -599,12 +603,12 @@ describe("workspace session controller", () => {
 
     expect(store.created).toHaveLength(0);
     expect(controller.current()).toBeNull();
-    expect(controller.managerOpen()).toBe(true);
+    expect(controller.managerOpen()).toBe(false);
     expect(location.hash).toBe("");
     dispose();
   });
 
-  it("shows the manager for a malformed explicit session ID", async () => {
+  it("retains an error for a malformed explicit session ID", async () => {
     const store = new FakeStore([record(A, "Device tab", 20)]);
     const { controller, dispose } = setup(
       store,
@@ -614,7 +618,7 @@ describe("workspace session controller", () => {
     await controller.start();
 
     expect(controller.current()).toBeNull();
-    expect(controller.managerOpen()).toBe(true);
+    expect(controller.managerOpen()).toBe(false);
     expect(controller.error()).toBe(
       "The URL contains an invalid workspace session ID",
     );
@@ -1074,7 +1078,7 @@ describe("workspace session controller", () => {
     await vi.waitFor(() => expect(controller.restoring()).toBe(false));
 
     expect(controller.current()?.id).toBe(A);
-    expect(controller.managerOpen()).toBe(true);
+    expect(controller.managerOpen()).toBe(false);
     expect(controller.error()).toContain("invalid workspace session ID");
     // A malformed request is reported, and left in the address rather than
     // silently rewritten out from under the person who typed it.

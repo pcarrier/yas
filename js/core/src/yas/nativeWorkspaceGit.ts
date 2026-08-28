@@ -683,6 +683,8 @@ class NativeGitLogSubscription implements YasNativeGitLogSubscription {
   private closed = false;
   private updateRevision = 0n;
   private delivery = Promise.resolve();
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryDelayMs = 100;
 
   constructor(
     private readonly repository: NativeGitRepository,
@@ -711,10 +713,22 @@ class NativeGitLogSubscription implements YasNativeGitLogSubscription {
       )
       .then((native) => {
         if (this.closed) void native.close().catch(() => undefined);
-        else this.native = native;
+        else {
+          this.native = native;
+          this.retryDelayMs = 100;
+        }
       })
       .catch((error) => {
         if (this.closed) return;
+        if (isTransientGitWatchStartError(error)) {
+          const delay = this.retryDelayMs;
+          this.retryDelayMs = Math.min(delay * 2, 2_000);
+          this.retryTimer = setTimeout(() => {
+            this.retryTimer = null;
+            if (!this.closed) this.start();
+          }, delay);
+          return;
+        }
         invokeLifecycleCallback(() =>
           this.onUpdate({
             updateRevision: ++this.updateRevision,
@@ -734,6 +748,8 @@ class NativeGitLogSubscription implements YasNativeGitLogSubscription {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
     this.repository.forgetLog(this);
     void this.native?.close().catch(() => undefined);
     this.native = null;
@@ -742,6 +758,8 @@ class NativeGitLogSubscription implements YasNativeGitLogSubscription {
   closeLocal(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
     this.repository.forgetLog(this);
     this.native = null;
   }
@@ -776,6 +794,15 @@ class NativeGitLogSubscription implements YasNativeGitLogSubscription {
       }),
     );
   }
+}
+
+export function isTransientGitWatchStartError(error: unknown): boolean {
+  return (
+    error instanceof YasResultError &&
+    (error.status === g.YAS_STATUS_RESOURCE_EXHAUSTED ||
+      error.status === g.YAS_STATUS_UNAVAILABLE ||
+      error.status === g.YAS_STATUS_CANCELLED)
+  );
 }
 
 function invokeLifecycleCallback(callback: (() => void) | undefined): void {

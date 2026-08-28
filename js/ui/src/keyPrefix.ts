@@ -81,9 +81,27 @@ type Chord = Pick<
   "ctrlKey" | "metaKey" | "altKey" | "shiftKey" | "key" | "code"
 >;
 
-/** `Ctrl+B` and nothing else — the one chord YAS reserves. */
-export function isPrefixChord(event: Chord): boolean {
-  if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) {
+function currentPlatform(): string {
+  return typeof navigator === "undefined" ? "" : navigator.platform;
+}
+
+function isMacPlatform(platform: string): boolean {
+  return /Mac|iPhone|iPad/.test(platform);
+}
+
+/** Human-readable prefix for compact, platform-specific UI hints. */
+export function prefixChordLabel(platform = currentPlatform()): string {
+  return isMacPlatform(platform) ? "⌘B" : "ctrl-b";
+}
+
+/** `Ctrl+B`, plus `Command+B` on Apple platforms, and nothing else. */
+export function isPrefixChord(
+  event: Chord,
+  platform = currentPlatform(),
+): boolean {
+  const control = event.ctrlKey && !event.metaKey;
+  const command = isMacPlatform(platform) && event.metaKey && !event.ctrlKey;
+  if ((!control && !command) || event.altKey || event.shiftKey) {
     return false;
   }
   return event.key === "b" || event.key === "B" || event.code === "KeyB";

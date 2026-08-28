@@ -69,9 +69,26 @@ interface NativeWatch {
   stopped: boolean;
 }
 
+interface NativeChannelTransfer
+  extends Pick<
+    YasTransfer,
+    | "closeWrite"
+    | "outgoingCreditOutstanding"
+    | "readMessage"
+    | "reset"
+    | "sendMessage"
+    | "subscribeOutgoingCredit"
+  > {
+  readonly descriptor: Pick<YasTransfer["descriptor"], "maxItemBytes">;
+}
+
+type NativeChannelConnection = Omit<YasChannelConnection, "transfer"> & {
+  readonly transfer: NativeChannelTransfer;
+};
+
 interface NativeChannel {
   readonly handle: bigint;
-  readonly transfer: YasTransfer;
+  readonly transfer: NativeChannelTransfer;
   readonly options: YasNativeChannelOpenOptions;
   pendingBytes: bigint;
   localClosed: boolean;
@@ -90,7 +107,7 @@ interface NativeChannelClientLike {
   connect(
     listener: Pick<YasChannelListenerRecord, "listenerHandle" | "generation">,
     options?: { metadata?: Uint8Array; initialReceiveCredit?: bigint },
-  ): Promise<YasChannelConnection>;
+  ): Promise<NativeChannelConnection>;
   dispose?(): void;
 }
 
@@ -144,7 +161,7 @@ export class YasNativeChannelFacade {
     )
       throw new YasProtocolError(`Channel ${name} listener generation changed`);
 
-    let endpoint: YasChannelConnection;
+    let endpoint: NativeChannelConnection;
     try {
       endpoint = await this.client.connect(current, {
         metadata: options.metadata
@@ -220,6 +237,18 @@ export class YasNativeChannelFacade {
         void active.transfer.sendMessage(bytes).then(
           () => {
             active.pendingBytes -= length;
+            // `pendingBytes` reserves credit before the asynchronous Transfer
+            // writer advances its native offset.  Releasing that reservation
+            // can make another synchronous send possible without any new
+            // CREDIT frame arriving.  Wake the adapter here too; otherwise a
+            // control command queued behind an icon request can wait forever.
+            if (!active.finished && !active.localClosed && !facade.disposed) {
+              try {
+                active.options.onCredit?.(facade.available(active));
+              } catch {
+                // An observer cannot affect Transfer sequencing.
+              }
+            }
           },
           (error) => {
             active.pendingBytes -= length;

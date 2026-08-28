@@ -104,6 +104,7 @@ pub(crate) struct ViewConfig {
     pub(crate) width: u16,
     pub(crate) height: u16,
     pub(crate) max_fps: u16,
+    pub(crate) decoder_capacity: u8,
     pub(crate) codec: Codec,
 }
 
@@ -440,7 +441,9 @@ pub(crate) async fn register(
     let sub = client.surface_subs.entry(surface_id).or_default();
     sub.codec_override = codec_support(config.codec);
     sub.scaled_target = Some((config.width, config.height));
+    sub.allow_adaptive_scale = true;
     sub.max_fps = Some(f32::from(config.max_fps.max(1)));
+    sub.max_inflight_frames = Some(usize::from(config.decoder_capacity.max(1)));
     sub.burst_remaining = SURFACE_BURST_FRAMES;
     request_surface_keyframe(sub, Instant::now(), true);
     session.clients.insert(client_id, client);
@@ -489,7 +492,9 @@ pub(crate) async fn configure(
     retire_encoder(sub.encoder.take());
     sub.codec_override = codec_support(config.codec);
     sub.scaled_target = Some((config.width, config.height));
+    sub.allow_adaptive_scale = true;
     sub.max_fps = Some(f32::from(config.max_fps.max(1)));
+    sub.max_inflight_frames = Some(usize::from(config.decoder_capacity.max(1)));
     sub.encoder_invalidated |= sub.encode_in_flight || sub.creation_in_flight;
     sub.nal_none_streak = 0;
     sub.nal_none_latched_at = None;
@@ -542,6 +547,15 @@ pub(crate) async fn acknowledge(
         record_surface_ack(client, surface_id);
     }
     true
+}
+
+pub(crate) async fn discard_frame(state: &AppState, client_id: u64, surface_id: u16) {
+    let mut session = state.session.lock().await;
+    if let Some(client) = session.clients.get_mut(&client_id) {
+        discard_surface_frame(client, surface_id);
+    }
+    drop(session);
+    state.delivery_notify.notify_one();
 }
 
 pub(crate) async fn remove(state: &AppState, client_id: u64) {
@@ -649,14 +663,10 @@ pub(crate) async fn input(state: &AppState, client_id: u64, surface_id: u16, inp
             }
             match phase {
                 PointerPhase::Down | PointerPhase::Up => {
-                    commands.push(CompositorCommand::PointerMotion {
+                    commands.push(CompositorCommand::PointerButtonAt {
                         surface_id,
                         x: f64::from(x),
                         y: f64::from(y),
-                        time_ms,
-                    });
-                    commands.push(CompositorCommand::PointerButton {
-                        surface_id,
                         button: evdev_button(button),
                         pressed: matches!(phase, PointerPhase::Down),
                         time_ms,
@@ -709,7 +719,16 @@ pub(crate) async fn input(state: &AppState, client_id: u64, surface_id: u16, inp
             return false;
         };
         for command in commands {
-            if compositor.handle.command_tx.try_send(command).is_err() {
+            let reliable = matches!(&command, CompositorCommand::PointerButtonAt { .. });
+            let failed = if reliable {
+                // A click is discrete state, not a coalescible motion sample.
+                // Wait for one bounded-queue slot instead of silently losing
+                // the press or release under a busy 120 Hz compositor.
+                compositor.handle.command_tx.send(command).is_err()
+            } else {
+                compositor.handle.command_tx.try_send(command).is_err()
+            };
+            if failed {
                 return false;
             }
         }
@@ -737,9 +756,7 @@ pub(crate) async fn resize(
         session.set_native_surface_claim(
             owner,
             surface_id,
-            width,
-            height,
-            scale_120,
+            (width, height, scale_120),
             &state.config.surface_encoders,
             state.config.verbose,
         );

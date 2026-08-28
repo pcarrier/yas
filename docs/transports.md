@@ -77,11 +77,14 @@ socket limit are ignored. The server rechecks the private parent's ownership
 and exact mode immediately before binding or removing a stale automatic
 socket, and rejects a prebound symlink or non-socket final path.
 
-The packaged NixOS system socket `/run/yas/$USER-$YAS_SERVER_NAME.sock` is a
-safe discovery candidate: `/run/yas` must be root-owned and
-non-writable and the socket must be owned by the effective user. Explicit
-socket paths are not relocated; their containing-directory policy remains the
-operator's responsibility.
+The packaged NixOS system-service socket
+`/run/yas/$USER/yas-$YAS_SERVER_NAME.sock` is a safe discovery candidate:
+`/run/yas` must be root-owned and non-writable, the per-user directory must be
+owned by the effective user with mode `0700`, and the socket must be owned by
+that user. The legacy systemd socket unit's direct
+`/run/yas/$USER-$YAS_SERVER_NAME.sock` path remains discoverable under the
+same ownership checks. Explicit socket paths are not relocated; their
+containing-directory policy remains the operator's responsibility.
 
 `YAS_SERVER_NAME` defaults to `default`. The CLI, edge, and SSH transport
 consider only name-suffixed sockets; there is no unnamed socket probe.

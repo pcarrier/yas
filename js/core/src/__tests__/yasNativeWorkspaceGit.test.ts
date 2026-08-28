@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  isTransientGitWatchStartError,
   YasNativeWorkspaceGit,
+  YasResultError,
+  YAS_STATUS_INVALID,
+  YAS_STATUS_RESOURCE_EXHAUSTED,
+  YAS_STATUS_UNAVAILABLE,
   type YasConnection,
   type YasGitRepository,
 } from "../yas";
@@ -30,6 +35,21 @@ function nativeRepository(): YasGitRepository {
 }
 
 describe("YasNativeWorkspaceGit lifecycle", () => {
+  it("retries only transient watched-query admission failures", () => {
+    const result = (status: number) =>
+      new YasResultError(status, new Uint8Array());
+
+    expect(
+      isTransientGitWatchStartError(result(YAS_STATUS_RESOURCE_EXHAUSTED)),
+    ).toBe(true);
+    expect(isTransientGitWatchStartError(result(YAS_STATUS_UNAVAILABLE))).toBe(
+      true,
+    );
+    expect(isTransientGitWatchStartError(result(YAS_STATUS_INVALID))).toBe(
+      false,
+    );
+  });
+
   it("closes active repositories on facade disposal", async () => {
     vi.stubGlobal("reportError", vi.fn());
     const native = nativeRepository();

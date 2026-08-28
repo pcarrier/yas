@@ -59,6 +59,9 @@ pub struct App {
     /// Wayland socket basename this instance was given, so `status` can show
     /// which stamped socket to look for.
     pub wayland_display: Option<String>,
+    /// Bounded stdout/stderr tail from the latest launch, for diagnosing a
+    /// desktop entry that exits before it creates a window.
+    pub last_output: Vec<u8>,
 }
 
 impl App {
@@ -74,6 +77,7 @@ impl App {
             next_attempt_ns: None,
             last_exit: None,
             wayland_display: None,
+            last_output: Vec::new(),
         }
     }
 }
@@ -164,6 +168,13 @@ impl App {
         self.wayland_display = wayland_display;
         self.started_at_ns = Some(now_ns);
         self.next_attempt_ns = None;
+        self.last_output.clear();
+    }
+
+    pub fn note_output(&mut self, bytes: &[u8], limit: usize) {
+        let remaining = limit.saturating_sub(self.last_output.len());
+        self.last_output
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
     }
 
     /// Re-adopt a child that outlived the extension that spawned it.

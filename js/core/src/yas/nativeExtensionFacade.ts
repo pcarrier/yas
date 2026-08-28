@@ -9,6 +9,7 @@ import {
   type YasExtensionDefinitionIdentity,
   type YasExtensionRecord,
   type YasExtensionRuntimeLimits,
+  type YasExtensionSnapshot,
   YasExtensionClient,
   extensionLimitsFromExtensions,
 } from "./extension";
@@ -31,14 +32,42 @@ export interface YasNativeExtensionInstallRequest {
   expectedDefinitionRevision?: bigint;
 }
 
+type YasNativeExtensionConnection = Pick<
+  YasConnection,
+  "family" | "onInvalidation"
+>;
+
+interface YasNativeExtensionClient {
+  list: YasExtensionClient["list"];
+  control: YasExtensionClient["control"];
+  deploy: YasExtensionClient["deploy"];
+  uploadObject: YasExtensionClient["uploadObject"];
+  catalog: {
+    readonly snapshot: YasExtensionSnapshot;
+    subscribe(listener: (snapshot: YasExtensionSnapshot) => void): () => void;
+    unwatch(): Promise<void>;
+  };
+  dispose?(): void;
+}
+
 export class YasNativeExtensionFacade {
   private readonly pendingIdentityCancels = new Set<(error: unknown) => void>();
   private disposed = false;
+  readonly connection: YasNativeExtensionConnection;
+  readonly client: YasNativeExtensionClient;
 
   constructor(
-    readonly connection: YasConnection,
-    readonly client: YasExtensionClient = new YasExtensionClient(connection),
-  ) {}
+    ...args:
+      | [connection: YasConnection]
+      | [
+          connection: YasNativeExtensionConnection,
+          client: YasNativeExtensionClient,
+        ]
+  ) {
+    this.connection = args[0];
+    this.client =
+      args.length === 1 ? new YasExtensionClient(args[0]) : args[1];
+  }
 
   async listExtensions(): Promise<readonly YasExtensionRecord[]> {
     this.assertOpen();
@@ -79,6 +108,7 @@ export class YasNativeExtensionFacade {
     let expectedHandle = 0n;
     let expectedGeneration = 0n;
     let expectedRevision = request.expectedDefinitionRevision ?? 0n;
+    let currentHash: Uint8Array | undefined;
     if (explicitUpdate) {
       const current = await this.find(request.expectedExtensionHandle!);
       if (
@@ -90,9 +120,45 @@ export class YasNativeExtensionFacade {
         throw new YasProtocolError("Extension update identity is stale");
       expectedHandle = current.extensionHandle;
       expectedGeneration = current.generation;
+      currentHash = current.contentHash;
     }
 
     let module: Uint8Array | undefined;
+    const objectBytes = async (): Promise<Uint8Array> => {
+      module ??= new Uint8Array(await request.module());
+      if (
+        module.length === 0 ||
+        BigInt(module.length) >
+          extensionLimitsFromExtensions(
+            this.connection.family(
+              g.YAS_FAMILY_EXTENSION,
+              g.YAS_EXTENSION_VERSION,
+            ).limits,
+          ).maxObjectBytes
+      )
+        throw new YasProtocolError(
+          "Extension object is empty or exceeds the negotiated limit",
+        );
+      return module;
+    };
+    // A missing object for a create is represented by a temporary NEED_OBJECT
+    // definition. An update deliberately keeps the old definition live, so its
+    // returned identity cannot carry that phase and used to look like a
+    // successful no-op. Stage changed update bytes first; OBJECT_BEGIN is cheap
+    // when the server already has them.
+    if (currentHash && !sameBytes(currentHash, request.contentHash)) {
+      const bytes = await objectBytes();
+      await this.client.uploadObject(
+        {
+          operationId: randomOperationId(),
+          contentHash: request.contentHash,
+          byteLength: BigInt(bytes.length),
+        },
+        bytes,
+        randomOperationId(),
+      );
+      this.assertOpen();
+    }
     for (let attempt = 0; attempt < 3; attempt++) {
       const identity = await this.client.deploy({
         operationId: randomOperationId(),
@@ -114,29 +180,22 @@ export class YasNativeExtensionFacade {
       });
       this.assertOpen();
       const record = await this.waitForIdentity(identity);
-      if (record.phase !== g.YAS_EXTENSION_PHASE_NEED_OBJECT) return record;
+      if (record.phase !== g.YAS_EXTENSION_PHASE_NEED_OBJECT) {
+        if (!sameBytes(record.contentHash, request.contentHash))
+          throw new YasProtocolError(
+            "Extension update did not adopt the requested object",
+          );
+        return record;
+      }
 
-      module ??= new Uint8Array(await request.module());
-      if (
-        module.length === 0 ||
-        BigInt(module.length) >
-          extensionLimitsFromExtensions(
-            this.connection.family(
-              g.YAS_FAMILY_EXTENSION,
-              g.YAS_EXTENSION_VERSION,
-            ).limits,
-          ).maxObjectBytes
-      )
-        throw new YasProtocolError(
-          "Extension object is empty or exceeds the negotiated limit",
-        );
+      const bytes = await objectBytes();
       await this.client.uploadObject(
         {
           operationId: randomOperationId(),
           contentHash: request.contentHash,
-          byteLength: BigInt(module.length),
+          byteLength: BigInt(bytes.length),
         },
-        module,
+        bytes,
         randomOperationId(),
       );
       this.assertOpen();
@@ -153,10 +212,7 @@ export class YasNativeExtensionFacade {
     const error = new YasDisconnectedError("Extension facade is disposed");
     for (const cancel of [...this.pendingIdentityCancels]) cancel(error);
     this.pendingIdentityCancels.clear();
-    const disposable = this.client as YasExtensionClient & {
-      dispose?: () => void;
-    };
-    if (disposable.dispose) disposable.dispose();
+    if (this.client.dispose) this.client.dispose();
     else void this.client.catalog.unwatch().catch(() => undefined);
   }
 
@@ -240,6 +296,10 @@ export function yasExtensionHashHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return left.length === right.length && left.every((byte, index) => byte === right[index]);
 }
 
 function defaultRuntimeLimits(): YasExtensionRuntimeLimits {

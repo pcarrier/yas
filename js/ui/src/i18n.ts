@@ -69,7 +69,7 @@ const en: Messages = {
     "A name cannot be empty, contain spaces or =, or start with #",
   "remotes.invalidUri": "A remote needs a URI",
   "remotes.storedWarning":
-    "Stored on the home server; every client of it can read these URIs.",
+    "These URIs are stored on the home server. All connected clients can read them.",
   "app.loading": "Loading",
   "help.windowManager": "Tiling → scrolling → floating",
   "help.columnWidth": "Narrow / widen the column",

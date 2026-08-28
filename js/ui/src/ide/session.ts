@@ -43,9 +43,11 @@ import {
   FS_ENTRY_SYMLINK,
   FS_ENTRY_LINK_DIR,
   GitStatusError,
+  gitStatusText,
   gitOidHex,
   GIT_LOG_TOPO,
   GIT_COMMITS_MORE,
+  GIT_STATUS_NOT_FOUND,
   GIT_STATUS_OK,
   GIT_CLOSED_CLIENT_REQUEST,
   GIT_CLOSED_CONNECTION_LOST,
@@ -995,7 +997,11 @@ function buildSession(
       (page) => {
         setLogLoaded(true);
         if (page.status !== GIT_STATUS_OK) {
-          setLogSpecError(`Cannot resolve "${spec}"`);
+          setLogSpecError(
+            page.status === GIT_STATUS_NOT_FOUND
+              ? `Cannot resolve "${spec}"`
+              : `Commit log unavailable: ${gitStatusText(page.status)}`,
+          );
           return;
         }
         setLogSpecError(null);

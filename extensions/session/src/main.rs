@@ -157,6 +157,16 @@ const CATALOG_TTL: Duration = Duration::from_secs(60);
 /// would be a way to stall the supervisor from the browser.
 const MAX_ICON_REQUEST: usize = 48;
 
+/// Candidate directories probed in the first icon lookup round.
+///
+/// Native FS READ evaluates every STAT question in a request; `FirstStat`
+/// chooses the first successful answer only after that. Sending all theme
+/// directories at once therefore did thousands of syscalls for a screenful,
+/// even when every icon was in the first theme. Probe a small ranked prefix,
+/// then widen geometrically only for names that were not there.
+const ICON_LOOKUP_INITIAL_DIRS: usize = 8;
+const ICON_LOOKUP_MAX_DIRS_PER_ROUND: usize = 32;
+
 /// Resolved icon paths kept in the guest before the cache is dropped wholesale.
 ///
 /// Measured in bytes rather than entries because the entries are not
@@ -180,6 +190,7 @@ const MAX_CACHED_ICON_BYTES: usize = 12 * 1024 * 1024;
 /// replenished window prevents every open application from pinning the guest
 /// SDK's 4 MiB general-purpose Process default.
 const APP_PROCESS_STREAM_WINDOW: u64 = 64 * 1024;
+const APP_DIAGNOSTIC_BYTES: usize = 4096;
 
 /// Icon messages a connection may have waiting on credit.
 ///
@@ -588,54 +599,69 @@ fn resolve_icons(
         }
     }
 
-    // Names: one message for the whole batch. Each name is a group of ranked
-    // candidates and the bounded native FS READ answers each group with its first hit,
-    // so the batch costs one round trip rather than one per name — which is what
-    // it cost when every name was its own request, and that was most of the time
-    // a screenful of artwork took.
+    // Names are probed in ranked directory stages. FS READ evaluates every
+    // question it receives, even though FirstStat returns only the first hit
+    // from each group. Asking all 80-odd directories about every visible row
+    // therefore did thousands of redundant stats before showing one icon.
+    // Most names land in the first stage; only misses widen the search.
     if !lookups.is_empty() {
         refresh_icon_dirs(client, state);
         let dirs = state.icon_dirs.clone();
-        let mut asked: Vec<&String> = Vec::new();
-        let mut candidates: Vec<Vec<String>> = Vec::new();
-        for name in &lookups {
-            let paths = icon::candidates(&dirs, name);
-            if paths.is_empty() {
+        if dirs.is_empty() {
+            for name in &lookups {
                 state.cache_icon(name.clone(), None);
                 resolved.insert(name.clone(), None);
-                continue;
             }
-            asked.push(name);
-            candidates.push(paths);
-        }
-        // The protocol bounds the paths one message may carry, so a long icon
-        // path means fewer names per message rather than a refused request.
-        let per_message = (wire::fs::MAX_QUERY_RECORDS / (dirs.len() * 2).max(1)).max(1);
-        let mut at = 0;
-        while at < candidates.len() {
-            let end = (at + per_message).min(candidates.len());
-            let groups: Vec<Vec<&str>> = candidates[at..end]
-                .iter()
-                .map(|paths| paths.iter().map(String::as_str).collect())
-                .collect();
-            let borrowed: Vec<&[&str]> = groups.iter().map(Vec::as_slice).collect();
-            // No reply says nothing about these names, so they are neither
-            // answered nor cached: the panel asks again and the next request
-            // gets a fresh attempt rather than a remembered failure.
-            // Which file, not what is in it: the panel reads the bytes itself,
-            // so this asks for a stat per candidate and carries none of them.
-            let Some(records) =
-                fs_read(client, ReadMode::FirstStat, icon::MAX_ICON_BYTES, &borrowed)
-            else {
-                break;
-            };
-            // One record per group, in group order.
-            for (name, (found, path, _)) in asked[at..end].iter().zip(records) {
-                let found = (found && icon::is_drawable_path(&path)).then_some(path);
-                state.cache_icon((*name).clone(), found.clone());
-                resolved.insert((*name).clone(), found);
+        } else {
+            let mut pending: Vec<&String> = lookups.iter().collect();
+            let mut directory_at = 0;
+            let mut directory_count = ICON_LOOKUP_INITIAL_DIRS;
+            let mut complete = true;
+            'directories: while !pending.is_empty() && directory_at < dirs.len() {
+                let directory_end = (directory_at + directory_count).min(dirs.len());
+                let stage = &dirs[directory_at..directory_end];
+                let per_message =
+                    (wire::fs::MAX_QUERY_RECORDS / (stage.len() * 2).max(1)).max(1);
+                for names in pending.chunks(per_message) {
+                    let candidates: Vec<Vec<String>> = names
+                        .iter()
+                        .map(|name| icon::candidates(stage, name))
+                        .collect();
+                    let groups: Vec<Vec<&str>> = candidates
+                        .iter()
+                        .map(|paths| paths.iter().map(String::as_str).collect())
+                        .collect();
+                    let borrowed: Vec<&[&str]> = groups.iter().map(Vec::as_slice).collect();
+                    // Which file, not what is in it: the panel reads the bytes
+                    // itself, so these are STAT questions and carry no artwork.
+                    let Some(records) = fs_read(
+                        client,
+                        ReadMode::FirstStat,
+                        icon::MAX_ICON_BYTES,
+                        &borrowed,
+                    ) else {
+                        complete = false;
+                        break 'directories;
+                    };
+                    for (name, (found, path, _)) in names.iter().zip(records) {
+                        if found && icon::is_drawable_path(&path) {
+                            state.cache_icon((*name).clone(), Some(path.clone()));
+                            resolved.insert((*name).clone(), Some(path));
+                        }
+                    }
+                }
+                pending.retain(|name| !resolved.contains_key(*name));
+                directory_at = directory_end;
+                directory_count = (directory_count * 2).min(ICON_LOOKUP_MAX_DIRS_PER_ROUND);
             }
-            at = end;
+            // Only an exhaustive search proves that a name has no artwork. A
+            // transport failure leaves it unanswered so the panel retries it.
+            if complete {
+                for name in pending {
+                    state.cache_icon(name.clone(), None);
+                    resolved.insert(name.clone(), None);
+                }
+            }
         }
     }
 
@@ -1173,6 +1199,23 @@ fn route_frame(
     if let Some(event) = process.offer_frame(frame)?
         && let ProcessEvent::Output(delivery) = event
     {
+        let application_id = state
+            .transient_process_apps
+            .get(&process_handle)
+            .map(|(id, _)| id.as_str())
+            .or_else(|| {
+                state
+                    .apps
+                    .values()
+                    .find(|app| app.process_handle == Some(process_handle))
+                    .map(|app| app.id.as_str())
+            })
+            .map(str::to_owned);
+        if let Some(application_id) = application_id
+            && let Some(app) = state.apps.get_mut(&application_id)
+        {
+            app.note_output(delivery.data(), APP_DIAGNOSTIC_BYTES);
+        }
         // The supervisor does not consume child output, but returning credit
         // is mandatory: the server bounds every Process stream.
         process.discard(client, delivery)?;
@@ -1224,6 +1267,9 @@ fn launch_once(client: &mut Client, state: &mut State, id: &str) -> Result<(), E
         .ok_or(Error::Invalid("application disappeared before launch"))?;
     if argv.is_empty() {
         return Ok(());
+    }
+    if let Some(app) = state.apps.get_mut(id) {
+        app.last_output.clear();
     }
 
     let has_surfaces = state
@@ -2116,6 +2162,13 @@ fn serve(
                 }
                 if let Some(display) = &app.wayland_display {
                     out.push_str(&format!("socket\t{display}\n"));
+                }
+                if !app.last_output.is_empty() {
+                    out.push_str("output\n");
+                    out.push_str(&String::from_utf8_lossy(&app.last_output));
+                    if !app.last_output.ends_with(b"\n") {
+                        out.push('\n');
+                    }
                 }
                 // Counted from stamped identity, not from a self-asserted
                 // app_id — the whole reason this number can be trusted.

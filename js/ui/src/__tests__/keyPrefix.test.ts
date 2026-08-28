@@ -6,6 +6,7 @@ import {
   prefixActionTokens,
   prefixArmed,
   prefixBindings,
+  prefixChordLabel,
   prefixToken,
   registerPrefixAction,
 } from "../keyPrefix";
@@ -29,23 +30,48 @@ function chord(
 const PREFIX = chord("b", { ctrlKey: true });
 
 describe("isPrefixChord", () => {
-  it("is Ctrl+B and nothing else", () => {
-    expect(isPrefixChord(PREFIX)).toBe(true);
-    expect(isPrefixChord(chord("B", { ctrlKey: true }))).toBe(true);
-    expect(isPrefixChord(chord("", { ctrlKey: true, code: "KeyB" }))).toBe(
+  it("is Ctrl+B on every platform", () => {
+    expect(isPrefixChord(PREFIX, "Linux x86_64")).toBe(true);
+    expect(isPrefixChord(chord("B", { ctrlKey: true }), "MacIntel")).toBe(
       true,
     );
+    expect(
+      isPrefixChord(
+        chord("", { ctrlKey: true, code: "KeyB" }),
+        "Linux x86_64",
+      ),
+    ).toBe(true);
   });
 
-  it("rejects the chord with any other modifier, and Cmd+B", () => {
+  it("also accepts Command+B on Apple platforms", () => {
+    expect(
+      isPrefixChord(chord("b", { metaKey: true }), "MacIntel"),
+    ).toBe(true);
+    expect(isPrefixChord(chord("b", { metaKey: true }), "iPad")).toBe(true);
+    expect(
+      isPrefixChord(chord("b", { metaKey: true }), "Linux x86_64"),
+    ).toBe(false);
+  });
+
+  it("rejects the prefix chord with any other modifier", () => {
     expect(isPrefixChord(chord("b", { ctrlKey: true, shiftKey: true }))).toBe(
       false,
     );
     expect(isPrefixChord(chord("b", { ctrlKey: true, altKey: true }))).toBe(
       false,
     );
-    expect(isPrefixChord(chord("b", { metaKey: true }))).toBe(false);
+    expect(
+      isPrefixChord(
+        chord("b", { ctrlKey: true, metaKey: true }),
+        "MacIntel",
+      ),
+    ).toBe(false);
     expect(isPrefixChord(chord("b"))).toBe(false);
+  });
+
+  it("uses the compact platform label", () => {
+    expect(prefixChordLabel("Linux x86_64")).toBe("ctrl-b");
+    expect(prefixChordLabel("MacIntel")).toBe("⌘B");
   });
 });
 

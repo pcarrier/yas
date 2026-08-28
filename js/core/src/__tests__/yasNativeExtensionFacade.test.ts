@@ -2,10 +2,17 @@ import { describe, expect, it, vi } from "vitest";
 import {
   YAS_EXTENSION_CONTROL_RESTART,
   YAS_EXTENSION_PHASE_RUNNING,
+  YAS_FAMILY_EXTENSION,
+  YAS_FAMILY_LIMIT_POLICIES,
 } from "../yas/generated";
-import type { YasExtensionClient, YasExtensionRecord } from "../yas/extension";
+import type { YasExtensionRecord } from "../yas/extension";
 import { YasNativeExtensionFacade } from "../yas/nativeExtensionFacade";
-import type { YasConnection } from "../yas/session";
+import { YasWriter } from "../yas/wire";
+
+type FacadeClient = ConstructorParameters<typeof YasNativeExtensionFacade>[1];
+type FacadeConnection = ConstructorParameters<
+  typeof YasNativeExtensionFacade
+>[0];
 
 function nativeRecord(): YasExtensionRecord {
   return {
@@ -35,6 +42,47 @@ function nativeRecord(): YasExtensionRecord {
   };
 }
 
+function connection(): FacadeConnection {
+  const limits = YAS_FAMILY_LIMIT_POLICIES[YAS_FAMILY_EXTENSION]!.map(
+    ([tag, width, required, , hardMax]) => ({
+      tag,
+      required,
+      value:
+        width === 4
+          ? new YasWriter().u32(Number(hardMax)).finish()
+          : new YasWriter().u64(hardMax).finish(),
+    }),
+  );
+  return {
+    family: vi.fn(() => ({
+      family: YAS_FAMILY_EXTENSION,
+      version: 1,
+      runtimeState: 1,
+      operations: [],
+      limits,
+    })),
+    onInvalidation: vi.fn(() => () => undefined),
+  };
+}
+
+function clientFor(
+  record: YasExtensionRecord,
+  overrides: Partial<FacadeClient> = {},
+): FacadeClient {
+  return {
+    list: vi.fn().mockResolvedValue({ revision: 1n, definitions: [record] }),
+    control: vi.fn(),
+    deploy: vi.fn(),
+    uploadObject: vi.fn(),
+    catalog: {
+      snapshot: { revision: 1n, definitions: [record] },
+      subscribe: vi.fn(() => () => undefined),
+      unwatch: vi.fn().mockResolvedValue(undefined),
+    },
+    ...overrides,
+  };
+}
+
 describe("YasNativeExtensionFacade", () => {
   it("controls the exact native handle, generation, and revision", async () => {
     const record = nativeRecord();
@@ -44,19 +92,10 @@ describe("YasNativeExtensionFacade", () => {
       definitionRevision: record.definitionRevision,
       extensions: [],
     });
-    const client = {
-      list: vi.fn().mockResolvedValue({ revision: 1n, definitions: [record] }),
+    const client = clientFor(record, {
       control,
-      catalog: {
-        snapshot: { revision: 1n, definitions: [record] },
-        subscribe: vi.fn(() => () => undefined),
-        unwatch: vi.fn(),
-      },
-    } as unknown as YasExtensionClient;
-    const connection = {
-      onInvalidation: vi.fn(() => () => undefined),
-    } as unknown as YasConnection;
-    const facade = new YasNativeExtensionFacade(connection, client);
+    });
+    const facade = new YasNativeExtensionFacade(connection(), client);
 
     const result = await facade.controlExtension(
       record.extensionHandle,
@@ -81,19 +120,10 @@ describe("YasNativeExtensionFacade", () => {
       definitionRevision: record.definitionRevision,
       extensions: [],
     });
-    const client = {
-      list: vi.fn().mockResolvedValue({ revision: 1n, definitions: [record] }),
+    const client = clientFor(record, {
       deploy,
-      catalog: {
-        snapshot: { revision: 1n, definitions: [record] },
-        subscribe: vi.fn(() => () => undefined),
-        unwatch: vi.fn(),
-      },
-    } as unknown as YasExtensionClient;
-    const connection = {
-      onInvalidation: vi.fn(() => () => undefined),
-    } as unknown as YasConnection;
-    const facade = new YasNativeExtensionFacade(connection, client);
+    });
+    const facade = new YasNativeExtensionFacade(connection(), client);
 
     await facade.installExtension({
       contentHash: record.contentHash,
@@ -110,5 +140,51 @@ describe("YasNativeExtensionFacade", () => {
         expectedDefinitionRevision: record.definitionRevision,
       }),
     );
+  });
+
+  it("uploads a changed update before deploying it", async () => {
+    const record = nativeRecord();
+    const contentHash = new Uint8Array(32).fill(9);
+    const updated = {
+      ...record,
+      definitionRevision: record.definitionRevision + 1n,
+      contentHash,
+    };
+    const order: string[] = [];
+    const catalog = {
+      snapshot: { revision: 1n, definitions: [record] },
+      subscribe: vi.fn(() => () => undefined),
+      unwatch: vi.fn().mockResolvedValue(undefined),
+    };
+    const uploadObject = vi.fn(async () => {
+      order.push("upload");
+    });
+    const deploy = vi.fn(async () => {
+      order.push("deploy");
+      catalog.snapshot = { revision: 2n, definitions: [updated] };
+      return {
+        extensionHandle: updated.extensionHandle,
+        generation: updated.generation,
+        definitionRevision: updated.definitionRevision,
+        extensions: [],
+      };
+    });
+    const client = clientFor(record, { catalog, uploadObject, deploy });
+    const facade = new YasNativeExtensionFacade(connection(), client);
+    const module = vi.fn().mockResolvedValue(new Uint8Array([0, 97, 115, 109]));
+
+    const result = await facade.installExtension({
+      contentHash,
+      name: record.name,
+      expectedExtensionHandle: record.extensionHandle,
+      expectedGeneration: record.generation,
+      expectedDefinitionRevision: record.definitionRevision,
+      module,
+    });
+
+    expect(order).toEqual(["upload", "deploy"]);
+    expect(uploadObject).toHaveBeenCalledOnce();
+    expect(module).toHaveBeenCalledOnce();
+    expect(result).toBe(updated);
   });
 });

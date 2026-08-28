@@ -305,6 +305,14 @@ mod stub {
             pressed: bool,
             time_ms: u32,
         },
+        PointerButtonAt {
+            surface_id: u16,
+            x: f64,
+            y: f64,
+            button: u32,
+            pressed: bool,
+            time_ms: u32,
+        },
         PointerAxis {
             surface_id: u16,
             dx: f64,

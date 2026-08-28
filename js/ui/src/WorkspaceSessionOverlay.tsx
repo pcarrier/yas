@@ -18,12 +18,14 @@ export function WorkspaceSessionOverlay(props: {
   const [confirmDelete, setConfirmDelete] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
   const theme = () => themeFor(props.palette);
-  const visible = () =>
-    props.controller.managerOpen() || props.controller.binding() === null;
+  // The manager is deliberately opt-in. Missing selections, catalogue
+  // warnings, and connection failures remain visible when the user opens it,
+  // but must never replace the workspace by themselves.
+  const visible = () => props.controller.managerOpen();
 
   onMount(() => {
     const keydown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && visible() && props.controller.binding()) {
+      if (event.key === "Escape" && visible()) {
         event.preventDefault();
         props.controller.closeManager();
       }
@@ -134,15 +136,13 @@ export function WorkspaceSessionOverlay(props: {
                     {t("sessions.title")}
                   </h2>
                 </div>
-                <Show when={props.controller.binding()}>
-                  <button
-                    type="button"
-                    style={button()}
-                    onClick={() => props.controller.closeManager()}
-                  >
-                    {t("overlay.close")}
-                  </button>
-                </Show>
+                <button
+                  type="button"
+                  style={button()}
+                  onClick={() => props.controller.closeManager()}
+                >
+                  {t("overlay.close")}
+                </button>
               </header>
 
               <Show when={props.controller.error()}>

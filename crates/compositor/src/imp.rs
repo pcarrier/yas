@@ -805,6 +805,17 @@ pub enum CompositorCommand {
         pressed: bool,
         time_ms: u32,
     },
+    /// Hit-test at this position and deliver the button as one indivisible
+    /// queue item. Remote clicks must not lose the button after their motion
+    /// filled the bounded compositor command queue.
+    PointerButtonAt {
+        surface_id: u16,
+        x: f64,
+        y: f64,
+        button: u32,
+        pressed: bool,
+        time_ms: u32,
+    },
     /// A scroll event.
     ///
     /// `dx`/`dy` are smooth distance in the composited frame's pixel
@@ -5238,6 +5249,67 @@ impl Compositor {
         }
     }
 
+    fn dispatch_pointer_button(&mut self, button: u32, pressed: bool, time_ms: u32) {
+        // A client-initiated drag swallows button input: presses go nowhere,
+        // and the release ends the grab — drop on the current target, or
+        // dnd_cancelled when there is none.
+        if self.client_pointer_drag_grabbed() {
+            if !pressed {
+                self.client_drag_release();
+            }
+            let _ = self.display_handle.flush_clients();
+            return;
+        }
+        let serial = self.next_serial();
+        let time = self.input_event_time(time_ms);
+        let state = if pressed {
+            wl_pointer::ButtonState::Pressed
+        } else {
+            wl_pointer::ButtonState::Released
+        };
+
+        // If a popup is grabbed and the pointer clicked outside the popup
+        // chain, dismiss the topmost grabbed popup.
+        let mut dismissed = false;
+        if pressed && !self.popup_grab_stack.is_empty() {
+            let click_on_grabbed = self.pointer_entered_id.as_ref().is_some_and(|eid| {
+                self.popup_grab_stack.iter().any(|gid| {
+                    self.surfaces
+                        .get(gid)
+                        .is_some_and(|s| s.wl_surface.id() == *eid)
+                })
+            });
+            if !click_on_grabbed {
+                self.dismiss_popup_grabs();
+                let _ = self.display_handle.flush_clients();
+                dismissed = true;
+            }
+        }
+
+        // The click that closed a menu is spent on closing it; see
+        // `button_routing`, whose tests enumerate the cases.
+        let (routing, swallow) =
+            button_routing(pressed, button, dismissed, self.popup_dismiss_button);
+        self.popup_dismiss_button = swallow;
+
+        if routing == ButtonRouting::Deliver {
+            let focused_wl = self
+                .surfaces
+                .values()
+                .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
+                .map(|s| s.wl_surface.clone());
+            for ptr in &self.pointers {
+                if let Some(ref wl) = focused_wl
+                    && same_client(ptr, wl)
+                {
+                    ptr.button(serial, time, button, state);
+                    ptr.frame();
+                }
+            }
+        }
+        let _ = self.display_handle.flush_clients();
+    }
+
     fn handle_command(&mut self, cmd: CompositorCommand) {
         match cmd {
             // Registering a socket needs the event loop's handle, which this
@@ -5426,64 +5498,26 @@ impl Compositor {
                 pressed,
                 time_ms,
             } => {
-                // A client-initiated drag swallows button input: presses go
-                // nowhere, and the release ends the grab — drop on the
-                // current target, or dnd_cancelled when there is none.
+                self.dispatch_pointer_button(button, pressed, time_ms);
+            }
+            CompositorCommand::PointerButtonAt {
+                surface_id,
+                x,
+                y,
+                button,
+                pressed,
+                time_ms,
+            } => {
+                // Motion and button share one bounded queue slot. Besides
+                // preventing a dropped button, this guarantees the click is
+                // routed to the subsurface hit at these coordinates.
                 if self.client_pointer_drag_grabbed() {
-                    if !pressed {
-                        self.client_drag_release();
-                    }
-                    let _ = self.display_handle.flush_clients();
-                    return;
-                }
-                let serial = self.next_serial();
-                let time = self.input_event_time(time_ms);
-                let state = if pressed {
-                    wl_pointer::ButtonState::Pressed
+                    self.client_drag_motion(surface_id, x, y);
                 } else {
-                    wl_pointer::ButtonState::Released
-                };
-
-                // If a popup is grabbed and the pointer clicked outside
-                // the popup chain, dismiss the topmost grabbed popup.
-                let mut dismissed = false;
-                if pressed && !self.popup_grab_stack.is_empty() {
-                    let click_on_grabbed = self.pointer_entered_id.as_ref().is_some_and(|eid| {
-                        self.popup_grab_stack.iter().any(|gid| {
-                            self.surfaces
-                                .get(gid)
-                                .is_some_and(|s| s.wl_surface.id() == *eid)
-                        })
-                    });
-                    if !click_on_grabbed {
-                        self.dismiss_popup_grabs();
-                        let _ = self.display_handle.flush_clients();
-                        dismissed = true;
-                    }
+                    self.pointer_frame_positions.insert(surface_id, (x, y));
+                    self.dispatch_pointer_motion(surface_id, x, y, time_ms);
                 }
-
-                // The click that closed a menu is spent on closing it; see
-                // `button_routing`, whose tests enumerate the cases.
-                let (routing, swallow) =
-                    button_routing(pressed, button, dismissed, self.popup_dismiss_button);
-                self.popup_dismiss_button = swallow;
-
-                if routing == ButtonRouting::Deliver {
-                    let focused_wl = self
-                        .surfaces
-                        .values()
-                        .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
-                        .map(|s| s.wl_surface.clone());
-                    for ptr in &self.pointers {
-                        if let Some(ref wl) = focused_wl
-                            && same_client(ptr, wl)
-                        {
-                            ptr.button(serial, time, button, state);
-                            ptr.frame();
-                        }
-                    }
-                }
-                let _ = self.display_handle.flush_clients();
+                self.dispatch_pointer_button(button, pressed, time_ms);
             }
             CompositorCommand::PointerAxis {
                 surface_id,
