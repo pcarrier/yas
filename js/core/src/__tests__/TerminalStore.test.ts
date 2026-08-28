@@ -404,6 +404,30 @@ describe("TerminalStore GPU loss recovery", () => {
 
     store.destroy();
   });
+
+  it("uses a synchronous renderer once a second terminal surface mounts", () => {
+    const { store, dirty } = storeWithTerminal();
+    const gpu = fakeRenderer();
+    const canvas = document.createElement("canvas");
+    Reflect.set(store, "webgpuRenderer", asRenderer(gpu));
+    Reflect.set(store, "webgpuCanvas", canvas);
+    Reflect.set(store, "sharedRenderer", asRenderer(gpu));
+    Reflect.set(store, "sharedCanvas", canvas);
+
+    store.retain(5n);
+    expect(Reflect.get(store, "sharedRenderer")).toBe(asRenderer(gpu));
+
+    store.retain(6n);
+    expect(Reflect.get(store, "sharedRenderer")).toBeNull();
+    expect(Reflect.get(store, "sharedCanvas")).toBeNull();
+    expect(Reflect.get(store, "webgpuRenderer")).toBeNull();
+    expect(gpu.disposeCount).toBe(1);
+    expect(dirty).toContain(5n);
+
+    store.release(6n);
+    store.release(5n);
+    store.destroy();
+  });
 });
 
 describe("TerminalStore frames arriving before WASM", () => {

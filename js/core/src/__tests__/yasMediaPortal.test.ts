@@ -13,6 +13,9 @@ import {
   encodeMediaPortalRecord,
   encodeMediaPlayerRecord,
   mediaPlayerActive,
+  mediaPlayerAlbumArtUrl,
+  YAS_MEDIA_PLAYER_ALBUM_ART_HASH_EXTENSION,
+  YAS_MEDIA_PLAYER_ALBUM_ART_URL_EXTENSION,
   YAS_MEDIA_PLAYER_ACTIVE_EXTENSION,
 } from "../yas";
 
@@ -47,11 +50,19 @@ describe("YAS Media typed portal metadata", () => {
           required: false,
           value: new Uint8Array([1]),
         },
+        {
+          tag: YAS_MEDIA_PLAYER_ALBUM_ART_URL_EXTENSION,
+          required: false,
+          value: new TextEncoder().encode("https://i.scdn.co/image/cover"),
+        },
       ],
     };
     const decoded = decodeMediaPlayerRecord(encodeMediaPlayerRecord(player));
     expect(decoded.playerHandle).toBe(player.playerHandle);
     expect(mediaPlayerActive(decoded)).toBe(true);
+    expect(mediaPlayerAlbumArtUrl(decoded)).toBe(
+      "https://i.scdn.co/image/cover",
+    );
     expect(mediaPlayerActive({ extensions: [] })).toBeNull();
     expect(() =>
       encodeMediaPlayerRecord({
@@ -65,6 +76,19 @@ describe("YAS Media typed portal metadata", () => {
         ],
       }),
     ).toThrow("active state");
+    expect(() =>
+      encodeMediaPlayerRecord({
+        ...player,
+        extensions: [
+          ...player.extensions,
+          {
+            tag: YAS_MEDIA_PLAYER_ALBUM_ART_HASH_EXTENSION,
+            required: false,
+            value: new Uint8Array(32),
+          },
+        ],
+      }),
+    ).toThrow("multiple album art sources");
   });
 
   for (const name of [

@@ -1,11 +1,13 @@
 import {
   For,
+  Index,
   Show,
   createEffect,
   createMemo,
   createSignal,
   onCleanup,
   onMount,
+  type Accessor,
   type JSX,
 } from "solid-js";
 import { Portal } from "solid-js/web";
@@ -83,10 +85,15 @@ type NotificationEntry = {
 
 type Toast = NotificationEntry & { key: string };
 type MenuState = { entry: TrayEntry; menu: TrayMenu };
+type MprisStoreTarget = MprisSubscriptionTarget & {
+  act(playerId: MediaId, action: MprisAction): Promise<void>;
+  positionUs(playerId: MediaId): number;
+};
 type MprisEntry = {
   connectionId: string;
   connectionLabel: string;
   readOnly: boolean;
+  store: MprisStoreTarget;
   player: MprisPlayer;
 };
 type PortalEntry = {
@@ -247,6 +254,7 @@ function MprisChrome(props: {
           connectionId: snapshot.id,
           connectionLabel: props.connectionLabels.get(snapshot.id) ?? "",
           readOnly: props.readOnlyConnections.has(snapshot.id),
+          store: connection.mprisStore,
           player,
         });
       }
@@ -321,7 +329,6 @@ function MprisChrome(props: {
   /** Resolves once the server has answered, however it answered: a caller that
    *  showed the action as already taken needs to know when to stop. */
   const act = (entry: MprisEntry, action: MprisAction): Promise<void> => {
-    if (entry.readOnly) return Promise.resolve();
     setActionError(undefined);
     if (action.kind === "raise") {
       props.onRaisePlayer?.({
@@ -330,11 +337,12 @@ function MprisChrome(props: {
         identity: entry.player.identity,
       });
     }
-    const pending = props.workspace
-      .getConnection(entry.connectionId)
-      ?.mprisStore.act(entry.player.playerId, action);
-    if (!pending) return Promise.resolve();
-    return pending
+    if (entry.readOnly) return Promise.resolve();
+    // Keep the native handle and the controller that produced it together.
+    // Re-looking up the connection here can cross a reconnect/HMR swap and
+    // send a live-looking player's action to a store that does not own it.
+    return entry.store
+      .act(entry.player.playerId, action)
       .then(() => {
         if (action.kind === "select") {
           setManualMediaSessionKey(mprisMediaSessionKey(entry));
@@ -575,10 +583,7 @@ function MprisChrome(props: {
     }
     if (player.lengthUs > 0 && player.rate > 0) {
       try {
-        const position =
-          props.workspace
-            .getConnection(entry.connectionId)
-            ?.mprisStore.positionUs(player.playerId) ?? player.positionUs;
+        const position = entry.store.positionUs(player.playerId);
         session.setPositionState({
           duration: player.lengthUs / 1_000_000,
           playbackRate: player.rate,
@@ -591,11 +596,11 @@ function MprisChrome(props: {
     onCleanup(clear);
   });
 
-  const controls = (entry: MprisEntry) => (
+  const controls = (entry: Accessor<MprisEntry>) => (
     <span style={{ display: "flex", "align-items": "center" }}>
       <button
-        disabled={!capable(entry, MPRIS_CAN_GO_PREVIOUS)}
-        onClick={() => act(entry, { kind: "previous" })}
+        disabled={!capable(entry(), MPRIS_CAN_GO_PREVIOUS)}
+        onClick={() => void act(entry(), { kind: "previous" })}
         title={t("desktop.mediaPrevious")}
         aria-label={t("desktop.mediaPrevious")}
         style={ui.btn}
@@ -604,27 +609,29 @@ function MprisChrome(props: {
       </button>
       <button
         disabled={
-          entry.player.playbackStatus === "playing"
-            ? !capable(entry, MPRIS_CAN_PAUSE)
-            : !capable(entry, MPRIS_CAN_PLAY)
+          entry().player.playbackStatus === "playing"
+            ? !capable(entry(), MPRIS_CAN_PAUSE)
+            : !capable(entry(), MPRIS_CAN_PLAY)
         }
-        onClick={() =>
-          act(entry, {
-            kind: entry.player.playbackStatus === "playing" ? "pause" : "play",
-          })
-        }
+        onClick={() => {
+          const current = entry();
+          void act(current, {
+            kind:
+              current.player.playbackStatus === "playing" ? "pause" : "play",
+          });
+        }}
         title={
-          entry.player.playbackStatus === "playing"
+          entry().player.playbackStatus === "playing"
             ? t("desktop.mediaPause")
             : t("desktop.mediaPlay")
         }
         style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
       >
-        {entry.player.playbackStatus === "playing" ? "Ⅱ" : "▶"}
+        {entry().player.playbackStatus === "playing" ? "Ⅱ" : "▶"}
       </button>
       <button
-        disabled={!capable(entry, MPRIS_CAN_GO_NEXT)}
-        onClick={() => act(entry, { kind: "next" })}
+        disabled={!capable(entry(), MPRIS_CAN_GO_NEXT)}
+        onClick={() => void act(entry(), { kind: "next" })}
         title={t("desktop.mediaNext")}
         aria-label={t("desktop.mediaNext")}
         style={ui.btn}
@@ -633,44 +640,49 @@ function MprisChrome(props: {
       </button>
     </span>
   );
+  const togglePopup = () => {
+    props.closeOthers();
+    setOpen((value) => !value);
+  };
 
   return (
-    <Show when={active()} keyed>
+    <Show when={active()}>
       {(current) => (
         <span style={{ display: "flex", "align-items": "center" }}>
-          <Show when={!props.compact}>{controls(current)}</Show>
-          <button
-            onClick={() => {
-              props.closeOthers();
-              setOpen((value) => !value);
-            }}
-            title={current.player.title || current.player.identity}
-            aria-label={t("desktop.mediaPlayers")}
-            aria-haspopup="menu"
-            aria-expanded={open()}
-            style={{
-              ...ui.btn,
-              // Compact spends a glyph, not a title. This sits in the cluster
-              // that never shrinks, so every em it takes comes out of the
-              // window title beside it — and on a phone the title had none to
-              // spare. The track name is still one tap away, in the popup and
-              // in the tooltip, and the glyph appearing at all already says
-              // something is playing.
-              ...(props.compact
-                ? { "font-size": `${props.scale.md}px` }
-                : {
-                    "max-width": "14em",
-                    overflow: "hidden",
-                    "text-overflow": "ellipsis",
-                    "white-space": "nowrap",
-                    "font-size": `${props.scale.sm}px`,
-                  }),
-            }}
-          >
-            {props.compact
-              ? "♪"
-              : current.player.title || current.player.identity}
-          </button>
+          <Show when={!props.compact}>
+            <button
+              onClick={togglePopup}
+              title={t("desktop.mediaPlayers")}
+              aria-haspopup="menu"
+              aria-expanded={open()}
+              style={{
+                ...ui.btn,
+                "max-width": "14em",
+                overflow: "hidden",
+                "text-overflow": "ellipsis",
+                "white-space": "nowrap",
+                "font-size": `${props.scale.sm}px`,
+              }}
+            >
+              {current().player.title || current().player.identity}
+            </button>
+            {controls(current)}
+          </Show>
+          <Show when={props.compact}>
+            <button
+              onClick={togglePopup}
+              title={t("desktop.mediaPlayers")}
+              aria-label={t("desktop.mediaPlayers")}
+              aria-haspopup="menu"
+              aria-expanded={open()}
+              style={{
+                ...ui.btn,
+                "font-size": `${props.scale.md}px`,
+              }}
+            >
+              ♪
+            </button>
+          </Show>
           <Show when={open()}>
             <Popup
               theme={props.theme}
@@ -692,47 +704,43 @@ function MprisChrome(props: {
                   </div>
                 )}
               </Show>
-              <For each={players()}>
+              <Index each={players()}>
                 {(entry) => {
-                  const art = () => artworkUrl(entry.player.artwork);
-                  // A drag owns the bar for exactly as long as this row lives.
-                  // An upsert rebuilds the row and so discards the scrub, which
-                  // is the outcome to want: whatever the server just reported
-                  // is newer than a position nobody is still holding, and it
-                  // leaves no way for an abandoned drag to freeze the readout.
+                  const art = () => artworkUrl(entry().player.artwork);
+                  // Keep the row alive across metadata updates. Replacing its
+                  // DOM node between pointer-down and click drops the gesture.
                   const [scrubUs, setScrubUs] = createSignal<number>();
                   const positionUs = () => {
                     const held = scrubUs();
                     if (held !== undefined) return held;
                     tick();
-                    return (
-                      props.workspace
-                        .getConnection(entry.connectionId)
-                        ?.mprisStore.positionUs(entry.player.playerId) ??
-                      entry.player.positionUs
+                    const current = entry();
+                    return current.store.positionUs(current.player.playerId);
+                  };
+                  const seekable = () => {
+                    const current = entry();
+                    return canSeekMpris(
+                      current.readOnly,
+                      current.player.capabilityFlags,
+                      current.player.lengthUs,
                     );
                   };
-                  const seekable = () =>
-                    canSeekMpris(
-                      entry.readOnly,
-                      entry.player.capabilityFlags,
-                      entry.player.lengthUs,
-                    );
                   // The scrub stays shown until the server answers, so the
                   // handle does not flick back to where the track was while
                   // the seek is in flight. The bridge re-reads and pushes the
                   // new position before it replies, so by the time this
                   // releases there is a truthful position to fall back to.
                   const seek = async (value: number) => {
+                    const current = entry();
                     const target = mprisSeekTargetUs(
                       value,
-                      entry.player.lengthUs,
+                      current.player.lengthUs,
                     );
                     setScrubUs(target);
-                    await act(entry, {
+                    await act(current, {
                       kind: "setPosition",
                       positionUs: target,
-                      trackRevision: entry.player.trackRevision,
+                      trackRevision: current.player.trackRevision,
                     });
                     setScrubUs(undefined);
                   };
@@ -770,8 +778,8 @@ function MprisChrome(props: {
                         )}
                       </Show>
                       <button
-                        disabled={entry.readOnly}
-                        onClick={() => act(entry, { kind: "select" })}
+                        disabled={entry().readOnly}
+                        onClick={() => void act(entry(), { kind: "select" })}
                         style={{
                           ...ui.btn,
                           "min-width": 0,
@@ -785,13 +793,13 @@ function MprisChrome(props: {
                             "text-overflow": "ellipsis",
                           }}
                         >
-                          {entry.player.title || entry.player.identity}
+                          {entry().player.title || entry().player.identity}
                         </strong>
                         <small style={{ color: props.theme.dimFg }}>
                           {[
-                            entry.player.artists.join(", "),
-                            entry.player.album,
-                            entry.connectionLabel,
+                            entry().player.artists.join(", "),
+                            entry().player.album,
+                            entry().connectionLabel,
                           ]
                             .filter(Boolean)
                             .join(" · ")}
@@ -807,19 +815,19 @@ function MprisChrome(props: {
                         {controls(entry)}
                         <Show
                           when={canRaiseMpris(
-                            entry.readOnly,
-                            entry.player.capabilityFlags,
+                            entry().readOnly,
+                            entry().player.capabilityFlags,
                           )}
                         >
                           <button
-                            onClick={() => act(entry, { kind: "raise" })}
+                            onClick={() => void act(entry(), { kind: "raise" })}
                             style={ui.btn}
                           >
                             {t("desktop.mediaRaise")}
                           </button>
                         </Show>
                       </span>
-                      <Show when={mprisHasProgress(entry.player.lengthUs)}>
+                      <Show when={mprisHasProgress(entry().player.lengthUs)}>
                         {/* Its own row under the text, not beside it: a bar
                             squeezed into the title column would be too short
                             to aim with on the phone this popup also serves. */}
@@ -841,13 +849,13 @@ function MprisChrome(props: {
                           <input
                             type="range"
                             min={0}
-                            max={entry.player.lengthUs}
+                            max={entry().player.lengthUs}
                             step={1_000}
                             value={positionUs()}
                             disabled={!seekable()}
                             title={t("desktop.mediaSeek")}
                             aria-label={t("desktop.mediaSeek")}
-                            aria-valuetext={`${mediaTime(positionUs())} / ${mediaTime(entry.player.lengthUs)}`}
+                            aria-valuetext={`${mediaTime(positionUs())} / ${mediaTime(entry().player.lengthUs)}`}
                             onInput={(event) =>
                               setScrubUs(Number(event.currentTarget.value))
                             }
@@ -865,14 +873,14 @@ function MprisChrome(props: {
                           <span
                             style={{ "font-variant-numeric": "tabular-nums" }}
                           >
-                            {mediaTime(entry.player.lengthUs)}
+                            {mediaTime(entry().player.lengthUs)}
                           </span>
                         </div>
                       </Show>
                     </article>
                   );
                 }}
-              </For>
+              </Index>
             </Popup>
           </Show>
         </span>

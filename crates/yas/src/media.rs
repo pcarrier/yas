@@ -2027,6 +2027,32 @@ impl PlayerRecord {
             _ => Err(Error::Invalid("Media player active state")),
         }
     }
+
+    /// Browser-loadable album artwork URL. Embedded artwork uses the separate
+    /// content-hash extension and is fetched through Media FETCH_ASSET.
+    pub fn album_art_url(&self) -> Result<Option<&str>> {
+        let Some(extension) = self.extensions.0.iter().find(|extension| {
+            extension.tag == crate::schema::media::PLAYER_ALBUM_ART_URL_EXTENSION as u16
+        }) else {
+            return Ok(None);
+        };
+        if extension.value.is_empty()
+            || extension.value.len() > crate::schema::media::PLAYER_ALBUM_ART_URL_MAX_BYTES as usize
+        {
+            return Err(Error::Invalid("Media album art URL length"));
+        }
+        let url = core::str::from_utf8(&extension.value)
+            .map_err(|_| Error::Invalid("Media album art URL UTF-8"))?;
+        let (scheme, rest) = url
+            .split_once("://")
+            .ok_or(Error::Invalid("Media album art URL scheme"))?;
+        if (!scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http"))
+            || rest.is_empty()
+        {
+            return Err(Error::Invalid("Media album art URL"));
+        }
+        Ok(Some(url))
+    }
 }
 
 pub fn player_active_extension(active: bool) -> crate::codec::Extension {
@@ -2049,11 +2075,15 @@ impl Encode for PlayerRecord {
             return Err(Error::Invalid("Media player record"));
         }
         self.extensions.validate()?;
-        if let Some(art) = self.extensions.0.iter().find(|extension| {
+        let album_art_hash = self.extensions.0.iter().find(|extension| {
             extension.tag == crate::schema::media::PLAYER_ALBUM_ART_HASH_EXTENSION as u16
-        }) && art.value.len() != 32
-        {
+        });
+        if album_art_hash.is_some_and(|art| art.value.len() != 32) {
             return Err(Error::Invalid("Media album art hash"));
+        }
+        let album_art_url = self.album_art_url()?;
+        if album_art_hash.is_some() && album_art_url.is_some() {
+            return Err(Error::Invalid("multiple Media album art sources"));
         }
         self.active()?;
         put_u64(out, self.player_handle);
@@ -2507,5 +2537,39 @@ mod tests {
             panic!("expected player state");
         };
         assert_eq!(player.active().unwrap(), Some(true));
+    }
+
+    #[test]
+    fn player_album_art_url_is_typed_and_exclusive_with_a_hash() {
+        let mut player = PlayerRecord {
+            player_handle: 1,
+            revision: 2,
+            state: crate::schema::media::PLAYER_PLAYING as u16,
+            flags: crate::schema::media::PLAYER_CAN_CONTROL as u16,
+            position_us: 3,
+            duration_us: 4,
+            identity: "player".into(),
+            desktop_entry: "player".into(),
+            title: "title".into(),
+            artist: "artist".into(),
+            album: "album".into(),
+            extensions: Extensions(vec![crate::codec::Extension {
+                tag: crate::schema::media::PLAYER_ALBUM_ART_URL_EXTENSION as u16,
+                required: false,
+                value: b"https://i.scdn.co/image/cover".to_vec(),
+            }]),
+        };
+        assert_eq!(
+            player.album_art_url().unwrap(),
+            Some("https://i.scdn.co/image/cover")
+        );
+        assert!(PlayerRecord::decode(&player.encode().unwrap()).is_ok());
+
+        player.extensions.0.push(crate::codec::Extension {
+            tag: crate::schema::media::PLAYER_ALBUM_ART_HASH_EXTENSION as u16,
+            required: false,
+            value: vec![0; 32],
+        });
+        assert!(player.encode().is_err());
     }
 }

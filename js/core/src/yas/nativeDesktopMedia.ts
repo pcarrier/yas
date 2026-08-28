@@ -73,6 +73,7 @@ import {
 import {
   YasMediaClient,
   mediaPlayerActive,
+  mediaPlayerAlbumArtUrl,
   type YasMediaDeviceRecord,
   type YasMediaFormat,
   type YasMediaFrame,
@@ -1176,11 +1177,10 @@ export class YasNativeDesktopClientLifecycle {
       (extension) =>
         extension.tag === g.YAS_MEDIA_PLAYER_ALBUM_ART_HASH_EXTENSION,
     )?.value;
-    const artwork = await this.productArtwork(
-      artworkHash,
-      liveArtwork,
-      retainedArtwork,
-    );
+    const artworkUrl = mediaPlayerAlbumArtUrl(record);
+    const artwork = artworkUrl
+      ? ({ kind: "url", url: artworkUrl } as const)
+      : await this.productArtwork(artworkHash, liveArtwork, retainedArtwork);
     return {
       playerId: record.playerHandle,
       revision: record.revision,

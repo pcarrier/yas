@@ -338,6 +338,12 @@ pub enum Command {
         command: Option<SurfaceCommand>,
     },
 
+    /// Inspect and control desktop media players (MPRIS)
+    Media {
+        #[command(subcommand)]
+        command: Option<MediaCommand>,
+    },
+
     /// Manage the clipboard
     #[command(alias = "c")]
     Clipboard {
@@ -1662,6 +1668,45 @@ pub enum SurfaceCommand {
         #[arg(long)]
         timing: Option<String>,
     },
+}
+
+// ── Media subcommands ────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum MediaCommand {
+    /// List desktop media players
+    #[command(alias = "ls")]
+    List,
+
+    /// Start or resume playback
+    Play(MediaPlayerTarget),
+
+    /// Pause playback
+    Pause(MediaPlayerTarget),
+
+    /// Toggle between playing and paused
+    #[command(alias = "play-pause", alias = "playpause")]
+    Toggle(MediaPlayerTarget),
+
+    /// Stop playback
+    Stop(MediaPlayerTarget),
+
+    /// Skip to the next track
+    Next(MediaPlayerTarget),
+
+    /// Return to the previous track
+    #[command(alias = "prev")]
+    Previous(MediaPlayerTarget),
+
+    /// Raise the player's application window
+    Raise(MediaPlayerTarget),
+}
+
+#[derive(Args)]
+pub struct MediaPlayerTarget {
+    /// Player ID; defaults to the active player
+    #[arg(value_name = "PLAYER")]
+    pub player: Option<u64>,
 }
 
 // ── Clipboard subcommands ────────────────────────────────────────────────

@@ -1769,6 +1769,8 @@ pub const ENTITY_PORTAL: u64 = 2;
 pub const ENTITY_PLAYER: u64 = 3;
 pub const PLAYER_ALBUM_ART_HASH_EXTENSION: u64 = 1;
 pub const PLAYER_ACTIVE_EXTENSION: u64 = 2;
+pub const PLAYER_ALBUM_ART_URL_EXTENSION: u64 = 3;
+pub const PLAYER_ALBUM_ART_URL_MAX_BYTES: u64 = 4096;
 pub const PORTAL_ASSET_HASH_EXTENSION: u64 = 1;
 pub const ASSET_CONTENT_KIND: u64 = 1;
 pub const MAX_INLINE_METADATA_BYTES: u64 = 32768;
@@ -1945,6 +1947,8 @@ super::ConstantMetadata { name: "ENTITY_PORTAL", value: 2 },
 super::ConstantMetadata { name: "ENTITY_PLAYER", value: 3 },
 super::ConstantMetadata { name: "PLAYER_ALBUM_ART_HASH_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "PLAYER_ACTIVE_EXTENSION", value: 2 },
+super::ConstantMetadata { name: "PLAYER_ALBUM_ART_URL_EXTENSION", value: 3 },
+super::ConstantMetadata { name: "PLAYER_ALBUM_ART_URL_MAX_BYTES", value: 4096 },
 super::ConstantMetadata { name: "PORTAL_ASSET_HASH_EXTENSION", value: 1 },
 super::ConstantMetadata { name: "ASSET_CONTENT_KIND", value: 1 },
 super::ConstantMetadata { name: "MAX_INLINE_METADATA_BYTES", value: 32768 },

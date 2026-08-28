@@ -11,7 +11,7 @@ pub use model::{
     LoopStatus, MPRIS_ARTWORK_MAX, MPRIS_STRING_MAX, MprisActionResult, MprisArtwork, MprisPlayer,
     MprisRecord, PlaybackStatus, PortalAccessRequest, PortalChoice, PortalChoiceValue,
     PortalRequest, PortalScreenCastRequest, STATUS_BUDGET, STATUS_CONFLICT, STATUS_INVALID,
-    STATUS_OK, STATUS_UNKNOWN_ID, STATUS_WRONG_TYPE, ScreenCastCandidate,
+    STATUS_OK, STATUS_UNKNOWN_ID, STATUS_WRONG_TYPE, ScreenCastCandidate, artwork_url_allowed,
 };
 pub use model::{
     MENU_NODE_CHECKMARK, MENU_NODE_ENABLED, MENU_NODE_RADIO, MENU_NODE_SEPARATOR,

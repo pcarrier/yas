@@ -33,6 +33,7 @@ import {
 import type {
   YasTerminalSurface,
   SessionId,
+  SurfaceId,
   TerminalPalette,
   YasSurface,
 } from "@yas-run/core";
@@ -111,7 +112,7 @@ import {
   type FloatingDragMode,
   type FloatingResizeEdge,
 } from "./floatingWindow";
-import { removePaneFromLayout } from "./paneRemoval";
+import { removePaneFromLayout, showEmptyPaneHint } from "./paneRemoval";
 import { SurfaceIcon } from "../SurfaceIcon";
 
 // The tree context lives in ./treeContext so its identity survives hot
@@ -229,9 +230,7 @@ export function LayoutContainer(props: {
   /** Called with control functions so the parent can direct pane focus/assignments. */
   onFocusBySession?: (fn: (sessionId: SessionId) => void) => void;
   onFocusPane?: (fn: (paneId: string) => void) => void;
-  onChooseWindowManager?: (
-    fn: (manager: WindowManager) => void,
-  ) => void;
+  onChooseWindowManager?: (fn: (manager: WindowManager) => void) => void;
   onAddFloatingWindow?: (fn: (assignment: string) => void) => void;
   onMoveSessionToPane?: (
     fn: (sessionId: SessionId, targetPaneId: string) => void,
@@ -270,6 +269,9 @@ export function LayoutContainer(props: {
   isConnectionReadOnly?: (connectionId: string) => boolean;
   /** Close an IDE/web tab host-wide (Workspace owns the tab registry). */
   onCloseTab?: (assignment: string) => void;
+  /** Close a native surface. Workspace owns the close tombstone that keeps
+   * the asynchronously-destroyed surface out of the parked-items panel. */
+  onCloseSurface?: (connectionId: string, surfaceId: SurfaceId) => void;
 }) {
   const workspace = createYasWorkspace();
   const workspaceState = createYasWorkspaceState(workspace);
@@ -923,7 +925,11 @@ export function LayoutContainer(props: {
     if (isSurfaceAssignment(assign)) {
       const parsed = parseSurfaceAssignment(assign);
       if (parsed) {
-        workspace.closeSurface(parsed.connectionId, parsed.surfaceId);
+        if (props.onCloseSurface) {
+          props.onCloseSurface(parsed.connectionId, parsed.surfaceId);
+        } else {
+          workspace.closeSurface(parsed.connectionId, parsed.surfaceId);
+        }
       }
       return;
     }
@@ -1271,6 +1277,8 @@ export function LayoutContainer(props: {
   });
 
   const multiPane = () => leafCount(root()) > 1;
+  const hasAssignedPane = () =>
+    Object.values(layoutState().assignments).some((value) => value !== null);
 
   // Each reactive field is exposed via a getter so consumers reading
   // `ctx.foo` see the current value.  Solid's Provider captures `props.value`
@@ -1286,6 +1294,9 @@ export function LayoutContainer(props: {
     },
     get multiPane() {
       return multiPane();
+    },
+    get hasAssignedPane() {
+      return hasAssignedPane();
     },
     get windowManager() {
       return windowManagerOf(root());
@@ -1742,14 +1753,14 @@ function LeafPane(props: {
         position: "relative",
         border:
           ctx.multiPane && ctx.windowManager !== "floating"
-          ? `1px solid ${
-              paneAttention()
-                ? theme().errorText
-                : props.isFocused
-                  ? theme().accent
-                  : "transparent"
-            }`
-          : "none",
+            ? `1px solid ${
+                paneAttention()
+                  ? theme().errorText
+                  : props.isFocused
+                    ? theme().accent
+                    : "transparent"
+              }`
+            : "none",
       }}
       onPointerDown={() => ctx.onFocusPane(props.paneId)}
       onFocusIn={() => ctx.onFocusPane(props.paneId)}
@@ -1885,7 +1896,11 @@ function LeafPane(props: {
                 <EmptyPane
                   paneId={props.paneId}
                   isFocused={props.isFocused}
-                  showHint={!ctx.multiPane}
+                  showHint={showEmptyPaneHint(
+                    ctx.multiPane,
+                    ctx.hasAssignedPane,
+                    props.isFocused,
+                  )}
                   theme={theme()}
                   palette={ctx.palette}
                   fontSize={ctx.fontSize}
@@ -1984,7 +1999,11 @@ function LeafPane(props: {
               <EmptyPane
                 paneId={props.paneId}
                 isFocused={props.isFocused}
-                showHint={!ctx.multiPane}
+                showHint={showEmptyPaneHint(
+                  ctx.multiPane,
+                  ctx.hasAssignedPane,
+                  props.isFocused,
+                )}
                 theme={theme()}
                 palette={ctx.palette}
                 fontSize={ctx.fontSize}
@@ -2319,7 +2338,7 @@ function FloatingLayer(props: {
             const value = assignment();
             return value
               ? floatingWindowTitle(value, sessions(), surfaceFor(value))
-                : "";
+              : "";
           };
           const surface = () => {
             const value = assignment();

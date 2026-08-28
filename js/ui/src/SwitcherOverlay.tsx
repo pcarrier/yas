@@ -9,6 +9,7 @@ import {
   For,
   type JSX,
 } from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
 import {
   YasTerminal,
   YasSurfaceView,
@@ -51,7 +52,6 @@ import {
 import { tileDisplay } from "./ide/tileDisplay";
 import { t, tp } from "./i18n";
 import { getInstallPrompt, clearInstallPrompt } from "./installPrompt";
-import { stabilizeSections } from "./switcherStabilize";
 import { placeApplicationSection } from "./switcherSections";
 import { retainSwitcherFocus } from "./switcherFocus";
 import { createLazyIcons } from "./lazyIcons";
@@ -1581,13 +1581,22 @@ export function SwitcherOverlay(props: {
     return next.filter((section) => section.items.length > 0);
   };
 
-  // Workspace emits (titles, usedRows, output-driven title sync) rebuild the
-  // item data constantly. Reuse unchanged section/item objects so Solid's
-  // <For> keeps existing rows — and their live thumbnails — mounted instead of
-  // remounting the whole list (visible as flashing) on every emit.
-  const sections = createMemo<SwitcherSection[]>((prev) =>
-    stabilizeSections(prev, buildSections()),
+  // Workspace emits rebuild the item data constantly. A keyed Solid store
+  // updates fields in place while preserving section and row proxies, so
+  // <For> keeps the terminal/surface canvases mounted even when a title,
+  // focus badge, or other visible field changes.
+  type StoredSwitcherSection = SwitcherSection & { key: string };
+  const [sectionStore, setSectionStore] = createStore<StoredSwitcherSection[]>(
+    [],
   );
+  createEffect(() => {
+    const next = buildSections().map((section) => ({
+      ...section,
+      key: `section:${section.title}`,
+    }));
+    setSectionStore(reconcile(next, { key: "key" }));
+  });
+  const sections = () => sectionStore;
 
   const flatItems = createMemo(() =>
     sections().flatMap((section) => section.items),

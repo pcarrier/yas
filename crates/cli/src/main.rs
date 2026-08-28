@@ -18,6 +18,7 @@ mod yas_fs;
 mod yas_git;
 mod yas_kv;
 mod yas_lsp;
+mod yas_media;
 mod yas_native;
 mod yas_net;
 mod yas_process;
@@ -598,6 +599,13 @@ async fn async_main() {
             };
             if let Err(e) = result {
                 eprintln!("yas: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Media { command } => {
+            let conn = &cli.connect;
+            if let Err(error) = yas_media::dispatch(conn.on.as_deref(), &conn.hub, command).await {
+                eprintln!("yas: {error}");
                 std::process::exit(1);
             }
         }

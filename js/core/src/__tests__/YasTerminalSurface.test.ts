@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   YasTerminalSurface,
+  terminalGridPresentation,
   terminalSurfaceForInput,
 } from "../YasTerminalSurface";
 
@@ -80,6 +81,23 @@ describe("YasTerminalSurface sizing", () => {
     }
     return { surface, canvas };
   }
+
+  it("scales a shared terminal grid to each pane without distorting cells", () => {
+    expect(terminalGridPresentation(1000, 700, 400, 200)).toEqual({
+      scale: 2.5,
+      width: 1000,
+      height: 500,
+      left: 0,
+      top: 100,
+    });
+    expect(terminalGridPresentation(300, 200, 600, 300)).toEqual({
+      scale: 0.5,
+      width: 300,
+      height: 150,
+      left: 0,
+      top: 25,
+    });
+  });
 
   it("resolves the mounted surface from its keyboard textarea", () => {
     const { surface, canvas } = attachSurface();
@@ -290,6 +308,38 @@ describe("YasTerminalSurface sizing", () => {
     ]);
     expect(setViewSize.mock.calls[0]![4]).toBeTypeOf("function");
 
+    surface.dispose();
+  });
+
+  it("registers the pane geometry when a new terminal becomes ready", async () => {
+    const setViewSize = vi.fn();
+    const surface = new YasTerminalSurface({ sessionId: "s1" });
+    const container = document.createElement("div");
+    const cell = surface["cell"];
+    Object.defineProperties(container, {
+      clientWidth: { configurable: true, value: cell.w * 111 },
+      clientHeight: { configurable: true, value: cell.h * 32 },
+    });
+    const terminal = {} as never;
+    surface["container"] = container;
+    surface.terminal = terminal;
+    surface["_yasConn"] = {
+      allocViewId: () => "v-new",
+      setViewSize,
+      removeView: vi.fn(),
+      release: vi.fn(),
+    } as never;
+
+    surface["registerReadyTerminalSize"](terminal);
+    await Promise.resolve();
+
+    expect(setViewSize).toHaveBeenCalledOnce();
+    expect(setViewSize.mock.calls[0]!.slice(0, 4)).toEqual([
+      "s1",
+      "v-new",
+      32,
+      111,
+    ]);
     surface.dispose();
   });
 });

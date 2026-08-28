@@ -791,6 +791,8 @@ export const YAS_MEDIA_ENTITY_PORTAL = 2 as const;
 export const YAS_MEDIA_ENTITY_PLAYER = 3 as const;
 export const YAS_MEDIA_PLAYER_ALBUM_ART_HASH_EXTENSION = 1 as const;
 export const YAS_MEDIA_PLAYER_ACTIVE_EXTENSION = 2 as const;
+export const YAS_MEDIA_PLAYER_ALBUM_ART_URL_EXTENSION = 3 as const;
+export const YAS_MEDIA_PLAYER_ALBUM_ART_URL_MAX_BYTES = 4096 as const;
 export const YAS_MEDIA_PORTAL_ASSET_HASH_EXTENSION = 1 as const;
 export const YAS_MEDIA_ASSET_CONTENT_KIND = 1 as const;
 export const YAS_MEDIA_MAX_INLINE_METADATA_BYTES = 32768 as const;
@@ -6899,6 +6901,14 @@ export const YAS_SCHEMA = {
         {
           "name": "PLAYER_ACTIVE_EXTENSION",
           "value": 2
+        },
+        {
+          "name": "PLAYER_ALBUM_ART_URL_EXTENSION",
+          "value": 3
+        },
+        {
+          "name": "PLAYER_ALBUM_ART_URL_MAX_BYTES",
+          "value": 4096
         },
         {
           "name": "PORTAL_ASSET_HASH_EXTENSION",

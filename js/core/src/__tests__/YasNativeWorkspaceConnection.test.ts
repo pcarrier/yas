@@ -206,6 +206,7 @@ describe("YasNativeWorkspaceConnection", () => {
         maxInflightFrames: 1,
       },
       subscribe: vi.fn(() => removeFrames),
+      configure: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
     };
     const cancelledResult = deferred<typeof view>();
@@ -247,16 +248,19 @@ describe("YasNativeWorkspaceConnection", () => {
       closeView(handle: bigint): Promise<void>;
       pendingViews: Map<bigint, { promise: Promise<void>; cancelled: boolean }>;
       views: Map<bigint, unknown>;
+      viewSizes: Map<bigint, Map<string, { rows: number; cols: number }>>;
     };
 
     const first = lifecycle.openView(1n);
     const second = lifecycle.openView(1n);
     expect(openView).toHaveBeenCalledOnce();
+    lifecycle.viewSizes.set(1n, new Map([["pane", { rows: 50, cols: 140 }]]));
     result.resolve(view);
     await Promise.all([first, second]);
 
     expect(lifecycle.views.size).toBe(1);
     expect(lifecycle.pendingViews.size).toBe(0);
+    expect(view.configure).toHaveBeenCalledWith({ rows: 50, cols: 140 });
     expect(view.close).not.toHaveBeenCalled();
 
     const late = lifecycle.openView(2n);
@@ -1184,25 +1188,13 @@ describe("YasNativeWorkspaceConnection", () => {
       "title",
       "app",
     );
-    expect(handleSurfaceResized).toHaveBeenCalledWith(
-      1n,
-      1598,
-      1198,
-      800,
-      600,
-    );
+    expect(handleSurfaceResized).toHaveBeenCalledWith(1n, 1598, 1198, 800, 600);
 
     handleSurfaceResized.mockClear();
     lifecycle.applySurfaceCatalog([
       { ...record, compositeWidth: 800, compositeHeight: 600 },
     ]);
-    expect(handleSurfaceResized).toHaveBeenCalledWith(
-      1n,
-      800,
-      600,
-      800,
-      600,
-    );
+    expect(handleSurfaceResized).toHaveBeenCalledWith(1n, 800, 600, 800, 600);
   });
 
   it("opens an unscaled HiDPI Surface view at physical size and display rate", async () => {

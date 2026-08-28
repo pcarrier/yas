@@ -79,6 +79,8 @@ export interface LayoutTreeCtx {
   connectionId: string;
   connectionLabels?: Map<string, string>;
   multiPane: boolean;
+  /** At least one pane currently contains a terminal, surface, or tile. */
+  hasAssignedPane: boolean;
   /** Root manager, so a framed floating window does not also draw the pane's
    *  hover toolbar inside its content. */
   windowManager: WindowManager;

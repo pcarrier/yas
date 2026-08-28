@@ -66,6 +66,7 @@ export class TerminalStore {
   private terminals = new Map<TerminalId, Terminal>();
   private staleTerminals = new Map<TerminalId, Terminal>();
   private retainCount = new Map<TerminalId, number>();
+  private retainedSurfaces = 0;
   private pendingFree = new Set<TerminalId>();
   private subscribed = new Set<TerminalId>();
   private desired = new Set<TerminalId>();
@@ -160,6 +161,15 @@ export class TerminalStore {
           return;
         }
         if (r) {
+          // A WebGPU canvas is presented asynchronously. One surface can
+          // tolerate the one-frame catch-up, but several surfaces sharing it
+          // would copy one another's previously presented frame and visibly
+          // flicker. Multi-surface rendering needs the synchronous WebGL2 (or
+          // Canvas2D) composite path.
+          if (this.retainedSurfaces > 1) {
+            r.dispose();
+            return;
+          }
           this.webgpuCanvas = canvas;
           this.webgpuRenderer = r;
           // If the shared renderer was already initialised with a WebGL2 /
@@ -374,6 +384,26 @@ export class TerminalStore {
     canvas: HTMLCanvasElement,
   ): HTMLCanvasElement {
     return canvas;
+  }
+
+  /**
+   * Stop using the asynchronous shared WebGPU canvas once a second terminal
+   * surface mounts. Synchronous copy-out is part of the shared-renderer
+   * contract; without it, each thumbnail can copy the preceding terminal's
+   * frame before its own WebGPU submission is presented.
+   */
+  private requireSynchronousComposite(): void {
+    const gpu = this.webgpuRenderer;
+    if (!gpu) return;
+    const wasShared = this.sharedRenderer === gpu;
+    if (wasShared) {
+      this.sharedRenderer = null;
+      this.sharedCanvas = null;
+    }
+    this.webgpuRenderer = null;
+    this.webgpuCanvas = null;
+    gpu.dispose();
+    if (wasShared) this.notifyAllDirty();
   }
 
   /**
@@ -626,10 +656,14 @@ export class TerminalStore {
 
   retain(ptyId: TerminalId): void {
     this.retainCount.set(ptyId, (this.retainCount.get(ptyId) ?? 0) + 1);
+    this.retainedSurfaces++;
+    if (this.retainedSurfaces > 1) this.requireSynchronousComposite();
   }
 
   release(ptyId: TerminalId): void {
-    const count = (this.retainCount.get(ptyId) ?? 1) - 1;
+    const previous = this.retainCount.get(ptyId) ?? 0;
+    const count = previous - 1;
+    if (previous > 0) this.retainedSurfaces--;
     if (count <= 0) {
       this.retainCount.delete(ptyId);
       if (this.pendingFree.has(ptyId)) {
@@ -862,6 +896,7 @@ export class TerminalStore {
     this.terminals.clear();
     for (const t of this.staleTerminals.values()) t.free();
     this.staleTerminals.clear();
+    this.retainedSurfaces = 0;
     this.subscribed.clear();
     this.dirtyListeners.clear();
     this.readyListeners.clear();

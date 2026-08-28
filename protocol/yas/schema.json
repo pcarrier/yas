@@ -4093,6 +4093,14 @@
           "value": 2
         },
         {
+          "name": "PLAYER_ALBUM_ART_URL_EXTENSION",
+          "value": 3
+        },
+        {
+          "name": "PLAYER_ALBUM_ART_URL_MAX_BYTES",
+          "value": 4096
+        },
+        {
           "name": "PORTAL_ASSET_HASH_EXTENSION",
           "value": 1
         },

@@ -39,6 +39,7 @@ import {
 } from "./wire";
 
 const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 export {
   YAS_FAMILY_MEDIA,
@@ -1557,6 +1558,7 @@ export function decodeMediaPlayerRecord(
       new Set([
         g.YAS_MEDIA_PLAYER_ALBUM_ART_HASH_EXTENSION,
         g.YAS_MEDIA_PLAYER_ACTIVE_EXTENSION,
+        g.YAS_MEDIA_PLAYER_ALBUM_ART_URL_EXTENSION,
       ]),
       "Media player extensions",
     ),
@@ -2420,6 +2422,12 @@ function validatePlayer(value: YasMediaPlayerRecord): void {
     g.YAS_MEDIA_PLAYER_ALBUM_ART_HASH_EXTENSION,
     "Media album art hash",
   );
+  const hasHash = value.extensions.some(
+    (entry) => entry.tag === g.YAS_MEDIA_PLAYER_ALBUM_ART_HASH_EXTENSION,
+  );
+  const albumArtUrl = mediaPlayerAlbumArtUrl(value);
+  if (hasHash && albumArtUrl !== null)
+    throw new YasProtocolError("Media player has multiple album art sources");
   mediaPlayerActive(value);
 }
 
@@ -2437,6 +2445,32 @@ export function mediaPlayerActive(
   )
     throw new YasProtocolError("Media player active state is invalid");
   return extension.value[0] === 1;
+}
+
+/** Browser-loadable album artwork URL carried directly by the player. */
+export function mediaPlayerAlbumArtUrl(
+  value: Pick<YasMediaPlayerRecord, "extensions">,
+): string | null {
+  const extension = value.extensions.find(
+    (entry) => entry.tag === g.YAS_MEDIA_PLAYER_ALBUM_ART_URL_EXTENSION,
+  );
+  if (!extension) return null;
+  if (
+    extension.value.length === 0 ||
+    extension.value.length > g.YAS_MEDIA_PLAYER_ALBUM_ART_URL_MAX_BYTES
+  )
+    throw new YasProtocolError("Media album art URL length is invalid");
+  let url: string;
+  try {
+    url = textDecoder.decode(extension.value);
+  } catch {
+    throw new YasProtocolError("Media album art URL is not valid UTF-8");
+  }
+  const separator = url.indexOf("://");
+  const scheme = separator < 0 ? "" : url.slice(0, separator).toLowerCase();
+  if ((scheme !== "https" && scheme !== "http") || separator + 3 >= url.length)
+    throw new YasProtocolError("Media album art URL scheme is invalid");
+  return url;
 }
 
 function validateHashExtension(

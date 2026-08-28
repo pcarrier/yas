@@ -163,6 +163,8 @@ const MAX_PENDING_MEDIA_OPERATIONS: usize = 32;
 #[cfg(target_os = "linux")]
 const MAX_MEDIA_ASSET_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(target_os = "linux")]
+const MEDIA_PLAYER_HANDLE_BASE: u64 = 1 << 63;
+#[cfg(target_os = "linux")]
 const MEDIA_OUTPUT_DEVICE_HANDLE: u64 = 1;
 #[cfg(target_os = "linux")]
 const MEDIA_MICROPHONE_DEVICE_HANDLE: u64 = 2;
@@ -4337,7 +4339,10 @@ impl MediaRuntime {
         if let Some(&handle) = self.player_handles.get(&backend_id) {
             return Some(handle);
         }
-        let handle = alloc_presentation_handle()?;
+        // MPRIS backend IDs are allocated monotonically for the server's
+        // lifetime. Keep their opaque wire handles stable across client
+        // connections so a handle printed by the CLI remains actionable.
+        let handle = MEDIA_PLAYER_HANDLE_BASE | u64::from(backend_id);
         self.player_handles.insert(backend_id, handle);
         self.player_backend_ids.insert(handle, backend_id);
         Some(handle)
@@ -32409,18 +32414,29 @@ fn media_player_record(
     player: &::yas_desktop::MprisPlayer,
 ) -> Option<yas_media::PlayerRecord> {
     let mut extensions = Extensions::default();
-    if let ::yas_desktop::MprisArtwork::Png(bytes) = &player.artwork
-        && let Some(hash) = media_store_asset(runtime, bytes)
-    {
-        extensions.0.push(Extension {
-            tag: yas_wire::schema::media::PLAYER_ALBUM_ART_HASH_EXTENSION as u16,
-            required: false,
-            value: hash.to_vec(),
-        });
+    match &player.artwork {
+        ::yas_desktop::MprisArtwork::Png(bytes) => {
+            if let Some(hash) = media_store_asset(runtime, bytes) {
+                extensions.0.push(Extension {
+                    tag: yas_wire::schema::media::PLAYER_ALBUM_ART_HASH_EXTENSION as u16,
+                    required: false,
+                    value: hash.to_vec(),
+                });
+            }
+        }
+        ::yas_desktop::MprisArtwork::Url(url) if ::yas_desktop::artwork_url_allowed(url) => {
+            extensions.0.push(Extension {
+                tag: yas_wire::schema::media::PLAYER_ALBUM_ART_URL_EXTENSION as u16,
+                required: false,
+                value: url.as_bytes().to_vec(),
+            });
+        }
+        ::yas_desktop::MprisArtwork::None | ::yas_desktop::MprisArtwork::Url(_) => {}
     }
     extensions
         .0
         .push(yas_media::player_active_extension(player.active));
+    extensions.0.sort_by_key(|extension| extension.tag);
     Some(yas_media::PlayerRecord {
         player_handle: runtime.player_handle(player.player_id)?,
         revision: u64::from(player.revision).max(1),
@@ -45007,6 +45023,20 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn media_player_handles_are_stable_across_connections() {
+        let mut first = MediaRuntime::new([1; 16], 1);
+        let mut second = MediaRuntime::new([2; 16], 2);
+
+        let first_handle = first.player_handle(41).unwrap();
+        let second_handle = second.player_handle(41).unwrap();
+        assert_eq!(first_handle, second_handle);
+        assert_eq!(first_handle, MEDIA_PLAYER_HANDLE_BASE | 41);
+        assert_eq!(first.player_backend_id(first_handle), Some(41));
+        assert_eq!(second.player_backend_id(second_handle), Some(41));
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn media_watch_output_audio_timebase_and_portal_are_native() {
         let state = super::super::tests::process_transport::test_state(
@@ -45133,7 +45163,9 @@ mod tests {
                     title: String::new(),
                     album: String::new(),
                     artists: Vec::new(),
-                    artwork: ::yas_desktop::MprisArtwork::None,
+                    artwork: ::yas_desktop::MprisArtwork::Url(
+                        "https://i.scdn.co/image/test".to_owned(),
+                    ),
                 },
             );
             compositor
@@ -45161,6 +45193,10 @@ mod tests {
         assert_ne!(player.player_handle, 41);
         assert_eq!(player.state, yas_wire::schema::media::PLAYER_PLAYING as u16);
         assert_eq!(player.active().unwrap(), Some(false));
+        assert_eq!(
+            player.album_art_url().unwrap(),
+            Some("https://i.scdn.co/image/test")
+        );
         let selected_format = output_device.formats[0].clone();
         write_request(
             &mut client,

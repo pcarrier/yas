@@ -30,10 +30,7 @@ import {
   setAllowedCodecSupport,
   isIOS,
 } from "@yas-run/core";
-import {
-  windowManagerOf,
-  type WindowManager,
-} from "@yas-run/core/layout";
+import { windowManagerOf, type WindowManager } from "@yas-run/core/layout";
 import type {
   YasTransport,
   YasSession,
@@ -364,9 +361,7 @@ function getHmrWorkspace(
   transportOwnership: WorkspaceTransportOwnership,
 ): HmrWorkspaceData {
   const raw = import.meta.hot?.data?.workspace as
-    | HmrWorkspaceData
-    | YasWorkspace
-    | undefined;
+    HmrWorkspaceData | YasWorkspace | undefined;
   // Accept the raw YasWorkspace stored by versions before HmrWorkspaceData.
   const prev = raw && "workspace" in raw ? raw.workspace : raw;
   const previousOwner = raw && "workspace" in raw ? raw.owner : null;
@@ -413,8 +408,7 @@ export function Workspace(props: {
   onAuthError: () => void;
   relayRoutes?: () => readonly YasRelayRoute[];
   workspaceSession?:
-    | WorkspaceSessionBinding
-    | Accessor<WorkspaceSessionBinding | null>;
+    WorkspaceSessionBinding | Accessor<WorkspaceSessionBinding | null>;
   workspaceSessions?: WorkspaceSessionController;
   transportOwnership?: WorkspaceTransportOwnership;
 }) {
@@ -2253,6 +2247,10 @@ function WorkspaceScreen(props: {
   // Session-only; explicit closes prune it.
   const [localTabs, setLocalTabs] = createSignal<string[]>([]);
   const closingTabs = createTabCloseTracker();
+  // A pane disappears synchronously, but xdg_toplevel.close is only a request:
+  // the Wayland client destroys its surface later. Tombstone it during that
+  // interval so closing a floating window can never look like parking it.
+  const closingSurfaces = createTabCloseTracker();
   // Recording pushes one entry per file navigated past, so the list is
   // LRU-capped — an unbounded dock also meant unbounded live fs syncs,
   // which is how YAS_FS_MAX_SYNCS got exhausted in normal browsing.
@@ -2319,9 +2317,7 @@ function WorkspaceScreen(props: {
     return out.slice(0, BACKGROUND_TILES_MAX);
   });
   createEffect(() => {
-    closingTabs.reconcile(
-      new Set(openTabs().map((tab) => tab.assignment)),
-    );
+    closingTabs.reconcile(new Set(openTabs().map((tab) => tab.assignment)));
   });
   /**
    * Everything open, in the order Ctrl+B [ / ] walks it: terminals, then
@@ -2559,10 +2555,14 @@ function WorkspaceScreen(props: {
     }
     return surfaces().filter(
       (s) =>
+        !closingSurfaces.isClosing(
+          surfaceAssignment(s.connectionId, s.surfaceId),
+        ) &&
         !(
           s.surfaceId === fid &&
           (fConnId == null || s.connectionId === fConnId)
-        ) && !inPane.has(`${s.connectionId}:${s.surfaceId}`),
+        ) &&
+        !inPane.has(`${s.connectionId}:${s.surfaceId}`),
     );
   });
 
@@ -3401,8 +3401,35 @@ function WorkspaceScreen(props: {
     ) {
       setPendingMainRef(null);
     }
-    workspace.closeSurface(connectionId, surfaceId);
+    const assignment = surfaceAssignment(connectionId, surfaceId);
+    const operation = closingSurfaces.begin(assignment);
+    try {
+      workspace.closeSurface(connectionId, surfaceId);
+      closingSurfaces.settle(
+        assignment,
+        operation,
+        true,
+        surfaces().some(
+          (surface) =>
+            surface.connectionId === connectionId &&
+            surface.surfaceId === surfaceId,
+        ),
+      );
+    } catch (error) {
+      closingSurfaces.settle(assignment, operation, false, false);
+      throw error;
+    }
   }
+
+  createEffect(() => {
+    closingSurfaces.reconcile(
+      new Set(
+        surfaces().map((surface) =>
+          surfaceAssignment(surface.connectionId, surface.surfaceId),
+        ),
+      ),
+    );
+  });
 
   function closeSessionFromUi(sessionId: SessionId): Promise<void> {
     if (wsState().focusedSessionId === sessionId) setPendingMainRef(null);
@@ -4054,8 +4081,7 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    | ((sessionId: SessionId, targetPaneId: string) => void)
-    | null = null;
+    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
@@ -4065,9 +4091,7 @@ function WorkspaceScreen(props: {
     null;
   let clearPaneAssignmentFn: ((paneId: string) => void) | null = null;
   let focusPaneFn: ((paneId: string) => void) | null = null;
-  let chooseWindowManagerFn:
-    | ((manager: WindowManager) => void)
-    | null = null;
+  let chooseWindowManagerFn: ((manager: WindowManager) => void) | null = null;
   let addFloatingWindowFn: ((assignment: string) => void) | null = null;
   // Drop every LayoutContainer control-fn reference. These close over a specific
   // LayoutContainer instance; when the container unmounts that instance is
@@ -4087,16 +4111,12 @@ function WorkspaceScreen(props: {
   /** Show a parked item without evicting a floating window already on screen. */
   function showAsFloatingWindow(assignment: string): boolean {
     const layout = activeLayout();
-    if (
-      !inLayout() ||
-      !layout ||
-      windowManagerOf(layout.root) !== "floating"
-    ) {
+    if (!inLayout() || !layout || windowManagerOf(layout.root) !== "floating") {
       return false;
     }
-    const shown = Object.entries(
-      layoutAssignments()?.assignments ?? {},
-    ).find(([, value]) => value === assignment)?.[0];
+    const shown = Object.entries(layoutAssignments()?.assignments ?? {}).find(
+      ([, value]) => value === assignment,
+    )?.[0];
     if (shown) focusPaneFn?.(shown);
     else addFloatingWindowFn?.(assignment);
     return true;
@@ -5382,6 +5402,7 @@ function WorkspaceScreen(props: {
                     onDropTile={dropTileIntoPane}
                     isMobileTouch={isMobileTouch()}
                     onCloseTab={closeTab}
+                    onCloseSurface={closeSurfaceFromUi}
                     onCreateInPane={(paneId, command, connectionId) => {
                       if (
                         !command &&
@@ -5797,9 +5818,7 @@ function WorkspaceScreen(props: {
         <Show when={overlay() === "window-manager"}>
           <WindowManagerChooser
             current={
-              activeLayout()
-                ? windowManagerOf(activeLayout()!.root)
-                : "tiling"
+              activeLayout() ? windowManagerOf(activeLayout()!.root) : "tiling"
             }
             palette={palette()}
             fontSize={fontSize()}

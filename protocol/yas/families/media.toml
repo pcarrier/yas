@@ -176,6 +176,12 @@ value = 1
 name = "PLAYER_ACTIVE_EXTENSION"
 value = 2
 [[constant]]
+name = "PLAYER_ALBUM_ART_URL_EXTENSION"
+value = 3
+[[constant]]
+name = "PLAYER_ALBUM_ART_URL_MAX_BYTES"
+value = 4096
+[[constant]]
 name = "PORTAL_ASSET_HASH_EXTENSION"
 value = 1
 [[constant]]

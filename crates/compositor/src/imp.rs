@@ -5004,11 +5004,7 @@ impl Compositor {
             .unwrap_or((self.output_width, self.output_height));
         let (w, h) = constrain_to_hints(surf, w, h);
         if let Some(ref tl) = surf.xdg_toplevel {
-            tl.configure(
-                w,
-                h,
-                pane_states(surf.xdg_maximized, surf.xdg_fullscreen),
-            );
+            tl.configure(w, h, pane_states(surf.xdg_maximized, surf.xdg_fullscreen));
         }
         if let Some(ref xs) = surf.xdg_surface {
             let serial = self.serial.wrapping_add(1);
@@ -5731,11 +5727,7 @@ impl Compositor {
                 {
                     let (cw, ch) = constrain_to_hints(surf, w, h);
                     if let Some(ref tl) = surf.xdg_toplevel {
-                        tl.configure(
-                            cw,
-                            ch,
-                            pane_states(surf.xdg_maximized, surf.xdg_fullscreen),
-                        );
+                        tl.configure(cw, ch, pane_states(surf.xdg_maximized, surf.xdg_fullscreen));
                     }
                     if let Some(ref xs) = surf.xdg_surface {
                         let serial = self.serial.wrapping_add(1);
@@ -8404,12 +8396,12 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                 if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
                     surf.xdg_maximized = maximized;
                     if surf.surface_id > 0 {
-                        let _ = state.event_tx.send(
-                            CompositorEvent::SurfaceMaximizeRequested {
+                        let _ = state
+                            .event_tx
+                            .send(CompositorEvent::SurfaceMaximizeRequested {
                                 surface_id: surf.surface_id,
                                 maximized,
-                            },
-                        );
+                            });
                         (state.event_notify)();
                     }
                 }

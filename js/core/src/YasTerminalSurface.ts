@@ -103,6 +103,47 @@ export interface YasTerminalSurfaceHandle {
   focus(): void;
 }
 
+export function terminalGridPresentation(
+  containerWidth: number,
+  containerHeight: number,
+  naturalWidth: number,
+  naturalHeight: number,
+): {
+  scale: number;
+  width: number;
+  height: number;
+  left: number;
+  top: number;
+} {
+  if (
+    containerWidth <= 0 ||
+    containerHeight <= 0 ||
+    naturalWidth <= 0 ||
+    naturalHeight <= 0
+  ) {
+    return {
+      scale: 1,
+      width: Math.max(0, naturalWidth),
+      height: Math.max(0, naturalHeight),
+      left: 0,
+      top: 0,
+    };
+  }
+  const scale = Math.min(
+    containerWidth / naturalWidth,
+    containerHeight / naturalHeight,
+  );
+  const width = naturalWidth * scale;
+  const height = naturalHeight * scale;
+  return {
+    scale,
+    width,
+    height,
+    left: Math.max(0, (containerWidth - width) / 2),
+    top: Math.max(0, (containerHeight - height) / 2),
+  };
+}
+
 /** Terminal-rendering slice exposed by the native Workspace connection. */
 export type YasTerminalConnection = Pick<
   YasWorkspaceConnection,
@@ -1468,6 +1509,7 @@ export class YasTerminalSurface {
         this.terminal = t;
         this.applyPaletteToTerminal(t);
         this.applyMetricsToTerminal(t);
+        this.registerReadyTerminalSize(t);
         this.contentDirty = true;
         this.scheduleRender();
       }
@@ -1497,6 +1539,7 @@ export class YasTerminalSurface {
         this.terminal = t;
         this.applyPaletteToTerminal(t);
         this.applyMetricsToTerminal(t);
+        this.registerReadyTerminalSize(t);
       }
       this.contentDirty = true;
       this.scheduleRender();
@@ -1510,6 +1553,7 @@ export class YasTerminalSurface {
         this.terminal = t;
         this.applyPaletteToTerminal(t);
         this.applyMetricsToTerminal(t);
+        this.registerReadyTerminalSize(t);
       }
       this.contentDirty = true;
       this.scheduleRender();
@@ -1522,6 +1566,30 @@ export class YasTerminalSurface {
     this.dirtyUnsub = null;
     this.scrollAnchorUnsub?.();
     this.scrollAnchorUnsub = null;
+  }
+
+  /**
+   * Publish the pane's real geometry when a newly created terminal arrives.
+   *
+   * Its pane can mount before TerminalStore materializes the first grid. The
+   * eager sizing pass then has nothing live to bind, and the native view opens
+   * at the terminal record's 80x24 default. Retry once after adopting the real
+   * terminal; the microtask lets connection/session setup finish first.
+   */
+  private registerReadyTerminalSize(terminal: Terminal): void {
+    if (!this._resizable) return;
+    queueMicrotask(() => {
+      if (
+        this.disposed ||
+        this.terminal !== terminal ||
+        !this.container ||
+        !this._yasConn ||
+        this._sessionId === null
+      )
+        return;
+      if (!this.viewId) this.viewId = this._yasConn.allocViewId();
+      this.handleResize(true);
+    });
   }
 
   /**
@@ -1662,6 +1730,8 @@ export class YasTerminalSurface {
    *  can center a grid smaller than its pane without a forced reflow. */
   private _containerW = 0;
   private _containerH = 0;
+  /** CSS scale used to fit the negotiated shared grid to this pane. */
+  private _presentationScale = 1;
   /** Container size in device pixels, tracked only for a non-resizable view.
    *  Presentation only — it never reaches handleResize, so a thumbnail can't
    *  drag the session's grid down to its own box. */
@@ -1931,23 +2001,35 @@ export class YasTerminalSurface {
     // being magnified. When the clamp bites, the composite below has already
     // halved the backing store towards the box, so the residual CSS scale is
     // always under 2:1.
-    const cssW = `${termCols * cell.w}px`;
+    const naturalW = termCols * cell.w;
+    const naturalH = termRows * cell.h;
+    const presentation = this._resizable
+      ? terminalGridPresentation(
+          this._containerW,
+          this._containerH,
+          naturalW,
+          naturalH,
+        )
+      : null;
+    this._presentationScale = presentation?.scale ?? 1;
+    const cssW = `${presentation?.width ?? naturalW}px`;
     // Non-resizable surfaces leave the height to the canvas's intrinsic aspect
     // ratio, so that clamping the width scales the grid instead of squashing
     // it and letterboxing the difference.
-    const cssH = this._resizable ? `${termRows * cell.h}px` : "auto";
+    const cssH = this._resizable
+      ? `${presentation?.height ?? naturalH}px`
+      : "auto";
     const glCanvas = this.glCanvas;
     if (glCanvas) {
       if (glCanvas.style.width !== cssW) glCanvas.style.width = cssW;
       if (glCanvas.style.height !== cssH) glCanvas.style.height = cssH;
       if (this._resizable) {
-        // The grid is server-owned (the minimum across subscribed clients),
-        // so it can be smaller than this pane; center it rather than pin it
-        // to the top-left corner.  Offsets are floored to whole CSS pixels —
-        // measureSnap/applySnap absorb any fractional device-pixel residue
-        // at dpr > 1 — and are 0 whenever the grid fills the pane.
-        const cssLeft = `${Math.max(0, Math.floor((this._containerW - termCols * cell.w) / 2))}px`;
-        const cssTop = `${Math.max(0, Math.floor((this._containerH - termRows * cell.h) / 2))}px`;
+        // The shared PTY grid is the largest one that fits every live client.
+        // Scale it locally so a smaller peer does not leave this pane drawing
+        // into a fraction of its box. Preserve the cell aspect ratio and
+        // centre the one sub-cell remainder on the unconstrained axis.
+        const cssLeft = `${presentation?.left ?? 0}px`;
+        const cssTop = `${presentation?.top ?? 0}px`;
         if (glCanvas.style.left !== cssLeft || glCanvas.style.top !== cssTop) {
           glCanvas.style.left = cssLeft;
           glCanvas.style.top = cssTop;
@@ -2148,9 +2230,17 @@ export class YasTerminalSurface {
       return;
     }
     const rect = canvas.getBoundingClientRect();
+    const terminal = this.terminal;
+    const presentationCell = terminal
+      ? {
+          ...cell,
+          w: rect.width / Math.max(1, terminal.cols),
+          h: rect.height / Math.max(1, terminal.rows),
+        }
+      : cell;
     const caret = gridCaretRect(
       rect,
-      cell,
+      presentationCell,
       { x: this.renderOffsetX, y: this.renderOffsetY },
       col,
       row,
@@ -3154,7 +3244,7 @@ export class YasTerminalSurface {
       const t = this.terminal;
       if (!t) return;
       const maxLines = t.scrollback_lines();
-      const cellH = Math.max(1, this.cell.h);
+      const cellH = Math.max(1, this.cell.h * this._presentationScale);
       // Anchor on the distance to the *bottom*, measured from real DOM
       // geometry rather than recomputed as `maxLines * cellH`. The two
       // agree only while the spacer matches the current `clientHeight`;
@@ -3214,7 +3304,7 @@ export class YasTerminalSurface {
     const spacer = this.scrollSpacer;
     const t = this.terminal;
     if (!el || !spacer || !t) return;
-    const cellH = Math.max(1, this.cell.h);
+    const cellH = Math.max(1, this.cell.h * this._presentationScale);
     const lines = t.scrollback_lines();
     // Browser scrollTop is capped at scrollHeight - clientHeight. Size the
     // content to viewport + scrollback range so the maximum reachable
@@ -3325,22 +3415,35 @@ export class YasTerminalSurface {
     const mouseToCell = (e: MouseEvent) => {
       const rect = this.canvasBox();
       if (!rect) return { row: 0, col: 0 };
+      const rows = Math.max(1, this.terminal?.rows ?? this._rows);
+      const cols = Math.max(1, this.terminal?.cols ?? this._cols);
+      const cellH =
+        rect.height > 0
+          ? rect.height / rows
+          : this.cell.h * this._presentationScale;
+      const cellW =
+        rect.width > 0
+          ? rect.width / cols
+          : this.cell.w * this._presentationScale;
       return {
         row: Math.min(
-          Math.max(Math.floor((e.clientY - rect.top) / this.cell.h), 0),
-          this._rows - 1,
+          Math.max(Math.floor((e.clientY - rect.top) / cellH), 0),
+          rows - 1,
         ),
         col: Math.min(
-          Math.max(Math.floor((e.clientX - rect.left) / this.cell.w), 0),
-          this._cols - 1,
+          Math.max(Math.floor((e.clientX - rect.left) / cellW), 0),
+          cols - 1,
         ),
       };
     };
 
     const canvasYFromEvent = (e: MouseEvent) => {
       const rect = canvas.getBoundingClientRect();
-      const dpr = this.cell.pw / this.cell.w;
-      return (e.clientY - rect.top) * dpr;
+      const cssToBacking =
+        rect.height > 0
+          ? canvas.height / rect.height
+          : this.cell.pw / this.cell.w;
+      return (e.clientY - rect.top) * cssToBacking;
     };
 
     const isNearScrollbar = (e: MouseEvent) => {
@@ -3752,11 +3855,12 @@ export class YasTerminalSurface {
         // Scrollback navigation. Native scroll does the work; a notched
         // wheel only has its travel put back on the row grid first, so the
         // sync has no rounding left to write back afterwards.
-        const rows = notchedRows(e, this.cell.h);
+        const cellH = this.cell.h * this._presentationScale;
+        const rows = notchedRows(e, cellH);
         const el = this.scrollEl;
         if (rows === 0 || !el) return;
         e.preventDefault();
-        el.scrollTop += rows * this.cell.h;
+        el.scrollTop += rows * cellH;
         return;
       }
       // Claim the gesture even when it hasn't completed a step yet, or the
@@ -3764,7 +3868,7 @@ export class YasTerminalSurface {
       e.preventDefault();
       const steps = wheelDetents.take(
         e,
-        this.cell.h,
+        this.cell.h * this._presentationScale,
         this._rows,
         performance.now(),
       );
@@ -4008,7 +4112,7 @@ export class YasTerminalSurface {
       flingLastAt = now;
       touchAccum += touchVel * dt;
       touchVel *= Math.pow(FLING_DECAY_PER_MS, dt);
-      const lineH = this.cell.h || 20;
+      const lineH = this.cell.h * this._presentationScale || 20;
       let steps = 0;
       while (
         Math.abs(touchAccum) >= lineH &&
@@ -4180,7 +4284,7 @@ export class YasTerminalSurface {
         touchLastAt = now;
         touchLastY = touch.clientY;
         touchAccum += dy;
-        const lineH = this.cell.h || 20;
+        const lineH = this.cell.h * this._presentationScale || 20;
         // Every report carries the cell where the drag began: the first
         // wheel step places the app's cursor there (vim & co. move the
         // cursor to the reported position), and pinning the rest keeps a

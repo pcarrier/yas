@@ -230,8 +230,7 @@ export function customSurfaceCursorCss(
   const rawX = Math.max(0, Math.round(hotspotX * bufferScale));
   const rawY = Math.max(0, Math.round(hotspotY * bufferScale));
   const image = `url(${JSON.stringify(url)})`;
-  if (bufferScale === 1)
-    return `${image} ${logicalX} ${logicalY}, default`;
+  if (bufferScale === 1) return `${image} ${logicalX} ${logicalY}, default`;
   // Wayland's hotspot is surface-local (logical), while the PNG is the raw
   // cursor buffer. image-set carries that buffer density into CSS, whose
   // hotspot is then expressed in the resolved image coordinate system. Keep
@@ -2797,6 +2796,15 @@ export class YasNativeWorkspaceConnection {
       this.pruneGrids(state);
     });
     this.views.set(handle, state);
+    // Mount geometry can change while OPEN_VIEW is in flight. Apply the
+    // latest offer after installing the view, just as Surface views do.
+    const latestSize = this.effectiveViewSize(handle);
+    if (
+      latestSize &&
+      (latestSize.rows !== size.rows || latestSize.cols !== size.cols)
+    ) {
+      this.configureView(handle, latestSize);
+    }
     if (this.focusedSessionId === this.sessionId(handle))
       void this.terminal.setFocus(view.result.viewId, true);
   }
