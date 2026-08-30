@@ -571,15 +571,39 @@ fn unix_sockaddr(
 }
 
 #[cfg(unix)]
-fn raw_unix_socket(kind: libc::c_int) -> Result<std::os::fd::OwnedFd, NativeConnectError> {
+fn cloexec_unix_socket(kind: libc::c_int) -> std::io::Result<std::os::fd::OwnedFd> {
+    #[cfg(target_vendor = "apple")]
+    use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
-    let fd = unsafe { libc::socket(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC, 0) };
+
+    #[cfg(target_vendor = "apple")]
+    let socket_kind = kind;
+    #[cfg(not(target_vendor = "apple"))]
+    let socket_kind = kind | libc::SOCK_CLOEXEC;
+
+    let fd = unsafe { libc::socket(libc::AF_UNIX, socket_kind, 0) };
     if fd < 0 {
-        return Err(NativeConnectError::Io(
-            std::io::Error::last_os_error().to_string(),
-        ));
+        return Err(std::io::Error::last_os_error());
     }
     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+    #[cfg(target_vendor = "apple")]
+    {
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(fd)
+}
+
+#[cfg(unix)]
+fn raw_unix_socket(kind: libc::c_int) -> Result<std::os::fd::OwnedFd, NativeConnectError> {
+    let fd =
+        cloexec_unix_socket(kind).map_err(|error| NativeConnectError::Io(error.to_string()))?;
     let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::F_GETFL) };
     if flags < 0
         || unsafe {
@@ -1183,10 +1207,11 @@ mod tests {
             kind: yas_net::UnixNameKind::Filesystem,
             name: path.as_os_str().as_bytes().to_vec(),
         };
-        let raw =
-            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
-        assert!(raw >= 0, "socket: {}", std::io::Error::last_os_error());
-        let listener = unsafe { OwnedFd::from_raw_fd(raw) };
+        let listener = cloexec_unix_socket(libc::SOCK_SEQPACKET)
+            .unwrap_or_else(|error| panic!("socket: {error}"));
+        let descriptor_flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFD) };
+        assert!(descriptor_flags >= 0);
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
         let (address, length) = unix_sockaddr(&name).unwrap();
         assert_eq!(
             unsafe {

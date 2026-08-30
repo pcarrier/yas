@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { YasSurface } from "@yas-run/core";
-import { surfaceApplicationId } from "../surfaceIcon";
+import { surfaceApplicationId } from "../surfaceApplicationId";
 
 describe("surface window icons", () => {
   it("uses the stamped desktop entry id before the client's app_id", () => {

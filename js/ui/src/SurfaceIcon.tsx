@@ -7,7 +7,7 @@ import {
   applicationIcon,
   requestApplicationIcons,
 } from "./sessionCatalogs";
-import { surfaceApplicationId } from "./surfaceIcon";
+import { surfaceApplicationId } from "./surfaceApplicationId";
 
 /** A Wayland window's `.desktop` artwork, sharing the session-catalog cache. */
 export function SurfaceIcon(props: {
