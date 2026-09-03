@@ -256,11 +256,15 @@ describe("audio worklet learned floor", () => {
   /** Play cleanly for `seconds`, keeping the buffer fed the whole way. */
   const playCleanly = (seconds: number): void => {
     const blocks = Math.ceil((seconds * 48000) / RENDER_QUANTUM);
+    const inputs: unknown[] = [];
+    const outputs = [
+      [new Float32Array(RENDER_QUANTUM), new Float32Array(RENDER_QUANTUM)],
+    ];
     for (let b = 0; b < blocks; b++) {
       if (proc.depth() < proc.bufferTarget + SAMPLES_PER_20_MS) {
         send(proc, pcmFrame());
       }
-      render(proc, 1);
+      proc.process(inputs, outputs);
     }
   };
 
@@ -278,11 +282,12 @@ describe("audio worklet learned floor", () => {
     expect(proc.bufferTarget).toBeLessThanOrEqual(learned);
   });
 
+  // Simulates ten minutes at the real render quantum on shared CI CPUs.
   it("gives the latency back once the link has been quiet for minutes", () => {
     underrunOnce(proc);
     playCleanly(600);
     expect(proc.bufferTarget).toBe(MIN_BUFFER_SAMPLES);
-  });
+  }, 15_000);
 
   it("never pins a link at the target ceiling", () => {
     for (let i = 0; i < 12; i++) underrunOnce(proc);
