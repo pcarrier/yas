@@ -2527,12 +2527,10 @@ mod tests {
         // Path encoding is independent of filesystem support for these names
         // (APFS rejects non-UTF-8 filenames).
         let root = test_root(&directory);
-        let relative = relative_path(&root, &directory.0.join(&name)).unwrap();
+        let absolute = root.path.join(name);
+        let relative = relative_path(&root, &absolute).unwrap();
         assert_eq!(relative.components, vec![vec![b'x', 0xff]]);
-        assert_eq!(
-            joined_path(&root, &relative).unwrap(),
-            directory.0.join(name)
-        );
+        assert_eq!(joined_path(&root, &relative).unwrap(), absolute);
     }
 
     #[test]
