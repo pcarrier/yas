@@ -6,7 +6,8 @@ import solidPlugin from "vite-plugin-solid";
 // replacement between the first and second click. Keep browser resolution so
 // effects use Solid's client build rather than its no-op server build.
 export default defineConfig({
-  plugins: [solidPlugin()],
+  // Keep HMR's virtual /@solid-refresh module out of the Windows test runner.
+  plugins: [solidPlugin({ hot: false })],
   resolve: { conditions: ["browser", "development"] },
   test: {
     environment: "jsdom",

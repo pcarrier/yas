@@ -2,7 +2,9 @@ import { defineConfig } from "vitest/config";
 import solidPlugin from "vite-plugin-solid";
 
 export default defineConfig({
-  plugins: [solidPlugin()],
+  // Tests do not need HMR's virtual /@solid-refresh module, whose file URL
+  // has no drive letter on Windows.
+  plugins: [solidPlugin({ hot: false })],
   test: {
     environment: "jsdom",
     globals: true,
