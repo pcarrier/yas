@@ -40168,12 +40168,81 @@ mod tests {
         GoAway::decode(&frame.payload).unwrap()
     }
 
+    #[derive(Default)]
+    struct TerminalFrames {
+        ready: Vec<yas_terminal::TerminalFrame>,
+        partial: BTreeMap<(u32, u32), yas_terminal::FrameChunk>,
+    }
+
+    impl TerminalFrames {
+        fn accept(&mut self, frame: Frame) {
+            if frame.header
+                == (FrameHeader {
+                    sensitive: true,
+                    ..FrameHeader::event(family::TERMINAL, yas_terminal::event_kind::FRAME)
+                })
+            {
+                self.ready
+                    .push(yas_terminal::TerminalFrame::decode(&frame.payload).unwrap());
+                return;
+            }
+            assert_eq!(
+                frame.header,
+                FrameHeader {
+                    sensitive: true,
+                    ..FrameHeader::event(family::TERMINAL, yas_terminal::event_kind::FRAME_CHUNK)
+                }
+            );
+            let chunk = yas_terminal::FrameChunk::decode(&frame.payload).unwrap();
+            assert!(chunk.logical_frame_len <= SERVER_MAX_DECODED);
+            let key = (chunk.view_id, chunk.frame_sequence);
+            if chunk.chunk_index == 0 {
+                assert!(self.partial.insert(key, chunk).is_none());
+            } else {
+                let partial = self.partial.get_mut(&key).expect("first frame chunk");
+                assert_eq!(chunk.chunk_index, partial.chunk_index + 1);
+                assert_eq!(chunk.chunk_count, partial.chunk_count);
+                assert_eq!(chunk.logical_frame_len, partial.logical_frame_len);
+                partial.chunk_index = chunk.chunk_index;
+                partial.chunk.extend_from_slice(&chunk.chunk);
+            }
+            let partial = &self.partial[&key];
+            assert!(partial.chunk.len() <= partial.logical_frame_len as usize);
+            if partial.chunk_index + 1 == partial.chunk_count {
+                let complete = self.partial.remove(&key).unwrap();
+                assert_eq!(complete.chunk.len(), complete.logical_frame_len as usize);
+                self.ready.push(
+                    yas_terminal::TerminalFrame::decode_logical_body(
+                        complete.view_id,
+                        complete.frame_sequence,
+                        &complete.chunk,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+
+        fn is_empty(&self) -> bool {
+            self.ready.is_empty() && self.partial.is_empty()
+        }
+
+        fn discard_view(&mut self, view_id: u32) {
+            self.ready.retain(|frame| frame.view_id != view_id);
+            self.partial.retain(|(view, _), _| *view != view_id);
+        }
+
+        fn contains_view(&self, view_id: u32) -> bool {
+            self.ready.iter().any(|frame| frame.view_id == view_id)
+                || self.partial.keys().any(|(view, _)| *view == view_id)
+        }
+    }
+
     async fn next_terminal_result(
         client: &mut DuplexStream,
         codec: &FrameCodec,
         kind: u16,
         request_id: u32,
-        frames: &mut Vec<yas_terminal::TerminalFrame>,
+        frames: &mut TerminalFrames,
     ) -> ResultPrefix {
         loop {
             let frame = next_frame(client, codec).await;
@@ -40186,19 +40255,7 @@ mod tests {
             if frame.header == expected {
                 return ResultPrefix::decode(&frame.payload).unwrap();
             }
-            if frame.header
-                == (FrameHeader {
-                    sensitive: true,
-                    ..FrameHeader::event(family::TERMINAL, yas_wire::schema::terminal::event::FRAME)
-                })
-            {
-                frames.push(yas_terminal::TerminalFrame::decode(&frame.payload).unwrap());
-                continue;
-            }
-            panic!(
-                "unexpected native frame while awaiting Terminal Result: {:?}",
-                frame.header
-            );
+            frames.accept(frame);
         }
     }
 
@@ -40231,25 +40288,17 @@ mod tests {
         client: &mut DuplexStream,
         codec: &FrameCodec,
         view_id: u32,
-        frames: &mut Vec<yas_terminal::TerminalFrame>,
+        frames: &mut TerminalFrames,
     ) -> yas_terminal::TerminalFrame {
-        if let Some(index) = frames.iter().position(|frame| frame.view_id == view_id) {
-            return frames.remove(index);
-        }
         loop {
-            let frame = next_frame(client, codec).await;
-            assert_eq!(
-                frame.header,
-                FrameHeader {
-                    sensitive: true,
-                    ..FrameHeader::event(family::TERMINAL, yas_wire::schema::terminal::event::FRAME,)
-                }
-            );
-            let frame = yas_terminal::TerminalFrame::decode(&frame.payload).unwrap();
-            if frame.view_id == view_id {
-                return frame;
+            if let Some(index) = frames
+                .ready
+                .iter()
+                .position(|frame| frame.view_id == view_id)
+            {
+                return frames.ready.remove(index);
             }
-            frames.push(frame);
+            frames.accept(next_frame(client, codec).await);
         }
     }
 
@@ -40278,7 +40327,7 @@ mod tests {
         client: &mut DuplexStream,
         codec: &FrameCodec,
         mut frame: yas_terminal::TerminalFrame,
-        frames: &mut Vec<yas_terminal::TerminalFrame>,
+        frames: &mut TerminalFrames,
         title: &str,
     ) -> yas_terminal::TerminalFrame {
         timeout(TEST_TIMEOUT, async {
@@ -43473,6 +43522,16 @@ mod tests {
             Phase::SnapshotEnd
         );
 
+        // Other tests mutate the shared store outside this prefix. Those
+        // commits advance the global revision through empty STATE deltas.
+        let assert_unchanged = |events: &[StateEvent]| {
+            for event in events {
+                assert_eq!(event.subscription_id, watch.subscription_id);
+                assert_eq!(event.phase, Phase::Delta);
+                assert!(event.records.is_empty(), "{event:?}");
+            }
+        };
+
         let raw_key = vec![0xfe, b'k'];
         let inline = b"native-value".to_vec();
         write_request(
@@ -43511,7 +43570,7 @@ mod tests {
         assert_eq!(watched.inline_value.as_deref(), Some(inline.as_slice()));
 
         // Lost-Result retry returns the exact committed outcome without a
-        // second mutation or STATE delta. Reusing the operation ID with
+        // second mutation or record change. Reusing the operation ID with
         // different canonical arguments is a request-level conflict.
         write_request(
             &mut client,
@@ -43537,7 +43596,7 @@ mod tests {
             121,
         )
         .await;
-        assert!(state.is_empty());
+        assert_unchanged(&state);
         assert_eq!(yas_kv::MutationResult::decode(&replayed.body).unwrap(), put);
         write_request(
             &mut client,
@@ -43563,7 +43622,7 @@ mod tests {
             122,
         )
         .await;
-        assert!(state.is_empty());
+        assert_unchanged(&state);
         assert_eq!(operation_conflict.status, Status::Conflict);
         assert!(operation_conflict.body.is_empty());
 
@@ -43593,7 +43652,7 @@ mod tests {
             103,
         )
         .await;
-        assert!(state.is_empty());
+        assert_unchanged(&state);
         let conflict = yas_kv::MutationResult::decode(&conflict.body).unwrap();
         assert_eq!(conflict.status, Status::Conflict);
         assert_eq!(conflict.content_hash, put.content_hash);
@@ -43636,7 +43695,7 @@ mod tests {
             104,
         )
         .await;
-        assert!(state.is_empty());
+        assert_unchanged(&state);
         let batch = yas_kv::BatchResult::decode(&batch.body).unwrap();
         assert!(
             batch
@@ -43665,7 +43724,7 @@ mod tests {
             105,
         )
         .await;
-        assert!(state.is_empty());
+        assert_unchanged(&state);
         assert_eq!(missing.status, Status::NotFound);
 
         let large = (0..(yas_kv::MAX_INLINE_BYTES + 4096))
@@ -43781,7 +43840,7 @@ mod tests {
             108,
         )
         .await;
-        assert!(state.is_empty());
+        assert_unchanged(&state);
         let got = yas_kv::GetResult::decode(&got.body).unwrap();
         let Delivery::Transfer(transfer) = got.value.delivery else {
             panic!("large KV GET was not transferred");
@@ -43790,6 +43849,17 @@ mod tests {
         let mut received = Vec::new();
         loop {
             let frame = next_frame(&mut client, &codec).await;
+            if frame.header.family == family::KV {
+                assert_eq!(
+                    frame.header,
+                    FrameHeader {
+                        sensitive: true,
+                        ..FrameHeader::event(family::KV, yas_wire::schema::kv::event::STATE)
+                    }
+                );
+                assert_unchanged(&[StateEvent::decode(&frame.payload).unwrap()]);
+                continue;
+            }
             assert_eq!(frame.header.family, family::TRANSFER);
             match frame.header.kind {
                 yas_wire::schema::transfer::event::BYTE_DATA => {
@@ -44567,7 +44637,7 @@ mod tests {
             }
         }
 
-        let mut pending_frames = Vec::new();
+        let mut pending_frames = TerminalFrames::default();
         write_request(
             &mut target,
             &target_codec,
@@ -50340,7 +50410,7 @@ mod tests {
             },
         )
         .await;
-        let mut frames = Vec::new();
+        let mut frames = TerminalFrames::default();
         let created = next_terminal_result(
             &mut client,
             &codec,
@@ -50559,7 +50629,7 @@ mod tests {
             },
         )
         .await;
-        let mut frames = Vec::new();
+        let mut frames = TerminalFrames::default();
         let created = next_terminal_result(
             &mut client,
             &codec,
@@ -50701,7 +50771,7 @@ mod tests {
             },
         )
         .await;
-        let mut owner_frames = Vec::new();
+        let mut owner_frames = TerminalFrames::default();
         let created = next_terminal_result(
             &mut owner,
             &owner_codec,
@@ -50734,7 +50804,7 @@ mod tests {
             },
         )
         .await;
-        let mut observer_frames = Vec::new();
+        let mut observer_frames = TerminalFrames::default();
         let watched = next_terminal_result(
             &mut observer,
             &observer_codec,
@@ -50940,7 +51010,7 @@ mod tests {
         });
         let (mut owner, owner_codec, _, owner_task) =
             start_registered_session(state.clone(), &[family::TERMINAL]).await;
-        let mut owner_frames = Vec::new();
+        let mut owner_frames = TerminalFrames::default();
         write_request(
             &mut owner,
             &owner_codec,
@@ -50985,7 +51055,7 @@ mod tests {
                 Arc::clone(&drop_probe),
             )
             .await;
-        let mut observer_frames = Vec::new();
+        let mut observer_frames = TerminalFrames::default();
         write_request(
             &mut observer,
             &observer_codec,
@@ -51269,7 +51339,7 @@ mod tests {
             Arc::clone(&gate),
         )
         .await;
-        let mut pending_frames = Vec::new();
+        let mut pending_frames = TerminalFrames::default();
 
         write_request(
             &mut client,
@@ -51409,7 +51479,7 @@ mod tests {
 
         let (mut owner, owner_codec, _, owner_task) =
             start_registered_session(state.clone(), &[family::TERMINAL]).await;
-        let mut owner_frames = Vec::new();
+        let mut owner_frames = TerminalFrames::default();
         write_request(
             &mut owner,
             &owner_codec,
@@ -51467,7 +51537,7 @@ mod tests {
             },
         )
         .await;
-        let mut observer_frames = Vec::new();
+        let mut observer_frames = TerminalFrames::default();
         let watched = next_terminal_result(
             &mut observer,
             &observer_codec,
@@ -51669,7 +51739,7 @@ mod tests {
             environment: Vec::new(),
             extensions: Extensions::default(),
         };
-        let mut pending_frames = Vec::new();
+        let mut pending_frames = TerminalFrames::default();
         let initial_view_request = yas_terminal::InitialViewRequest {
             rows: 24,
             cols: 80,
@@ -52136,7 +52206,7 @@ mod tests {
             launch,
             extensions: Extensions::default(),
         };
-        let mut pending_frames = Vec::new();
+        let mut pending_frames = TerminalFrames::default();
 
         let mut created = None;
         // The same operation twice while the terminal lives: one create, one
@@ -52265,7 +52335,7 @@ mod tests {
         });
         let (mut client, codec, _, task) =
             start_registered_session(state, &[family::TERMINAL]).await;
-        let mut pending_frames = Vec::new();
+        let mut pending_frames = TerminalFrames::default();
 
         write_request(
             &mut client,
@@ -52566,7 +52636,7 @@ mod tests {
         });
         let (mut client, codec, _, task) =
             start_registered_session(state.clone(), &[family::TERMINAL]).await;
-        let mut pending_frames = Vec::new();
+        let mut pending_frames = TerminalFrames::default();
 
         write_request(
             &mut client,
@@ -52805,7 +52875,7 @@ mod tests {
             },
         )
         .await;
-        let mut pending_frames = Vec::new();
+        let mut pending_frames = TerminalFrames::default();
         let created = next_terminal_result(
             &mut client,
             &codec,
@@ -53022,6 +53092,31 @@ mod tests {
         )
         .await;
         assert_eq!(grown.status, Status::Ok);
+        let grown_frame = timeout(TEST_TIMEOUT, async {
+            loop {
+                let frame = next_terminal_frame_for(
+                    &mut client,
+                    &codec,
+                    first.view_id,
+                    &mut pending_frames,
+                )
+                .await;
+                let dimensions = frame
+                    .decode_grid_codec1(SERVER_MAX_DECODED, None)
+                    .unwrap()
+                    .dimensions;
+                acknowledge_terminal_frame(&mut client, &codec, &frame).await;
+                if dimensions == Some((100, 200)) {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("grown view produced its fragmented frame");
+        assert!(
+            grown_frame.encode_logical_body().unwrap().len()
+                > yas_wire::frame::HARD_MAX_BULK_CHUNK as usize
+        );
 
         // The view declared a frame bound sized for 12x40 and its peer holds
         // exactly that reservation. A geometry that would outgrow the bound is
@@ -53081,7 +53176,7 @@ mod tests {
         // Frames already queued before CLOSE may have been collected while
         // reading the correlated Result.  Only a frame emitted after that
         // Result would violate the closed-view lifetime.
-        pending_frames.retain(|frame| frame.view_id != first.view_id);
+        pending_frames.discard_view(first.view_id);
 
         write_event(
             &mut client,
@@ -53097,11 +53192,7 @@ mod tests {
         let remaining =
             next_terminal_frame_for(&mut client, &codec, second.view_id, &mut pending_frames).await;
         assert_eq!(remaining.view_id, second.view_id);
-        assert!(
-            !pending_frames
-                .iter()
-                .any(|frame| frame.view_id == first.view_id)
-        );
+        assert!(!pending_frames.contains_view(first.view_id));
         acknowledge_terminal_frame(&mut client, &codec, &remaining).await;
 
         // `cat` is the terminal's foreground process after the shell's exec.
