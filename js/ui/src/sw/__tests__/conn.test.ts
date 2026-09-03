@@ -87,15 +87,15 @@ describe("native preview Net broker", () => {
     await stream.opened;
     const first = stream.write(new Uint8Array([1, 2]));
     const second = stream.write(new Uint8Array([3]));
-    await tick();
-    expect(writes).toEqual([{ id: 1, bytes: [1, 2] }]);
+    await vi.waitFor(() => expect(writes).toEqual([{ id: 1, bytes: [1, 2] }]));
     app.postMessage({ type: PREVIEW_NET_WRITE_OK, id: 1 });
     await first;
-    await tick();
-    expect(writes).toEqual([
-      { id: 1, bytes: [1, 2] },
-      { id: 2, bytes: [3] },
-    ]);
+    await vi.waitFor(() =>
+      expect(writes).toEqual([
+        { id: 1, bytes: [1, 2] },
+        { id: 2, bytes: [3] },
+      ]),
+    );
     app.postMessage({ type: PREVIEW_NET_WRITE_OK, id: 2 });
     await second;
   });
@@ -142,8 +142,9 @@ describe("native preview Net broker", () => {
     await stream.opened;
     stream.shutdownWrite();
     stream.close();
-    await tick();
-    expect(messages).toEqual([PREVIEW_NET_SHUTDOWN_WRITE, PREVIEW_NET_CLOSE]);
+    await vi.waitFor(() =>
+      expect(messages).toEqual([PREVIEW_NET_SHUTDOWN_WRITE, PREVIEW_NET_CLOSE]),
+    );
     expect(vi.isMockFunction(globalThis.WebSocket)).toBe(false);
   });
 
@@ -160,7 +161,3 @@ describe("native preview Net broker", () => {
     await expect(stream.opened).rejects.toThrow("connection refused");
   });
 });
-
-async function tick(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}

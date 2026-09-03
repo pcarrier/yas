@@ -144,8 +144,7 @@ describe("relayed WebSocket liveness", () => {
     const ws = new shim.WS("ws://gateway.example/hmr");
     // Constructing must not dispatch: the app has not subscribed yet.
     const events = watch(ws);
-    await new Promise((r) => setTimeout(r, 0));
-    expect(events).toEqual(["error", "close"]);
+    await vi.waitFor(() => expect(events).toEqual(["error", "close"]));
   });
 
   it("reports a close when the pipe goes quiet while open", async () => {
@@ -153,10 +152,8 @@ describe("relayed WebSocket liveness", () => {
     const shim = loadShim();
     const ws = new shim.WS("ws://gateway.example/hmr");
     const events = watch(ws);
-    await vi.advanceTimersByTimeAsync(0);
     shim.relay!.postMessage(handshake());
-    await vi.advanceTimersByTimeAsync(0);
-    expect(ws.readyState).toBe(1);
+    await vi.waitFor(() => expect(ws.readyState).toBe(1));
     await vi.advanceTimersByTimeAsync(40_000);
     expect(events).toContain("close");
   });
@@ -165,10 +162,8 @@ describe("relayed WebSocket liveness", () => {
     const shim = loadShim();
     const ws = new shim.WS("ws://gateway.example/hmr");
     const events = watch(ws);
-    await new Promise((r) => setTimeout(r, 0));
     shim.relay!.postMessage({ yasClosed: true });
-    await new Promise((r) => setTimeout(r, 0));
-    expect(events).toContain("close");
+    await vi.waitFor(() => expect(events).toContain("close"));
   });
 
   it("reports a close when the app closes and no reply comes", async () => {
@@ -176,9 +171,8 @@ describe("relayed WebSocket liveness", () => {
     const shim = loadShim();
     const ws = new shim.WS("ws://gateway.example/hmr");
     const events = watch(ws);
-    await vi.advanceTimersByTimeAsync(0);
     shim.relay!.postMessage(handshake());
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(ws.readyState).toBe(1));
 
     ws.close();
     expect(ws.readyState).toBe(2);
@@ -193,8 +187,6 @@ describe("relayed WebSocket liveness", () => {
     const shim = loadShim();
     const ws = new shim.WS("ws://gateway.example/hmr");
     const events = watch(ws);
-    await vi.advanceTimersByTimeAsync(0);
-
     ws.close();
     await vi.advanceTimersByTimeAsync(30_000);
     expect(events).toContain("close");
@@ -210,7 +202,9 @@ describe("relayed WebSocket liveness", () => {
     shim.relay!.onmessage = (event) => relayMessages.push(event.data);
     await vi.advanceTimersByTimeAsync(20_000);
     expect(events).toContain("close");
-    expect(relayMessages.some(relayCloseRequest)).toBe(true);
+    await vi.waitFor(() =>
+      expect(relayMessages.some(relayCloseRequest)).toBe(true),
+    );
   });
 
   it("bounds an unterminated handshake header", async () => {
@@ -222,11 +216,10 @@ describe("relayed WebSocket liveness", () => {
     shim.relay!.postMessage(
       new Uint8Array(PREVIEW_WS_MAX_HANDSHAKE_BYTES).fill(0x41).buffer,
     );
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(events).toEqual(["error", "close"]);
-    expect(relayMessages.some(relayCloseRequest)).toBe(true);
+    await vi.waitFor(() => {
+      expect(events).toEqual(["error", "close"]);
+      expect(relayMessages.some(relayCloseRequest)).toBe(true);
+    });
   });
 
   it("rejects oversized and unsafe u64 frame lengths from their headers", async () => {
@@ -237,16 +230,13 @@ describe("relayed WebSocket liveness", () => {
       const shim = loadShim();
       const ws = new shim.WS("ws://gateway.example/hmr");
       const events = watch(ws);
-      await new Promise((resolve) => setTimeout(resolve, 0));
       shim.relay!.postMessage(handshake());
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(ws.readyState).toBe(1);
+      await vi.waitFor(() => expect(ws.readyState).toBe(1));
 
       // No payload follows: the declared u64 must be rejected before it is
       // converted to Number or used to grow the receive buffer.
       shim.relay!.postMessage(wideServerFrameHeader(0x2, length));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(events).toContain("close");
+      await vi.waitFor(() => expect(events).toContain("close"));
     }
   });
 
@@ -254,17 +244,14 @@ describe("relayed WebSocket liveness", () => {
     const shim = loadShim();
     const ws = new shim.WS("ws://gateway.example/hmr");
     const events = watch(ws);
-    await new Promise((resolve) => setTimeout(resolve, 0));
     shim.relay!.postMessage(handshake());
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(ws.readyState).toBe(1));
 
     shim.relay!.postMessage(serverFrame(0x1, encoder.encode("a"), false));
-    await new Promise((resolve) => setTimeout(resolve, 0));
     shim.relay!.postMessage(
       wideServerFrameHeader(0x0, BigInt(PREVIEW_WS_MAX_MESSAGE_BYTES)),
     );
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(events).toContain("close");
+    await vi.waitFor(() => expect(events).toContain("close"));
   });
 
   it("bounds zero-length fragmentation while preserving valid fragments", async () => {
@@ -272,29 +259,25 @@ describe("relayed WebSocket liveness", () => {
     const validWs = new valid.WS("ws://gateway.example/hmr");
     const messages: string[] = [];
     validWs.onmessage = (event) => messages.push(event.data as string);
-    await new Promise((resolve) => setTimeout(resolve, 0));
     valid.relay!.postMessage(handshake());
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(validWs.readyState).toBe(1));
     valid.relay!.postMessage(serverFrame(0x1, encoder.encode("hel"), false));
     valid.relay!.postMessage(serverFrame(0x0, encoder.encode("lo")));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(messages).toEqual(["hello"]);
+    await vi.waitFor(() => expect(messages).toEqual(["hello"]));
     valid.relay!.postMessage(serverFrame(0x8, new Uint8Array([0x03, 0xe8])));
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(validWs.readyState).toBe(3));
     valid.relay!.postMessage({ yasCloseAck: true });
 
     const bounded = loadShim();
     const boundedWs = new bounded.WS("ws://gateway.example/hmr");
     const events = watch(boundedWs);
-    await new Promise((resolve) => setTimeout(resolve, 0));
     bounded.relay!.postMessage(handshake());
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(boundedWs.readyState).toBe(1));
     const frames = new Uint8Array((PREVIEW_WS_MAX_FRAGMENTS + 1) * 2);
     frames[0] = 0x1;
     for (let i = 0; i <= PREVIEW_WS_MAX_FRAGMENTS; i++) frames[i * 2 + 1] = 0;
     bounded.relay!.postMessage(frames.buffer);
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(events).toContain("close");
+    await vi.waitFor(() => expect(events).toContain("close"));
   });
 
   // A leaked interval keeps a frame's timers alive for every socket an app has
@@ -304,13 +287,11 @@ describe("relayed WebSocket liveness", () => {
     const shim = loadShim();
     const ws = new shim.WS("ws://gateway.example/hmr");
     const events = watch(ws);
-    await vi.advanceTimersByTimeAsync(0);
     shim.relay!.postMessage(handshake());
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(ws.readyState).toBe(1));
 
     shim.relay!.postMessage(serverFrame(0x8, new Uint8Array([0x03, 0xe8])));
-    await vi.advanceTimersByTimeAsync(0);
-    expect(ws.readyState).toBe(3);
+    await vi.waitFor(() => expect(ws.readyState).toBe(3));
     expect(events).toContain("close");
     await vi.advanceTimersByTimeAsync(60_000);
     expect(vi.getTimerCount()).toBe(0);
@@ -319,11 +300,11 @@ describe("relayed WebSocket liveness", () => {
   it("leaves no timer running once the socket dies", async () => {
     fake();
     const shim = loadShim();
-    new shim.WS("ws://gateway.example/hmr");
-    await vi.advanceTimersByTimeAsync(0);
+    const ws = new shim.WS("ws://gateway.example/hmr");
     shim.relay!.postMessage(handshake());
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(ws.readyState).toBe(1));
     shim.relay!.postMessage({ yasClosed: true });
+    await vi.waitFor(() => expect(ws.readyState).toBe(3));
     await vi.advanceTimersByTimeAsync(60_000);
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -335,8 +316,6 @@ describe("relayed WebSocket liveness", () => {
     const seen: string[] = [];
     ws.binaryType = "arraybuffer";
     ws.onmessage = (e) => seen.push(e.data as string);
-    await vi.advanceTimersByTimeAsync(0);
-
     // Read from the start, so the shim's queued upgrade request is consumed
     // here rather than landing in the assertion below.
     const written: Uint8Array[] = [];
@@ -345,8 +324,7 @@ describe("relayed WebSocket liveness", () => {
       if (bytes) written.push(bytes);
     };
     shim.relay!.postMessage(handshake());
-    await vi.advanceTimersByTimeAsync(0);
-    expect(written).toHaveLength(1);
+    await vi.waitFor(() => expect(written).toHaveLength(1));
     expect(new TextDecoder().decode(written[0])).toContain(
       "Upgrade: websocket",
     );
@@ -354,11 +332,11 @@ describe("relayed WebSocket liveness", () => {
 
     shim.relay!.postMessage(serverFrame(0x1, encoder.encode("hello")));
     shim.relay!.postMessage(serverFrame(0x9));
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(seen).toEqual(["hello"]);
     // One pong, masked, with an empty payload.
-    expect(written).toHaveLength(1);
+    await vi.waitFor(() => {
+      expect(seen).toEqual(["hello"]);
+      expect(written).toHaveLength(1);
+    });
     expect(written[0][0]).toBe(0x8a);
     expect(ws.readyState).toBe(1);
   });
