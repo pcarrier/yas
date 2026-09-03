@@ -40,18 +40,20 @@ jobs:
           pnpm --filter @yas-run/solid run build
           pnpm --filter @yas-run/ui run build
           pnpm --filter yas-web run build
-      - name: Build release binaries
-        run: cargo build --release -p yas-cli
       - name: Test the complete cross-platform Yas product graph
         shell: bash
         run: |
           # Linux-only compositor probes are Cargo examples. Exercise every
           # workspace library, product binary, and integration/unit test here
           # without asking Windows to compile those live Wayland probes.
-          cargo test --workspace --lib --bins --tests --no-fail-fast
+          test_status=0
+          cargo test --workspace --lib --bins --tests --no-fail-fast || test_status=$?
           cd js
-          pnpm run typecheck
-          pnpm run test
+          pnpm run typecheck || test_status=$?
+          pnpm run test || test_status=$?
+          exit "$test_status"
+      - name: Build release binaries
+        run: cargo build --release -p yas-cli
       - name: Package zips
         if: ${{ inputs.upload }}
         shell: bash

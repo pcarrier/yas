@@ -7,3 +7,6 @@ pub use ipc_unix::*;
 mod ipc_windows;
 #[cfg(windows)]
 pub use ipc_windows::*;
+
+#[cfg(any(windows, test))]
+pub(crate) mod replacement;

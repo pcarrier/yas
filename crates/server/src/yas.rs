@@ -41810,6 +41810,50 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    async fn ipc_replacement_request_shuts_down_a_native_session() {
+        let state = super::super::tests::process_transport::test_state(
+            super::super::process::Server::new(false, true),
+        );
+        let (mut client, server) = tokio::io::duplex(2 * 1024 * 1024);
+        let cancellation = ConnectionCancellation::default();
+        let registration = state.connections.register(cancellation.clone()).unwrap();
+        let task = tokio::spawn(serve_stream(
+            server,
+            state.clone(),
+            cancellation,
+            registration,
+            None,
+            ConnectionOrigin::Network,
+        ));
+
+        crate::ipc::replacement::request_shutdown(&mut client)
+            .await
+            .expect("replacement HELLO and SHUTDOWN encode and reach the server");
+        let hello = next_result(
+            &mut client,
+            &FrameCodec::pre_hello(),
+            family::CORE,
+            yas_wire::core::request_kind::HELLO,
+            1,
+        )
+        .await;
+        assert_eq!(hello.status, Status::Ok);
+        let codec = FrameCodec::new(FrameLimits::recommended(), []).unwrap();
+        let result = next_sensitive_result(
+            &mut client,
+            &codec,
+            family::CORE,
+            yas_wire::core::request_kind::SHUTDOWN,
+            2,
+        )
+        .await;
+        assert_eq!(result.status, Status::Ok);
+        timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
+        assert!(state.yas_shutdown.is_scheduled());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn core_shutdown_orders_result_broadcast_and_boot_replay() {
         let state = super::super::tests::process_transport::test_state(
             super::super::process::Server::new(false, true),

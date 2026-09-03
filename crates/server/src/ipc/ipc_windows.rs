@@ -1,10 +1,8 @@
 use std::io;
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use super::replacement::request_shutdown;
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
-use yas_wire::core::{ClientHello, ReceiveLimits, Shutdown};
-use yas_wire::{Encode, Extensions, Frame, FrameCodec, FrameHeader, family};
 
 pub type IpcStream = NamedPipeServer;
 
@@ -89,17 +87,22 @@ async fn bind_replacing_existing(pipe_name: &str) -> io::Result<NamedPipeServer>
         }
 
         if !shutdown_requested && let Ok(mut previous) = ClientOptions::new().open(pipe_name) {
-            if request_shutdown(&mut previous).await.is_ok() {
-                eprintln!("yas-server: requesting previous server shutdown");
-                shutdown_requested = true;
-                // Closing the client can discard unread pipe data. Keep it
-                // open while the server consumes SHUTDOWN and drain replies
-                // until the server closes its end, with a bounded wait.
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(3),
-                    tokio::io::copy(&mut previous, &mut tokio::io::sink()),
-                )
-                .await;
+            match request_shutdown(&mut previous).await {
+                Ok(()) => {
+                    eprintln!("yas-server: requesting previous server shutdown");
+                    shutdown_requested = true;
+                    // Closing the client can discard unread pipe data. Keep it
+                    // open while the server consumes SHUTDOWN and drain replies
+                    // until the server closes its end, with a bounded wait.
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        tokio::io::copy(&mut previous, &mut tokio::io::sink()),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    eprintln!("yas-server: cannot request previous server shutdown: {error}");
+                }
             }
         }
 
@@ -109,54 +112,10 @@ async fn bind_replacing_existing(pipe_name: &str) -> io::Result<NamedPipeServer>
     unreachable!("replacement loop always returns on its final attempt")
 }
 
-async fn request_shutdown(
-    previous: &mut tokio::net::windows::named_pipe::NamedPipeClient,
-) -> io::Result<()> {
-    let mut client_instance = [0; 16];
-    getrandom::fill(&mut client_instance).map_err(io::Error::other)?;
-    if client_instance == [0; 16] {
-        client_instance[15] = 1;
-    }
-    let hello = ClientHello {
-        min_minor: 1,
-        max_minor: 1,
-        receive: ReceiveLimits::recommended(0),
-        client_instance,
-        client_name: "yas-server-replacement".to_owned(),
-        client_release: env!("CARGO_PKG_VERSION").to_owned(),
-        families: Vec::new(),
-        codecs: Vec::new(),
-        extensions: Extensions::default(),
-    };
-    let codec = FrameCodec::pre_hello();
-    let hello = codec
-        .encode_stream(&Frame {
-            header: FrameHeader::request(family::CORE, yas_wire::core::request_kind::HELLO, 1),
-            payload: hello.encode().map_err(io::Error::other)?,
-        })
-        .map_err(io::Error::other)?;
-    let shutdown = Shutdown {
-        operation_id: client_instance,
-        grace_ns: 0,
-        reason: "server replacement".to_owned(),
-    };
-    let shutdown = codec
-        .encode_stream(&Frame {
-            header: FrameHeader {
-                sensitive: true,
-                ..FrameHeader::request(family::CORE, yas_wire::core::request_kind::SHUTDOWN, 2)
-            },
-            payload: shutdown.encode().map_err(io::Error::other)?,
-        })
-        .map_err(io::Error::other)?;
-    previous.write_all(&yas_wire::PREFACE).await?;
-    previous.write_all(&hello).await?;
-    previous.write_all(&shutdown).await
-}
-
 #[cfg(test)]
 mod tests {
     use tokio::io::AsyncReadExt;
+    use yas_wire::{Frame, FrameCodec, FrameHeader, FrameLimits, family};
 
     use super::*;
 
@@ -190,6 +149,7 @@ mod tests {
                 hello.header,
                 FrameHeader::request(family::CORE, yas_wire::core::request_kind::HELLO, 1)
             );
+            let codec = FrameCodec::new(FrameLimits::recommended(), []).unwrap();
             let shutdown = read_frame(&mut previous, &codec).await;
             assert_eq!(
                 shutdown.header,
