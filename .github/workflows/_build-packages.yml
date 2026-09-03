@@ -48,7 +48,7 @@ jobs:
             pnpm --filter @yas-run/ui run build &&
             pnpm --filter yas-web run build
           '
-          nix develop --command cargo test --workspace --lib --bins --tests
+          nix develop --command cargo test --workspace --lib --bins --tests --no-fail-fast
           nix develop --command bash -lc \
             'cd js && pnpm install --frozen-lockfile && pnpm run typecheck && pnpm run test'
       - uses: actions/upload-artifact@v7

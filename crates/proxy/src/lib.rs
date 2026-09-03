@@ -1950,7 +1950,10 @@ mod tests {
     fn proxy_socket_path_default() {
         let p = automatic_proxy_socket_path();
         assert!(!p.is_empty());
+        #[cfg(unix)]
         assert!(p.ends_with("yas-proxy.sock"));
+        #[cfg(windows)]
+        assert_eq!(p, r"\\.\pipe\yas-proxy");
     }
 
     #[cfg(unix)]
