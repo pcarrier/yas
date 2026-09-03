@@ -92,6 +92,14 @@ async fn bind_replacing_existing(pipe_name: &str) -> io::Result<NamedPipeServer>
             if request_shutdown(&mut previous).await.is_ok() {
                 eprintln!("yas-server: requesting previous server shutdown");
                 shutdown_requested = true;
+                // Closing the client can discard unread pipe data. Keep it
+                // open while the server consumes SHUTDOWN and drain replies
+                // until the server closes its end, with a bounded wait.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    tokio::io::copy(&mut previous, &mut tokio::io::sink()),
+                )
+                .await;
             }
         }
 
@@ -152,6 +160,14 @@ mod tests {
 
     use super::*;
 
+    async fn read_frame(pipe: &mut NamedPipeServer, codec: &FrameCodec) -> Frame {
+        let length = pipe.read_u32_le().await.unwrap();
+        assert!(length <= codec.limits().max_wire_frame);
+        let mut bytes = vec![0; length as usize];
+        pipe.read_exact(&mut bytes).await.unwrap();
+        codec.decode(&bytes).unwrap()
+    }
+
     #[tokio::test]
     async fn bind_replaces_an_existing_server() {
         let pipe_name = format!(r"\\.\pipe\yas-test-replace-{}", std::process::id());
@@ -162,19 +178,26 @@ mod tests {
 
         let previous_task = tokio::spawn(async move {
             previous.connect().await.unwrap();
+            // The replacement must retain its client even when the previous
+            // server does not consume the queued request immediately.
+            tokio::time::sleep(Duration::from_millis(25)).await;
             let mut preface = [0; yas_wire::PREFACE.len()];
             previous.read_exact(&mut preface).await.unwrap();
             assert_eq!(preface, yas_wire::PREFACE);
-            let mut bytes = vec![0; 4096];
-            let read = previous.read(&mut bytes).await.unwrap();
             let codec = FrameCodec::pre_hello();
-            let (hello, consumed) = codec.decode_stream(&bytes[..read]).unwrap();
+            let hello = read_frame(&mut previous, &codec).await;
             assert_eq!(
                 hello.header,
                 FrameHeader::request(family::CORE, yas_wire::core::request_kind::HELLO, 1)
             );
-            let (shutdown, _) = codec.decode_stream(&bytes[consumed..read]).unwrap();
-            assert_eq!(shutdown.header.kind, yas_wire::core::request_kind::SHUTDOWN);
+            let shutdown = read_frame(&mut previous, &codec).await;
+            assert_eq!(
+                shutdown.header,
+                FrameHeader {
+                    sensitive: true,
+                    ..FrameHeader::request(family::CORE, yas_wire::core::request_kind::SHUTDOWN, 2)
+                }
+            );
         });
 
         let replacement = bind_replacing_existing(&pipe_name).await.unwrap();

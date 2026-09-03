@@ -582,7 +582,8 @@ mod tests {
     #[test]
     fn socket_template_matches_sticky_tmpdir_layout() {
         let root = tempfile::tempdir().unwrap();
-        let tmp = PathBuf::from("/tmp");
+        // macOS exposes /tmp as a symlink to the root-owned sticky directory.
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
         let metadata = std::fs::symlink_metadata(&tmp).unwrap();
         assert_eq!(
             metadata.uid(),

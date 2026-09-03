@@ -2251,11 +2251,12 @@ mod tests {
         let path = fs_wire::Path {
             components: vec![b"src".to_vec(), b"main.rs".to_vec()],
         };
-        let root = PathBuf::from("/workspace");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("workspace");
         let resolved = resolve_relative(&root, &path).unwrap();
-        assert_eq!(resolved, PathBuf::from("/workspace/src/main.rs"));
+        assert_eq!(resolved, root.join("src").join("main.rs"));
         assert_eq!(relative_wire_path(&root, &resolved).unwrap(), path);
-        assert!(relative_wire_path(&root, Path::new("/outside/main.rs")).is_err());
+        assert!(relative_wire_path(&root, &directory.path().join("outside/main.rs")).is_err());
 
         let mut root = root;
         append_path(
@@ -2265,7 +2266,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(root, PathBuf::from("/workspace"));
+        assert_eq!(root, directory.path().join("workspace"));
     }
 
     #[cfg(unix)]

@@ -132,7 +132,7 @@ impl ObjectRead {
     }
 
     pub fn sync(&self) -> Result<(), ObjectStoreError> {
-        File::open(&self.path)?.sync_all()?;
+        sync_file(&self.path)?;
         #[cfg(unix)]
         if let Some(parent) = self.path.parent() {
             File::open(parent)?.sync_all()?;
@@ -1610,6 +1610,15 @@ fn decode_lru_metadata(
     Some((clock, recency))
 }
 
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    // Windows FlushFileBuffers requires a handle with GENERIC_WRITE access.
+    OpenOptions::new()
+        .read(true)
+        .write(cfg!(windows))
+        .open(path)?
+        .sync_all()
+}
+
 fn write_lru_metadata_atomic(root: &Path, bytes: &[u8]) -> Result<(), ObjectStoreError> {
     let path = root.join(LRU_METADATA_FILE);
     let temporary = root.join(LRU_METADATA_TEMP);
@@ -1641,7 +1650,7 @@ fn write_lru_metadata_atomic(root: &Path, bytes: &[u8]) -> Result<(), ObjectStor
             fs::rename(&temporary, &path)?;
         }
         set_owner_file(&path)?;
-        File::open(&path)?.sync_all()?;
+        sync_file(&path)?;
         #[cfg(unix)]
         File::open(root)?.sync_all()?;
         Ok(())
@@ -1932,6 +1941,7 @@ mod tests {
         let bytes = b"\0asm extension";
         let hash = put(&mut store, 7, bytes);
         assert_eq!(store.read(&hash).unwrap(), bytes);
+        store.sync_object(&hash).unwrap();
         assert_eq!(
             store
                 .begin_upload(9, hash, bytes.len() as u64, Instant::now())
