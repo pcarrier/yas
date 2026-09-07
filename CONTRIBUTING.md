@@ -151,18 +151,21 @@ selected server instance's muster configuration directory. The source derives
 an instance for the main checkout and every linked worktree containing
 `.yas/muster`. Pass `--force` to replace an older installer-owned entry and
 `--on TARGET` when yas's effective target is not that server. The installer
-checks the running extension before writing. Each unit points direnv at its own
-`${STACK_DIR}`; direnv finds that checkout's `.envrc`, enters its environment,
-and resolves its `bin/dev-*` entrypoint without deriving the worktree root from
-the stack's path. Muster supervises these units in each instance:
+checks the running extension before writing. A oneshot first authorizes each
+worktree's distinct `.envrc`. Each command then points direnv at its own
+`${STACK_DIR}`; direnv enters that checkout's environment and resolves its
+`bin/dev-*` entrypoint without deriving the worktree root from the stack's
+path. Muster supervises these units in each instance:
 
-| Unit         | What it does                                                                     | Default port / socket                 |
-| ------------ | -------------------------------------------------------------------------------- | ------------------------------------- |
-| `js`         | Builds browser WASM, installs JS deps, then watches `crates/browser/src`         | n/a                                   |
-| `server`     | Builds `yas-cli` and runs the profiling `yas server`, serving the browser itself | `local:<instance>`, `127.0.0.1:10001` |
-| `ui`         | Vite dev server for `js/ui/`                                                     | `127.0.0.1:10000`                     |
-| `website`    | Vite dev server for `js/web/`                                                    | `127.0.0.1:10002`                     |
-| `extensions` | Builds `extensions/dist`, then serves it as a CORS extension registry            | `127.0.0.1:10003`                     |
+| Unit         | What it does                                                             | Default port / socket                 |
+| ------------ | ------------------------------------------------------------------------ | ------------------------------------- |
+| `direnv`     | Authorizes the worktree's `.envrc` before other units start              | n/a                                   |
+| `build`      | Builds the profiling `yas-cli` replacement                               | n/a                                   |
+| `js`         | Builds browser WASM, installs JS deps, then watches `crates/browser/src` | n/a                                   |
+| `server`     | Runs the profiling `yas server`, serving the browser itself              | `local:<instance>`, `127.0.0.1:10001` |
+| `ui`         | Vite dev server for `js/ui/`                                             | `127.0.0.1:10000`                     |
+| `website`    | Vite dev server for `js/web/`                                            | `127.0.0.1:10002`                     |
+| `extensions` | Builds `extensions/dist`, then serves it as a CORS extension registry    | `127.0.0.1:10003`                     |
 
 Inspect and control the stack through muster:
 

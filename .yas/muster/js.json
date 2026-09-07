@@ -13,6 +13,7 @@
     "is gone; the rebuilt WASM and the installed deps are both idempotent."
   ],
   "description": "YAS browser WASM watch and JS dependencies (${INSTANCE})",
+  "requires": ["direnv"],
   "command": ["direnv", "exec", "${STACK_DIR}", "dev-js"],
   "readyWhen": { "log": "js ready" },
   "timeoutStart": "10m",

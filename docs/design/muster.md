@@ -409,6 +409,18 @@ The checked-in `.yas/muster` directory is the development stack installed by
 `bin/install-in-muster`. Its graph, probes, and restart policies live beside
 the code they supervise.
 
+`yas/direnv.json` authorizes each worktree's distinct `.envrc` before any unit
+tries `direnv exec`. This is a oneshot dependency of the three roots of the
+stack graph; its successful result gates all other units:
+
+```json
+{
+  "description": "Authorize the YAS direnv environment (${INSTANCE})",
+  "command": ["direnv", "allow", "${STACK_DIR}/../../.envrc"],
+  "type": "oneshot"
+}
+```
+
 `yas/server.json` — the Muster instance name is also the local server name,
 and the same process serves the browser. The name is the whole socket
 configuration: `bin/dev-server` clears the supervising server's exported
@@ -472,14 +484,15 @@ deployed one does, so the template went away rather than duplicating a
 deployment shape the modules no longer use. `yas edge` is still a command, for
 the fixed-home edge in front of a server that does not host its own.
 
-Six templates in all. Every command points direnv at `${STACK_DIR}`. Direnv
-finds the checkout's ancestor `.envrc`, changes to that checkout, and exposes
-its `bin/` on `PATH`; neither Muster nor the templates infer a worktree root
+Seven templates in all. The `direnv` oneshot explicitly authorizes the
+checkout's `.envrc`; every subsequent command points direnv at `${STACK_DIR}`.
+Direnv finds that ancestor `.envrc`, changes to its checkout, and exposes its
+`bin/` on `PATH`; neither Muster nor the command templates infer a worktree root
 from the stack's depth or from the main checkout. The JSON retains only graph,
 variables, probes, and restart policy. The build is deliberately a separate
 oneshot because its staged replacement semantics prevent compilation time or a
 failed build from becoming server downtime. With `server` above, an installed
-checkout runs all six units.
+checkout runs all seven units.
 
 A repository is registered with one command after muster is running:
 

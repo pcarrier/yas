@@ -1,0 +1,11 @@
+{
+  "//": [
+    "Each Git worktree has a distinct .envrc path, so direnv requires an",
+    "explicit authorization before direnv exec can enter a new worktree.",
+    "The installed Muster worktree source already grants this repository's",
+    "stack permission to execute code from every discovered worktree."
+  ],
+  "description": "Authorize the YAS direnv environment (${INSTANCE})",
+  "command": ["direnv", "allow", "${STACK_DIR}/../../.envrc"],
+  "type": "oneshot"
+}
