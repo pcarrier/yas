@@ -16,11 +16,17 @@ export interface PrunedLayout {
 export function pruneUnassignedPanes(
   root: LayoutNode,
   assignments: Readonly<Record<string, string | null>>,
+  retainedEmptyLeaves: ReadonlySet<LayoutLeaf> = new Set(),
 ): PrunedLayout | null {
   const oldPanes = enumeratePanes(root);
   const retained = new Set<LayoutLeaf>(
     oldPanes
-      .filter(({ id, leaf }) => assignments[id] != null || !!leaf.command)
+      .filter(
+        ({ id, leaf }) =>
+          assignments[id] != null ||
+          !!leaf.command ||
+          retainedEmptyLeaves.has(leaf),
+      )
       .map(({ leaf }) => leaf),
   );
   const launcherOnly = retained.size === 0;

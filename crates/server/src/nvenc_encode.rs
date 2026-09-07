@@ -1202,10 +1202,11 @@ impl NvencDirectEncoder {
     /// 595.84 / RTX 4090, including a byte-pattern round trip through the
     /// mapped pointer) and refuses a `dma_buf`.
     ///
-    /// `sync_fd` is not optional in practice. An `OPAQUE_FD` allocation
-    /// carries none of the implicit fencing a `dma_buf` does, so without
-    /// waiting for the compositor's BGRA→NV12 compute pass we would encode
-    /// a partially-written buffer — intermittently, and worst under load.
+    /// An `OPAQUE_FD` allocation carries none of the implicit fencing a
+    /// `dma_buf` does. When `sync_fd` is present, wait for the compositor's
+    /// BGRA→NV12 compute pass here. `None` is accepted only because the
+    /// producer contract requires a completed blocking Vulkan fence wait
+    /// before publishing that form.
     ///
     /// Returns `None` on any failure. Unlike the BGRA path there is no CPU
     /// fallback available here: the allocation is DEVICE_LOCAL VRAM behind

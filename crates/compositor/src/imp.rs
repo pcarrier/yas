@@ -220,8 +220,8 @@ pub enum PixelData {
     /// are why the variants stay apart. `Nv12DmaBuf`'s consumer resolves fds
     /// by inode against the VA-API surfaces it exported, which this fd will
     /// never match; and an `OPAQUE_FD` allocation carries none of the
-    /// implicit fencing a `dma_buf` does, so `sync_fd` here is load-bearing
-    /// rather than an optimisation.
+    /// implicit fencing a `dma_buf` does. The producer must therefore either
+    /// attach `sync_fd` or finish a blocking Vulkan fence wait before publish.
     Nv12OpaqueFd {
         fd: Arc<OwnedFd>,
         /// Process-unique id for the allocation behind `fd`. The consumer
@@ -245,10 +245,9 @@ pub enum PixelData {
         /// rows and NVENC rejects or garbles the picture.
         is_444: bool,
         /// sync_file exported from the fence guarding the BGRA→NV12 compute
-        /// dispatch. The consumer MUST poll this before reading: nothing
-        /// else orders CUDA's reads against the compositor's writes, and an
-        /// unsynchronised read tears intermittently — worst at high frame
-        /// rates, i.e. exactly where a short test looks fine.
+        /// dispatch. The consumer MUST poll it when present. `None` means
+        /// the producer completed a blocking fence wait before publishing;
+        /// an unsynchronised buffer is never published.
         sync_fd: Option<Arc<OwnedFd>>,
     },
     /// VA-API surface ready for VPP/encode — zero-copy path.
@@ -11960,6 +11959,11 @@ pub struct CompositorHandle {
     pub vulkan_video_encode: bool,
     /// Whether the compositor's Vulkan renderer supports Vulkan Video AV1 encode.
     pub vulkan_video_encode_av1: bool,
+    /// UUID of the Vulkan physical device selected by the compositor.
+    ///
+    /// Unlike a DRM render-node path, this remains available in containers
+    /// which expose the GPU APIs without mounting `/dev/dri`.
+    pub vulkan_device_uuid: Option<[u8; 16]>,
     foreign_exports: Arc<RwLock<HashMap<String, u16>>>,
     thread: std::thread::JoinHandle<()>,
     frame_clock_thread: std::thread::JoinHandle<()>,
@@ -12220,7 +12224,7 @@ fn spawn_compositor_inner(
     let (command_tx, command_rx) = mpsc::sync_channel(COMPOSITOR_COMMAND_QUEUE);
     let (socket_tx, socket_rx) = mpsc::sync_channel(1);
     let (signal_tx, signal_rx) = mpsc::sync_channel::<LoopSignal>(1);
-    let (caps_tx, caps_rx) = mpsc::sync_channel::<(bool, bool)>(1);
+    let (caps_tx, caps_rx) = mpsc::sync_channel::<(bool, bool, Option<[u8; 16]>)>(1);
     let foreign_exports = Arc::new(RwLock::new(HashMap::new()));
     let compositor_foreign_exports = foreign_exports.clone();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -12280,7 +12284,8 @@ fn spawn_compositor_inner(
     let loop_signal = signal_rx
         .recv()
         .expect("compositor failed to send loop signal");
-    let (vulkan_video_encode, vulkan_video_encode_av1) = caps_rx.recv().unwrap_or((false, false));
+    let (vulkan_video_encode, vulkan_video_encode_av1, vulkan_device_uuid) =
+        caps_rx.recv().unwrap_or((false, false, None));
     let (frame_clock_tx, frame_clock_rx) = mpsc::sync_channel(FRAME_CLOCK_COMMAND_QUEUE);
     let frame_clock_updates = Arc::new(std::sync::Mutex::new(FxHashMap::default()));
     let frame_clock_requests = Arc::new(AtomicU32::new(0));
@@ -12317,6 +12322,7 @@ fn spawn_compositor_inner(
         shutdown,
         vulkan_video_encode,
         vulkan_video_encode_av1,
+        vulkan_device_uuid,
         foreign_exports,
         loop_signal,
     }
@@ -12424,7 +12430,7 @@ fn run_compositor(
     command_rx: mpsc::Receiver<CompositorCommand>,
     socket_tx: mpsc::SyncSender<String>,
     signal_tx: mpsc::SyncSender<LoopSignal>,
-    caps_tx: mpsc::SyncSender<(bool, bool)>,
+    caps_tx: mpsc::SyncSender<(bool, bool, Option<[u8; 16]>)>,
     event_notify: Arc<dyn Fn() + Send + Sync>,
     shutdown: Arc<AtomicBool>,
     verbose: bool,
@@ -12625,12 +12631,18 @@ fn run_compositor(
 
     // Report Vulkan Video encode capabilities to the server.
     {
-        let (vve, vve_av1) = compositor
+        let (vve, vve_av1, device_uuid) = compositor
             .vulkan_renderer
             .as_ref()
-            .map(|vk| (vk.has_video_encode(), vk.has_video_encode_av1()))
-            .unwrap_or((false, false));
-        let _ = caps_tx.send((vve, vve_av1));
+            .map(|vk| {
+                (
+                    vk.has_video_encode(),
+                    vk.has_video_encode_av1(),
+                    Some(vk.device_uuid()),
+                )
+            })
+            .unwrap_or((false, false, None));
+        let _ = caps_tx.send((vve, vve_av1, device_uuid));
     }
 
     let handle = event_loop.handle();

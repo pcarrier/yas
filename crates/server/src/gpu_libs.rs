@@ -216,10 +216,9 @@ pub struct CudaFns {
     >,
     pub cuDestroyExternalSemaphore:
         Option<unsafe extern "C" fn(extSem: CUexternalSemaphore) -> CUresult>,
-    /// Used to pick the CUDA device matching the Vulkan `deviceUUID`.  On a
-    /// multi-GPU host (this one has an AMD iGPU alongside the 4090) importing
-    /// into a context on the wrong device fails, and yas has a history of
-    /// landing on the iGPU.
+    /// Used to verify that the configured CUDA device matches the Vulkan
+    /// `deviceUUID`. Importing into a context on the wrong device fails; the
+    /// UUID remains usable in containers which expose no DRM render nodes.
     pub cuDeviceGetUuid_v2:
         Option<unsafe extern "C" fn(uuid: *mut [u8; 16], dev: CUdevice) -> CUresult>,
     _lib: DynLib,

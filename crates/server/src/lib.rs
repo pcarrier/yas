@@ -1593,16 +1593,6 @@ const SURFACE_CLAIM_GRACE: Duration = Duration::from_millis(750);
 /// GPU representation again.
 const OPAQUE_PUBLISH_GRACE: Duration = Duration::from_millis(250);
 
-#[cfg(target_os = "linux")]
-fn drm_node_is_nvidia(path: &str) -> bool {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
-    let Some(node) = canonical.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    std::fs::read_to_string(format!("/sys/class/drm/{node}/device/vendor"))
-        .is_ok_and(|vendor| vendor.trim().eq_ignore_ascii_case("0x10de"))
-}
-
 /// Resolve the compositor render node. An explicit override wins. Otherwise,
 /// when NVENC is in the encoder chain, match the selected CUDA ordinal to its
 /// DRM render node by PCI address so Vulkan export and CUDA import cannot
@@ -1663,6 +1653,66 @@ fn cuda_drm_render_node() -> Option<String> {
         }
     }
     None
+}
+
+/// UUID of the CUDA device NVENC will use.
+///
+/// Unlike PCI-to-DRM discovery, this works when a container exposes CUDA and
+/// Vulkan while omitting `/dev/dri` and `/sys/class/drm`.
+#[cfg(target_os = "linux")]
+fn cuda_device_uuid() -> Option<[u8; 16]> {
+    static UUID: std::sync::OnceLock<Option<[u8; 16]>> = std::sync::OnceLock::new();
+    *UUID.get_or_init(|| {
+        let cuda = gpu_libs::cuda().ok()?;
+        if unsafe { (cuda.cuInit)(0) } != 0 {
+            return None;
+        }
+        let ordinal = std::env::var("YAS_CUDA_DEVICE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let mut device = 0;
+        if unsafe { (cuda.cuDeviceGet)(&mut device, ordinal) } != 0 {
+            return None;
+        }
+        let get_uuid = cuda.cuDeviceGetUuid_v2?;
+        let mut uuid = [0; 16];
+        if unsafe { get_uuid(&mut uuid, device) } != 0 {
+            return None;
+        }
+        Some(uuid)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn same_device_identity(
+    vulkan_uuid: Option<[u8; 16]>,
+    cuda_uuid: Option<[u8; 16]>,
+    drm_nodes_match: bool,
+) -> bool {
+    match (vulkan_uuid, cuda_uuid) {
+        (Some(vulkan), Some(cuda)) => vulkan == cuda,
+        _ => drm_nodes_match,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn same_drm_node(left: &str, right: &str) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// Whether CUDA may safely import the compositor's `OPAQUE_FD` allocations.
+/// Prefer the cross-API physical-device UUID; retain exact render-node
+/// matching as a compatibility fallback for drivers without CUDA UUIDs.
+#[cfg(target_os = "linux")]
+fn nvenc_matches_compositor(compositor_device: &str, vulkan_uuid: Option<[u8; 16]>) -> bool {
+    let cuda_uuid = cuda_device_uuid();
+    let drm_nodes_match = cuda_drm_render_node()
+        .is_some_and(|cuda_node| same_drm_node(&cuda_node, compositor_device));
+    same_device_identity(vulkan_uuid, cuda_uuid, drm_nodes_match)
 }
 
 /// How long a dispatched configure may hold off building an encoder for the
@@ -11770,11 +11820,18 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // Computed before the compositor borrow below, which
                     // takes `sess` mutably.
                     let encoder_is_nvenc = encoder.wants_nv12_opaque_fd();
-                    let encoder_wants_nv12_opaque =
-                        encoder_is_nvenc && drm_node_is_nvidia(&state2.config.compositor_device);
+                    let compositor_uuid = sess
+                        .compositor
+                        .as_ref()
+                        .and_then(|cs| cs.handle.vulkan_device_uuid);
+                    let encoder_wants_nv12_opaque = encoder_is_nvenc
+                        && nvenc_matches_compositor(
+                            &state2.config.compositor_device,
+                            compositor_uuid,
+                        );
                     if encoder_is_nvenc && !encoder_wants_nv12_opaque && state2.config.verbose {
                         eprintln!(
-                            "[surface-encoder] NVENC GPU differs from compositor {}; using CPU upload",
+                            "[surface-encoder] NVENC device identity differs from compositor {}; using CPU upload",
                             state2.config.compositor_device,
                         );
                     }
@@ -12608,6 +12665,32 @@ fn spawn_yas_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_gpu_uuids_enable_zero_copy_without_drm_nodes() {
+        use super::same_device_identity;
+
+        let uuid = [7; 16];
+        assert!(same_device_identity(Some(uuid), Some(uuid), false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mismatched_gpu_uuids_override_a_render_node_guess() {
+        use super::same_device_identity;
+
+        assert!(!same_device_identity(Some([1; 16]), Some([2; 16]), true,));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_render_node_match_supports_drivers_without_uuids() {
+        use super::same_device_identity;
+
+        assert!(same_device_identity(Some([1; 16]), None, true));
+        assert!(!same_device_identity(Some([1; 16]), None, false));
+    }
+
     #[test]
     fn keyboard_request_survives_coalesced_caret_updates() {
         use super::CachedSurfaceTextInput;

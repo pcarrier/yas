@@ -32,6 +32,7 @@ import type {
   TerminalPalette,
   YasSurface,
 } from "@yas-run/core";
+import { measureCell } from "@yas-run/core";
 import type {
   LayoutNode,
   LayoutChild,
@@ -183,6 +184,20 @@ function sameAssignments(
   return true;
 }
 
+export interface TerminalPaneReservation {
+  rows: number;
+  cols: number;
+  /** Fill the measured pane. False means the layout changed meanwhile. */
+  commit: (assignment: string) => boolean;
+  /** Remove a newly inserted pane, or release an existing empty pane. */
+  cancel: () => void;
+}
+
+export type ReserveTerminalPane = (
+  paneId: string,
+  placement?: "container" | "split",
+) => Promise<TerminalPaneReservation | null>;
+
 export function LayoutContainer(props: {
   layout: WorkspaceLayout;
   onLayoutChange: (
@@ -194,6 +209,8 @@ export function LayoutContainer(props: {
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;
+  /** Font-table cell advance, when the loaded terminal font provides one. */
+  advanceRatio?: number;
   /** Surface zoom factor. Defaults to 1. */
   surfaceZoom?: number;
   /** Whether surface zoom is relative to display DPI or an exact scale. */
@@ -272,6 +289,10 @@ export function LayoutContainer(props: {
       direction?: "horizontal" | "vertical",
     ) => void,
   ) => void | (() => void);
+  /** Reserve and measure a terminal's final pane before its server CREATE. */
+  onReserveTerminalPane?: (
+    fn: ReserveTerminalPane,
+  ) => void | (() => void);
   onClearPaneAssignment?: (fn: (paneId: string) => void) => void;
   /** Reset a manager with no remaining windows to one empty tiling pane. */
   onCollapseToSingle?: (assignment: string | null) => void;
@@ -305,6 +326,10 @@ export function LayoutContainer(props: {
   /** Request a native surface close; its catalogue determines removal. */
   onCloseSurface?: (connectionId: string, surfaceId: SurfaceId) => void;
 }) {
+  let layoutAlive = true;
+  onCleanup(() => {
+    layoutAlive = false;
+  });
   const workspace = createYasWorkspace();
   const workspaceState = createYasWorkspaceState(workspace);
   const sessions = createYasSessions(workspace);
@@ -369,6 +394,13 @@ export function LayoutContainer(props: {
   const [root, setRoot] = createSignal(props.layout.root);
   const panes = createMemo(() => enumeratePanes(root()));
   const paneIds = createMemo(() => panes().map((pane) => pane.id));
+  // A terminal is created only after its destination has real browser
+  // geometry. Keep those deliberately empty leaves out of the ordinary empty
+  // pane compactor until CREATE either commits the session or fails.
+  const pendingTerminalLeaves = new Set<LayoutLeaf>();
+  const [pendingTerminalRevision, setPendingTerminalRevision] = createSignal(0);
+  const touchPendingTerminals = () =>
+    setPendingTerminalRevision((revision) => revision + 1);
 
   // The backend store carries stable PTY/surface/tab refs. Resolve them to
   // ephemeral live assignments as their remotes arrive, while retaining every
@@ -809,6 +841,8 @@ export function LayoutContainer(props: {
     const restoreKey = props.restoreKey;
     if (restoreKey === lastRestoreKey) return;
     lastRestoreKey = restoreKey;
+    pendingTerminalLeaves.clear();
+    touchPendingTerminals();
     setParkedPlacements(props.storedParkedPlacements ?? {});
     restoreGeneration += 1;
     tabFetchesInFlight.clear();
@@ -888,6 +922,7 @@ export function LayoutContainer(props: {
   // is one plain leaf when the workspace has no content at all: that is the
   // empty-workspace launcher, never a gap beside a real window.
   createEffect(() => {
+    pendingTerminalRevision();
     if (resolvingRefs() || !initialPlacementPassComplete()) return;
     const previous = layoutState();
     const snapshots = workspaceState().connections;
@@ -905,7 +940,11 @@ export function LayoutContainer(props: {
     // cross-remote layout edit. Ready connections are authoritative, so refs
     // absent from their first complete catalogue may be compacted normally.
     if (unavailableRef) return;
-    const compacted = pruneUnassignedPanes(root(), previous.assignments);
+    const compacted = pruneUnassignedPanes(
+      root(),
+      previous.assignments,
+      pendingTerminalLeaves,
+    );
     if (!compacted) return;
 
     const nextPending: Record<string, string> = {};
@@ -1251,6 +1290,173 @@ export function LayoutContainer(props: {
     props.onSplitPane?.(splitPane);
   });
 
+  let terminalReservationSequence = 0;
+
+  function terminalPaneSize(leaf: LayoutLeaf): {
+    rows: number;
+    cols: number;
+  } | null {
+    const pane = enumeratePanes(root()).find(
+      (candidate) => candidate.leaf === leaf,
+    );
+    if (!pane || !layoutElement) return null;
+    const element = layoutElement.querySelector<HTMLElement>(
+      `[data-yas-pane-id="${pane.id}"]`,
+    );
+    if (!element || element.clientWidth <= 0 || element.clientHeight <= 0)
+      return null;
+    const cell = measureCell(
+      props.fontFamily,
+      resolveLeafFontSize(leaf, props.fontSize),
+      undefined,
+      props.advanceRatio,
+    );
+    return {
+      rows: Math.min(
+        0xffff,
+        Math.max(1, Math.floor(element.clientHeight / cell.h)),
+      ),
+      cols: Math.min(
+        0xffff,
+        Math.max(1, Math.floor(element.clientWidth / cell.w)),
+      ),
+    };
+  }
+
+  /**
+   * Materialize the pane a terminal will occupy before sending CREATE. This
+   * makes the process's first TIOCGWINSZ agree with the browser instead of
+   * starting every application at 80x24 and correcting it one frame later.
+   */
+  async function reserveTerminalPane(
+    requestedPaneId: string,
+    placement: "container" | "split" = "container",
+  ): Promise<TerminalPaneReservation | null> {
+    const currentPanes = enumeratePanes(root());
+    const target = currentPanes.find((pane) => pane.id === requestedPaneId);
+    if (!target) return null;
+
+    let leaf = target.leaf;
+    let inserted = false;
+    if (layoutState().assignments[requestedPaneId] != null) {
+      const marker = `yas-terminal-reservation:${++terminalReservationSequence}`;
+      const targetElement = layoutElement?.querySelector<HTMLElement>(
+        `[data-yas-pane-id="${requestedPaneId}"]`,
+      );
+      const targetRect = targetElement?.getBoundingClientRect();
+      const currentRoot = root();
+      let mutation: LayoutMutation | null;
+
+      if (
+        placement === "container" &&
+        currentRoot.type === "split" &&
+        currentRoot.direction === "workspace" &&
+        paneIsFloating(currentRoot, requestedPaneId)
+      ) {
+        mutation = addFloatingWindowToWorkspace(
+          currentRoot,
+          layoutState().assignments,
+          marker,
+          cascadeRect(panesByFloatingMode(currentRoot).floating.length),
+        );
+      } else {
+        const inherited =
+          placement === "container"
+            ? paneParentLayout(currentRoot, requestedPaneId)
+            : null;
+        const inheritedTiled: TiledLayout | null =
+          inherited === "horizontal" ||
+          inherited === "vertical" ||
+          inherited === "tabs" ||
+          inherited === "stacking"
+            ? inherited
+            : null;
+        const direction: TiledLayout =
+          nextSplitDirection() ??
+          inheritedTiled ??
+          (targetRect && targetRect.height > targetRect.width
+            ? "vertical"
+            : "horizontal");
+        mutation = splitPaneWithAssignment(
+          currentRoot,
+          layoutState().assignments,
+          requestedPaneId,
+          marker,
+          direction,
+        );
+      }
+      if (!mutation) return null;
+      const reserved = enumeratePanes(mutation.root).find(
+        (pane) => mutation.assignments[pane.id] === marker,
+      );
+      if (!reserved) return null;
+      leaf = reserved.leaf;
+      mutation.assignments[reserved.id] = null;
+      pendingTerminalLeaves.add(leaf);
+      touchPendingTerminals();
+      setNextSplitDirection(null);
+      applyLayoutMutation(mutation);
+      inserted = true;
+    } else {
+      pendingTerminalLeaves.add(leaf);
+      touchPendingTerminals();
+    }
+
+    // Let Solid flush the new leaf before forcing browser layout through the
+    // clientWidth/clientHeight reads above.
+    await Promise.resolve();
+
+    let settled = false;
+    const paneId = () =>
+      enumeratePanes(root()).find((candidate) => candidate.leaf === leaf)?.id ??
+      null;
+    const cancel = () => {
+      if (settled) return;
+      settled = true;
+      if (!layoutAlive) return;
+      const currentPaneId = paneId();
+      batch(() => {
+        pendingTerminalLeaves.delete(leaf);
+        touchPendingTerminals();
+        if (
+          inserted &&
+          currentPaneId &&
+          layoutState().assignments[currentPaneId] == null
+        )
+          removePaneWithPlacement(currentPaneId, false);
+      });
+    };
+    const size = terminalPaneSize(leaf);
+    if (!size) {
+      cancel();
+      return null;
+    }
+
+    return {
+      ...size,
+      commit(assignment: string): boolean {
+        if (settled || !layoutAlive) return false;
+        settled = true;
+        const currentPaneId = paneId();
+        const canCommit =
+          currentPaneId != null &&
+          layoutState().assignments[currentPaneId] == null;
+        batch(() => {
+          pendingTerminalLeaves.delete(leaf);
+          touchPendingTerminals();
+          if (canCommit) moveToPane(assignment, currentPaneId);
+        });
+        return canCommit;
+      },
+      cancel,
+    };
+  }
+
+  createEffect(() => {
+    const unregister = props.onReserveTerminalPane?.(reserveTerminalPane);
+    if (unregister) onCleanup(unregister);
+  });
+
   /** Restoring a parked item as floating adds an independent window. */
   function addFloatingWindow(
     value: string,
@@ -1444,7 +1650,8 @@ export function LayoutContainer(props: {
         (pane) =>
           pane.id !== paneId &&
           (previous.assignments[pane.id] != null ||
-            pendingRefs[pane.id] != null),
+            pendingRefs[pane.id] != null ||
+            pendingTerminalLeaves.has(pane.leaf)),
       );
       if (retained.length === 0) {
         batch(() => {

@@ -32,6 +32,7 @@ import {
   detectCodecSupport,
   getProbedCodecSupport,
   setAllowedCodecSupport,
+  terminalSurfaceForInput,
   isIOS,
 } from "@yas-run/core";
 import type {
@@ -229,6 +230,10 @@ import { RootsOverlay } from "./RootsOverlay";
 import { MediaOverlay } from "./MediaOverlay";
 import { createMediaDevices } from "./mediaDevices";
 import { LayoutContainer, EmptyPane } from "./layout/LayoutContainer";
+import type {
+  ReserveTerminalPane,
+  TerminalPaneReservation,
+} from "./layout/LayoutContainer";
 import { newlyLaunchedSurface } from "./layout/floatingWindow";
 import {
   autoFocusPaneTarget,
@@ -4108,6 +4113,7 @@ function WorkspaceScreen(props: {
         direction?: "horizontal" | "vertical",
       ) => void)
     | null = null;
+  let reserveTerminalPaneFn: ReserveTerminalPane | null = null;
   // A tile to drop into a freshly-created layout, flushed when LayoutContainer
   // wires moveToPane on mount (no-layout file open).
   // Layout controls disappear briefly while a tree remounts. Keep every
@@ -4146,6 +4152,7 @@ function WorkspaceScreen(props: {
     openTabInPaneFn = null;
     openInContainerFn = null;
     splitPaneFn = null;
+    reserveTerminalPaneFn = null;
     clearPaneAssignmentFn = null;
     focusPaneFn = null;
     addFloatingWindowFn = null;
@@ -4657,8 +4664,25 @@ function WorkspaceScreen(props: {
     );
   }
 
-  let termHandle: { rows: number; cols: number; focus: () => void } | null =
-    null;
+  const fallbackTerminalSize = (): { rows: number; cols: number } => {
+    const surface =
+      terminalSurfaceForInput(document.activeElement) ?? terminalSurface();
+    return {
+      rows: surface?.rows ?? 24,
+      cols: surface?.cols ?? 80,
+    };
+  };
+
+  async function reserveTerminalPane(
+    paneId: string,
+    placement: "container" | "split" = "container",
+  ): Promise<TerminalPaneReservation | null> {
+    try {
+      return (await reserveTerminalPaneFn?.(paneId, placement)) ?? null;
+    } catch {
+      return null;
+    }
+  }
 
   async function createAndFocus(command?: string, connectionId?: string) {
     // `[remote>][command]` doubles as a location bar: an entry with a scheme
@@ -4668,20 +4692,26 @@ function WorkspaceScreen(props: {
       closeOverlay();
       return;
     }
+    let reservation: TerminalPaneReservation | null = null;
     try {
       const previous = focusedAssignment();
       const fid = wsState().focusedSessionId;
       const connId = connectionId ?? activeConnectionId();
+      const paneId = preferredTilePane();
+      reservation = await reserveTerminalPane(paneId);
+      const size = reservation ?? fallbackTerminalSize();
       const session = await workspace.createSession({
         connectionId: connId,
-        rows: termHandle?.rows ?? 24,
-        cols: termHandle?.cols ?? 80,
+        rows: size.rows,
+        cols: size.cols,
         ...(command ? { command } : {}),
         ...(!command && fid && !connectionId ? { cwdFromSessionId: fid } : {}),
       });
       if (!showAsFloatingWindow(session.id)) {
-        if (inLayout()) {
-          openAssignmentInPane(session.id, preferredTilePane());
+        if (reservation?.commit(session.id)) {
+          // The measured destination is already in the tree.
+        } else if (inLayout()) {
+          openAssignmentInPane(session.id, paneId);
         } else if (previous) {
           queueTilePlacement(previous, "0");
           queueTilePlacement(session.id, "1");
@@ -4697,12 +4727,17 @@ function WorkspaceScreen(props: {
           focusSurfaceById(null);
           setActiveTile(null);
         }
+      } else {
+        reservation?.cancel();
       }
       retainMainTerminalRef(session.id);
       workspace.focusSession(session.id);
       previousFocus = null;
       closeOverlay();
-    } catch {}
+    } catch {
+      // A failed server CREATE must not leave its empty measured pane behind.
+      reservation?.cancel();
+    }
   }
 
   /** Open a terminal in an absolute directory on the session's own
@@ -4712,19 +4747,25 @@ function WorkspaceScreen(props: {
   async function openTerminalIn(path: string) {
     const connectionId = activeSession()?.connectionId;
     if (!connectionId) return;
+    let reservation: TerminalPaneReservation | null = null;
     try {
       const previous = focusedAssignment();
+      const paneId = preferredTilePane();
+      reservation = await reserveTerminalPane(paneId);
+      const size = reservation ?? fallbackTerminalSize();
       const session = await workspace.createSession({
         connectionId,
-        rows: termHandle?.rows ?? 24,
-        cols: termHandle?.cols ?? 80,
+        rows: size.rows,
+        cols: size.cols,
         cwd: path,
       });
       focusSurfaceById(null);
       setActiveTile(null);
       if (!showAsFloatingWindow(session.id)) {
-        if (inLayout()) {
-          openAssignmentInPane(session.id, preferredTilePane());
+        if (reservation?.commit(session.id)) {
+          // The measured destination is already in the tree.
+        } else if (inLayout()) {
+          openAssignmentInPane(session.id, paneId);
         } else if (previous) {
           queueTilePlacement(previous, "0");
           queueTilePlacement(session.id, "1");
@@ -4737,10 +4778,14 @@ function WorkspaceScreen(props: {
             ],
           });
         }
+      } else {
+        reservation?.cancel();
       }
       retainMainTerminalRef(session.id);
       workspace.focusSession(session.id);
-    } catch {}
+    } catch {
+      reservation?.cancel();
+    }
   }
 
   async function createInPane(
@@ -4752,38 +4797,50 @@ function WorkspaceScreen(props: {
       openWebPane(command, connectionId, paneId);
       return;
     }
+    let reservation: TerminalPaneReservation | null = null;
     try {
       const fid = wsState().focusedSessionId;
       const connId = connectionId ?? activeConnectionId();
+      reservation = await reserveTerminalPane(paneId);
+      const size = reservation ?? fallbackTerminalSize();
       const session = await workspace.createSession({
         connectionId: connId,
-        rows: termHandle?.rows ?? 24,
-        cols: termHandle?.cols ?? 80,
+        rows: size.rows,
+        cols: size.cols,
         ...(command ? { command } : {}),
         ...(!command && fid && !connectionId ? { cwdFromSessionId: fid } : {}),
       });
       if (!showAsFloatingWindow(session.id)) {
-        openAssignmentInPane(session.id, paneId);
+        if (!reservation?.commit(session.id))
+          openAssignmentInPane(session.id, paneId);
+      } else {
+        reservation?.cancel();
       }
       retainMainTerminalRef(session.id);
       workspace.focusSession(session.id);
-    } catch {}
+    } catch {
+      reservation?.cancel();
+    }
   }
 
-  /** Create first, then change geometry, so a failed terminal creation cannot
-   * leave an empty stack behind. */
+  /** Reserve and measure a sibling pane before creating its terminal. */
   async function createBesideFocused() {
+    let reservation: TerminalPaneReservation | null = null;
     try {
       const previous = focusedAssignment();
       const fid = wsState().focusedSessionId;
+      const paneId = inLayout() ? layoutFocusedPaneId() : null;
+      if (paneId) reservation = await reserveTerminalPane(paneId, "split");
+      const size = reservation ?? fallbackTerminalSize();
       const session = await workspace.createSession({
         connectionId: activeConnectionId(),
-        rows: termHandle?.rows ?? 24,
-        cols: termHandle?.cols ?? 80,
+        rows: size.rows,
+        cols: size.cols,
         ...(fid ? { cwdFromSessionId: fid } : {}),
       });
-      const paneId = inLayout() ? layoutFocusedPaneId() : null;
-      if (paneId && splitPaneFn) {
+      if (reservation?.commit(session.id)) {
+        // The measured split is already in the tree.
+      } else if (paneId && splitPaneFn) {
         splitPaneFn(session.id, paneId);
       } else {
         if (previous) {
@@ -4806,7 +4863,9 @@ function WorkspaceScreen(props: {
       workspace.focusSession(session.id);
       previousFocus = null;
       closeOverlay();
-    } catch {}
+    } catch {
+      reservation?.cancel();
+    }
   }
 
   function selectPane(
@@ -5716,6 +5775,7 @@ function WorkspaceScreen(props: {
                     palette={palette()}
                     fontFamily={resolvedFontWithFallback()}
                     fontSize={fontSize()}
+                    advanceRatio={advanceRatio()}
                     surfaceZoom={surfaceZoom() / 100}
                     surfaceZoomMode={surfaceZoomMode()}
                     surfaceTouchMode={surfaceTouchMode()}
@@ -5835,6 +5895,13 @@ function WorkspaceScreen(props: {
                       splitPaneFn = fn;
                       return () => {
                         if (splitPaneFn === fn) splitPaneFn = null;
+                      };
+                    }}
+                    onReserveTerminalPane={(fn) => {
+                      reserveTerminalPaneFn = fn;
+                      return () => {
+                        if (reserveTerminalPaneFn === fn)
+                          reserveTerminalPaneFn = null;
                       };
                     }}
                     onClearPaneAssignment={(fn) => {

@@ -412,6 +412,10 @@ pub(crate) struct VulkanRenderer {
     external_semaphore_fd_fn: Option<ash::khr::external_semaphore_fd::Device>,
     sync_fd_semaphore_importable: bool,
     sync_fd_semaphore_exportable: bool,
+    /// A driver may advertise SYNC_FD export extensions but reject the
+    /// actual export (Modal's NVIDIA containers do). After the first hard
+    /// failure, stop allocating export objects and use host fence waits.
+    sync_fd_export_broken: bool,
     /// Imported acquire-fence semaphores awaiting attachment to the next
     /// composite submit.  Each is a client's explicit-sync acquire point:
     /// the submit that samples the committed buffer must wait on it, or
@@ -564,6 +568,10 @@ fn next_nv12_buf_id() -> u64 {
     NEXT_NV12_BUF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn external_output_is_synchronized(has_sync_fd: bool, host_waited: bool) -> bool {
+    has_sync_fd || host_waited
+}
+
 /// How an NV12 output's memory is exported, and therefore who can read it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Nv12Export {
@@ -574,7 +582,8 @@ enum Nv12Export {
     DmaBuf,
     /// An NVIDIA-internal handle. The only importer is CUDA (NVENC):
     /// `cuImportExternalMemory` accepts `OPAQUE_FD` and refuses `dma_buf`.
-    /// Carries no implicit fencing, so a consumer must be handed a sync_fd.
+    /// Carries no implicit fencing, so the producer must either hand the
+    /// consumer a sync_fd or finish a blocking fence wait before publishing.
     OpaqueFd,
 }
 
@@ -1883,6 +1892,7 @@ impl VulkanRenderer {
             external_semaphore_fd_fn,
             sync_fd_semaphore_importable,
             sync_fd_semaphore_exportable,
+            sync_fd_export_broken: false,
             pending_acquire_semaphores: Vec::new(),
             supported_dmabuf_modifiers,
             external_outputs: HashMap::new(),
@@ -1907,6 +1917,20 @@ impl VulkanRenderer {
             pending_destroy_nv12_outputs: Vec::new(),
             pending_destroy_downscale_outputs: Vec::new(),
         })
+    }
+
+    /// Stable identity of the physical device backing this renderer.
+    ///
+    /// Vulkan 1.1+ guarantees `deviceUUID`; querying it directly avoids
+    /// depending on a DRM node being mounted into the process namespace.
+    pub(crate) fn device_uuid(&self) -> [u8; vk::UUID_SIZE] {
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+        unsafe {
+            self.instance
+                .get_physical_device_properties2(self.physical_device, &mut properties);
+        }
+        id.device_uuid
     }
 
     /// (major, minor) of the device node at `path`.
@@ -8300,10 +8324,12 @@ impl VulkanRenderer {
         }) || downscale_targets
             .iter()
             .any(|&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some());
-        let can_export_semaphore =
-            self.sync_fd_semaphore_exportable && self.external_semaphore_fd_fn.is_some();
-        let needs_sync_fd_export =
-            has_sync_fd_consumer && (can_export_semaphore || self.external_fence_fd_fn.is_some());
+        let can_export_semaphore = !self.sync_fd_export_broken
+            && self.sync_fd_semaphore_exportable
+            && self.external_semaphore_fd_fn.is_some();
+        let needs_sync_fd_export = has_sync_fd_consumer
+            && !self.sync_fd_export_broken
+            && (can_export_semaphore || self.external_fence_fd_fn.is_some());
 
         let tracking_fence = if let Some(fence) = self.recycled_tracking_fences.pop() {
             fence
@@ -8341,6 +8367,7 @@ impl VulkanRenderer {
                         Ok(semaphore) => Some(semaphore),
                         Err(e) => {
                             eprintln!("[render_tree_sized] create_semaphore(sync_fd) failed: {e}");
+                            self.sync_fd_export_broken = true;
                             None
                         }
                     }
@@ -8368,6 +8395,7 @@ impl VulkanRenderer {
                         Ok(f) => Some(f),
                         Err(e) => {
                             eprintln!("[render_tree_sized] create_fence(sync_fd) failed: {e}");
+                            self.sync_fd_export_broken = true;
                             // Continue without sync_fd export — fall back to
                             // the blocking wait branch below.
                             None
@@ -8426,6 +8454,7 @@ impl VulkanRenderer {
                 let empty = vk::SubmitInfo::default();
                 if let Err(e) = self.device.queue_submit(self.queue, &[empty], ef) {
                     eprintln!("[render_tree_sized] queue_submit (export fence) failed: {e}");
+                    self.sync_fd_export_broken = true;
                     self.device.destroy_fence(ef, None);
                     export_fence = None;
                     // Continue with tracking fence; encoder will block.
@@ -8607,6 +8636,7 @@ impl VulkanRenderer {
         // Export one sync_fd shared by every target. SYNC_FD copy export
         // consumes the pending signal and restores the Vulkan object's
         // permanent unsignalled payload, making it reusable.
+        let mut host_waited_for_external = false;
         let shared_sync_fd: Option<Arc<std::os::fd::OwnedFd>> = if let (
             Some(ext_semaphore_fn),
             Some(es),
@@ -8625,11 +8655,19 @@ impl VulkanRenderer {
                     Some(Arc::new(owned))
                 }
                 Ok(_) | Err(_) => {
-                    eprintln!(
-                        "[vulkan-render] vkGetSemaphoreFdKHR failed; falling back to blocking wait"
-                    );
+                    self.sync_fd_export_broken = true;
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "[vulkan-render] vkGetSemaphoreFdKHR failed; using blocking fence waits"
+                        );
+                    }
                     unsafe {
-                        let _ = self.device.wait_for_fences(&[fence], true, 5_000_000_000);
+                        host_waited_for_external = self
+                            .device
+                            .wait_for_fences(&[fence], true, 5_000_000_000)
+                            .is_ok();
                         self.device.destroy_semaphore(es, None);
                     }
                     None
@@ -8647,15 +8685,23 @@ impl VulkanRenderer {
                     (Some(Arc::new(owned)), true)
                 }
                 Ok(_) | Err(_) => {
-                    // Fallback: block on tracking_fence so the encoder
-                    // still sees a finished frame.
-                    eprintln!(
-                        "[vulkan-render] vkGetFenceFdKHR failed; \
-                         falling back to blocking wait"
-                    );
-                    unsafe {
-                        let _ = self.device.wait_for_fences(&[fence], true, 5_000_000_000);
+                    // The empty submission carrying `ef` follows the render
+                    // submission on the same queue. Waiting for it proves the
+                    // compute writes are complete and also makes destroying
+                    // the failed export fence safe.
+                    self.sync_fd_export_broken = true;
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "[vulkan-render] vkGetFenceFdKHR failed; using blocking fence waits"
+                        );
                     }
+                    host_waited_for_external = unsafe {
+                        self.device
+                            .wait_for_fences(&[ef], true, 5_000_000_000)
+                            .is_ok()
+                    };
                     (None, false)
                 }
             };
@@ -8670,34 +8716,37 @@ impl VulkanRenderer {
             }
             result
         } else {
+            if has_sync_fd_consumer {
+                host_waited_for_external = unsafe {
+                    self.device
+                        .wait_for_fences(&[fence], true, 5_000_000_000)
+                        .is_ok()
+                };
+            }
             None
         };
 
-        // NVENC zero-copy targets.  Published immediately, like the
-        // external ones and for the same reason: the consumer synchronises
-        // itself against `sync_fd` rather than us blocking here.
-        //
-        // Without a sync_fd we publish nothing. There is no implicit
-        // fencing behind an OPAQUE_FD allocation, so handing it over
-        // unsynchronised would let NVENC read a buffer the compute pass is
-        // still writing — which shows up as intermittent tearing under
-        // load rather than as an obvious failure. Dropping the frame
-        // instead leaves the encoder with nothing to send for this tick,
-        // which is visible and safe.
+        // NVENC zero-copy targets. Prefer publishing immediately with a
+        // sync_fd so the encoder worker can wait. Drivers such as Modal's
+        // containerized NVIDIA stack expose OPAQUE_FD memory but cannot
+        // export SYNC_FD; after the blocking wait above, publishing without
+        // a sync_fd is equivalently ordered, at the cost of serializing the
+        // compositor thread. Never publish when neither mechanism succeeded.
         for &(tw, th) in &nv12_opaque_targets {
             let Some(idx) = self.nv12_opaque_slot(sid, tw, th) else {
                 continue;
             };
-            let Some(sync) = shared_sync_fd.clone() else {
+            let sync = shared_sync_fd.clone();
+            if !external_output_is_synchronized(sync.is_some(), host_waited_for_external) {
                 static WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!(
-                        "[vulkan-render] NV12 opaque-fd target {tw}x{th} has no sync_fd; dropping frames rather than racing the encoder",
+                        "[vulkan-render] NV12 opaque-fd target {tw}x{th} could not be synchronized; dropping frame",
                     );
                 }
                 continue;
-            };
+            }
             let nv12 = &self.nv12_opaque_outputs[&(sid, tw, th)].0[idx];
             let Nv12OutputKind::Buffer {
                 stride,
@@ -8725,7 +8774,7 @@ impl VulkanRenderer {
                     width: nv12.width,
                     height: nv12.height,
                     is_444: nv12.is_444,
-                    sync_fd: Some(sync),
+                    sync_fd: sync,
                 },
                 false,
             ));
@@ -9102,6 +9151,14 @@ impl Drop for VulkanRenderer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opaque_output_accepts_exported_or_host_fence_synchronization() {
+        assert!(super::external_output_is_synchronized(true, false));
+        assert!(super::external_output_is_synchronized(false, true));
+        assert!(super::external_output_is_synchronized(true, true));
+        assert!(!super::external_output_is_synchronized(false, false));
+    }
+
     use super::{
         NativeReadback, ShmDamageFrame, ShmDamageRect, ShmHostImportMode, ShmTextureKey,
         StalledSubmit, clamped_scissor, coalesce_shm_damage, is_full_shm_damage,

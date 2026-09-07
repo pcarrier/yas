@@ -623,6 +623,12 @@ mod stub {
         pub vulkan_video_encode: bool,
         /// Whether the compositor's Vulkan renderer supports Vulkan Video AV1 encode.
         pub vulkan_video_encode_av1: bool,
+        /// UUID of the Vulkan physical device selected by the compositor.
+        ///
+        /// CUDA consumers use this when no DRM render node is exposed (for
+        /// example in GPU containers) to prove that external memory stays on
+        /// the same physical device.
+        pub vulkan_device_uuid: Option<[u8; 16]>,
         foreign_exports: Arc<std::sync::RwLock<std::collections::HashMap<String, u16>>>,
         thread: std::thread::JoinHandle<()>,
     }
@@ -696,6 +702,7 @@ mod stub {
             thread,
             vulkan_video_encode: false,
             vulkan_video_encode_av1: false,
+            vulkan_device_uuid: None,
             foreign_exports: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
