@@ -3,7 +3,11 @@ import { type YasHost, decodeUtf8, encodeUtf8 } from "./yas";
 import { serveCommands } from "./command";
 
 function fakeHost(
-  incoming: Array<{ args: string[]; streamsStdin: boolean; channelHandle: bigint }>,
+  incoming: Array<{
+    args: string[];
+    streamsStdin: boolean;
+    channelHandle: bigint;
+  }>,
 ): YasHost & { calls: Array<[string, ...unknown[]]> } {
   const calls: Array<[string, ...unknown[]]> = [];
   return {

@@ -290,9 +290,7 @@ export function LayoutContainer(props: {
     ) => void,
   ) => void | (() => void);
   /** Reserve and measure a terminal's final pane before its server CREATE. */
-  onReserveTerminalPane?: (
-    fn: ReserveTerminalPane,
-  ) => void | (() => void);
+  onReserveTerminalPane?: (fn: ReserveTerminalPane) => void | (() => void);
   onClearPaneAssignment?: (fn: (paneId: string) => void) => void;
   /** Reset a manager with no remaining windows to one empty tiling pane. */
   onCollapseToSingle?: (assignment: string | null) => void;
