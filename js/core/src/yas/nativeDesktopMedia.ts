@@ -493,6 +493,7 @@ export class YasNativeDesktopClientLifecycle {
         queueDepth: 0,
         desiredCreditFrames: MEDIA_OUTPUT_CREDIT,
       });
+      this.options.audioPlayer.setSubscribed(true);
     });
   }
 

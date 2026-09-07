@@ -69,6 +69,16 @@ struct SpaCallbacks {
     data: *mut c_void,
 }
 
+/// The public SPA interface prefix embedded at the start of PipeWire proxy
+/// objects.  PipeWire's generated convenience methods dispatch through this
+/// table when the corresponding wrapper is not exported by libpipewire.
+#[repr(C)]
+struct SpaInterface {
+    type_: *const c_char,
+    version: u32,
+    callbacks: SpaCallbacks,
+}
+
 #[repr(C)]
 struct SpaHook {
     link: SpaList,
@@ -301,6 +311,146 @@ type FnPwPropertiesSet =
     unsafe extern "C" fn(*mut PwProperties, *const c_char, *const c_char) -> c_int;
 type FnPwPropertiesGet = unsafe extern "C" fn(*const PwProperties, *const c_char) -> *const c_char;
 
+// PipeWire kept these API entry points as `static inline` header methods until
+// 1.x, so distributions such as Debian Bookworm (0.3.65) do not export them.
+// Their ABI is the stable SPA interface method table.  Keep local equivalents
+// for those libraries while preferring real exported wrappers when present.
+#[repr(C)]
+struct PwCoreMethods {
+    version: u32,
+    add_listener: Option<
+        unsafe extern "C" fn(*mut c_void, *mut SpaHook, *const PwCoreEvents, *mut c_void) -> c_int,
+    >,
+    hello: *const c_void,
+    sync: *const c_void,
+    pong: *const c_void,
+    error: *const c_void,
+    get_registry: Option<unsafe extern "C" fn(*mut c_void, u32, usize) -> *mut PwRegistry>,
+    create_object: *const c_void,
+    destroy: *const c_void,
+}
+
+#[repr(C)]
+struct PwRegistryMethods {
+    version: u32,
+    add_listener: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut SpaHook,
+            *const PwRegistryEvents,
+            *mut c_void,
+        ) -> c_int,
+    >,
+    bind: Option<unsafe extern "C" fn(*mut c_void, u32, *const c_char, u32, usize) -> *mut c_void>,
+    destroy: *const c_void,
+}
+
+#[repr(C)]
+struct PwNodeMethods {
+    version: u32,
+    add_listener: *const c_void,
+    subscribe_params: *const c_void,
+    enum_params: *const c_void,
+    set_param: Option<unsafe extern "C" fn(*mut c_void, u32, u32, *const c_void) -> c_int>,
+    send_command: *const c_void,
+}
+
+/// Return an interface's method table and the implementation object passed as
+/// the first method argument. This is the expansion of `spa_api_method_r` for
+/// version-zero PipeWire interfaces.
+unsafe fn interface_methods<T>(object: *mut c_void) -> Option<(*const T, *mut c_void)> {
+    if object.is_null() {
+        return None;
+    }
+    let interface = unsafe { &*object.cast::<SpaInterface>() };
+    (!interface.callbacks.funcs.is_null()).then_some((
+        interface.callbacks.funcs.cast::<T>(),
+        interface.callbacks.data,
+    ))
+}
+
+unsafe extern "C" fn inline_pw_core_add_listener(
+    core: *mut PwCore,
+    listener: *mut SpaHook,
+    events: *const PwCoreEvents,
+    data: *mut c_void,
+) -> c_int {
+    let Some((methods, object)) = (unsafe { interface_methods::<PwCoreMethods>(core.cast()) })
+    else {
+        return -libc::ENOTSUP;
+    };
+    let Some(method) = (unsafe { (*methods).add_listener }) else {
+        return -libc::ENOTSUP;
+    };
+    unsafe { method(object, listener, events, data) }
+}
+
+unsafe extern "C" fn inline_pw_core_get_registry(
+    core: *mut PwCore,
+    version: u32,
+    user_data_size: usize,
+) -> *mut PwRegistry {
+    let Some((methods, object)) = (unsafe { interface_methods::<PwCoreMethods>(core.cast()) })
+    else {
+        return ptr::null_mut();
+    };
+    let Some(method) = (unsafe { (*methods).get_registry }) else {
+        return ptr::null_mut();
+    };
+    unsafe { method(object, version, user_data_size) }
+}
+
+unsafe extern "C" fn inline_pw_registry_add_listener(
+    registry: *mut PwRegistry,
+    listener: *mut SpaHook,
+    events: *const PwRegistryEvents,
+    data: *mut c_void,
+) -> c_int {
+    let Some((methods, object)) =
+        (unsafe { interface_methods::<PwRegistryMethods>(registry.cast()) })
+    else {
+        return -libc::ENOTSUP;
+    };
+    let Some(method) = (unsafe { (*methods).add_listener }) else {
+        return -libc::ENOTSUP;
+    };
+    unsafe { method(object, listener, events, data) }
+}
+
+unsafe extern "C" fn inline_pw_registry_bind(
+    registry: *mut PwRegistry,
+    id: u32,
+    type_: *const c_char,
+    version: u32,
+    user_data_size: usize,
+) -> *mut c_void {
+    let Some((methods, object)) =
+        (unsafe { interface_methods::<PwRegistryMethods>(registry.cast()) })
+    else {
+        return ptr::null_mut();
+    };
+    let Some(method) = (unsafe { (*methods).bind }) else {
+        return ptr::null_mut();
+    };
+    unsafe { method(object, id, type_, version, user_data_size) }
+}
+
+unsafe extern "C" fn inline_pw_node_set_param(
+    node: *mut PwNode,
+    id: u32,
+    flags: u32,
+    param: *const c_void,
+) -> c_int {
+    let Some((methods, object)) = (unsafe { interface_methods::<PwNodeMethods>(node.cast()) })
+    else {
+        return -libc::ENOTSUP;
+    };
+    let Some(method) = (unsafe { (*methods).set_param }) else {
+        return -libc::ENOTSUP;
+    };
+    unsafe { method(object, id, flags, param) }
+}
+
 struct Syms {
     pw_init: FnPwInit,
     pw_thread_loop_new: FnPwThreadLoopNew,
@@ -406,6 +556,19 @@ fn syms() -> Option<&'static Syms> {
                 }};
             }
 
+            macro_rules! sym_or_inline {
+                ($name:literal, $ty:ty, $fallback:expr) => {{
+                    let cname = CString::new($name).ok()?;
+                    let ptr = dlsym(handle, cname.as_ptr());
+                    if ptr.is_null() {
+                        let fallback: $ty = $fallback;
+                        fallback
+                    } else {
+                        std::mem::transmute::<*mut c_void, $ty>(ptr)
+                    }
+                }};
+            }
+
             let syms = Syms {
                 pw_init: sym!("pw_init", FnPwInit),
                 pw_deinit: sym!("pw_deinit", FnPwDeinit),
@@ -430,11 +593,31 @@ fn syms() -> Option<&'static Syms> {
                 pw_stream_get_node_id: sym!("pw_stream_get_node_id", FnPwStreamGetNodeId),
                 pw_stream_get_properties: sym!("pw_stream_get_properties", FnPwStreamGetProperties),
                 pw_stream_get_core: sym!("pw_stream_get_core", FnPwStreamGetCore),
-                pw_core_add_listener: sym!("pw_core_add_listener", FnPwCoreAddListener),
-                pw_core_get_registry: sym!("pw_core_get_registry", FnPwCoreGetRegistry),
-                pw_registry_add_listener: sym!("pw_registry_add_listener", FnPwRegistryAddListener),
-                pw_registry_bind: sym!("pw_registry_bind", FnPwRegistryBind),
-                pw_node_set_param: sym!("pw_node_set_param", FnPwNodeSetParam),
+                pw_core_add_listener: sym_or_inline!(
+                    "pw_core_add_listener",
+                    FnPwCoreAddListener,
+                    inline_pw_core_add_listener
+                ),
+                pw_core_get_registry: sym_or_inline!(
+                    "pw_core_get_registry",
+                    FnPwCoreGetRegistry,
+                    inline_pw_core_get_registry
+                ),
+                pw_registry_add_listener: sym_or_inline!(
+                    "pw_registry_add_listener",
+                    FnPwRegistryAddListener,
+                    inline_pw_registry_add_listener
+                ),
+                pw_registry_bind: sym_or_inline!(
+                    "pw_registry_bind",
+                    FnPwRegistryBind,
+                    inline_pw_registry_bind
+                ),
+                pw_node_set_param: sym_or_inline!(
+                    "pw_node_set_param",
+                    FnPwNodeSetParam,
+                    inline_pw_node_set_param
+                ),
                 pw_proxy_destroy: sym!("pw_proxy_destroy", FnPwProxyDestroy),
                 pw_properties_new: sym!("pw_properties_new", FnPwPropertiesNew),
                 pw_properties_set: sym!("pw_properties_set", FnPwPropertiesSet),
@@ -2101,6 +2284,162 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
+
+    #[derive(Default)]
+    struct InlineMethodCalls {
+        core_listener: usize,
+        registry_listener: usize,
+        bound_id: u32,
+        node_param: u32,
+    }
+
+    unsafe extern "C" fn fake_core_add_listener(
+        data: *mut c_void,
+        _listener: *mut SpaHook,
+        _events: *const PwCoreEvents,
+        _event_data: *mut c_void,
+    ) -> c_int {
+        unsafe { (*data.cast::<InlineMethodCalls>()).core_listener += 1 };
+        11
+    }
+
+    unsafe extern "C" fn fake_core_get_registry(
+        _data: *mut c_void,
+        version: u32,
+        user_data_size: usize,
+    ) -> *mut PwRegistry {
+        assert_eq!(version, PW_VERSION_REGISTRY);
+        assert_eq!(user_data_size, 0);
+        0x1234usize as *mut PwRegistry
+    }
+
+    unsafe extern "C" fn fake_registry_add_listener(
+        data: *mut c_void,
+        _listener: *mut SpaHook,
+        _events: *const PwRegistryEvents,
+        _event_data: *mut c_void,
+    ) -> c_int {
+        unsafe { (*data.cast::<InlineMethodCalls>()).registry_listener += 1 };
+        12
+    }
+
+    unsafe extern "C" fn fake_registry_bind(
+        data: *mut c_void,
+        id: u32,
+        _type: *const c_char,
+        version: u32,
+        user_data_size: usize,
+    ) -> *mut c_void {
+        assert_eq!(version, PW_VERSION_NODE);
+        assert_eq!(user_data_size, 0);
+        unsafe { (*data.cast::<InlineMethodCalls>()).bound_id = id };
+        0x5678usize as *mut c_void
+    }
+
+    unsafe extern "C" fn fake_node_set_param(
+        data: *mut c_void,
+        id: u32,
+        flags: u32,
+        _param: *const c_void,
+    ) -> c_int {
+        assert_eq!(flags, 0);
+        unsafe { (*data.cast::<InlineMethodCalls>()).node_param = id };
+        13
+    }
+
+    #[test]
+    fn inline_pipewire_api_dispatches_through_spa_interfaces() {
+        let mut calls = InlineMethodCalls::default();
+        let data = (&mut calls as *mut InlineMethodCalls).cast();
+        let core_methods = PwCoreMethods {
+            version: 0,
+            add_listener: Some(fake_core_add_listener),
+            hello: ptr::null(),
+            sync: ptr::null(),
+            pong: ptr::null(),
+            error: ptr::null(),
+            get_registry: Some(fake_core_get_registry),
+            create_object: ptr::null(),
+            destroy: ptr::null(),
+        };
+        let registry_methods = PwRegistryMethods {
+            version: 0,
+            add_listener: Some(fake_registry_add_listener),
+            bind: Some(fake_registry_bind),
+            destroy: ptr::null(),
+        };
+        let node_methods = PwNodeMethods {
+            version: 0,
+            add_listener: ptr::null(),
+            subscribe_params: ptr::null(),
+            enum_params: ptr::null(),
+            set_param: Some(fake_node_set_param),
+            send_command: ptr::null(),
+        };
+        let interface = |methods: *const c_void| SpaInterface {
+            type_: ptr::null(),
+            version: 0,
+            callbacks: SpaCallbacks {
+                funcs: methods,
+                data,
+            },
+        };
+        let mut core = interface((&core_methods as *const PwCoreMethods).cast());
+        let mut registry = interface((&registry_methods as *const PwRegistryMethods).cast());
+        let mut node = interface((&node_methods as *const PwNodeMethods).cast());
+
+        unsafe {
+            assert_eq!(
+                inline_pw_core_add_listener(
+                    (&mut core as *mut SpaInterface).cast(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
+                11
+            );
+            assert_eq!(
+                inline_pw_core_get_registry(
+                    (&mut core as *mut SpaInterface).cast(),
+                    PW_VERSION_REGISTRY,
+                    0,
+                ) as usize,
+                0x1234
+            );
+            assert_eq!(
+                inline_pw_registry_add_listener(
+                    (&mut registry as *mut SpaInterface).cast(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
+                12
+            );
+            assert_eq!(
+                inline_pw_registry_bind(
+                    (&mut registry as *mut SpaInterface).cast(),
+                    42,
+                    ptr::null(),
+                    PW_VERSION_NODE,
+                    0,
+                ) as usize,
+                0x5678
+            );
+            assert_eq!(
+                inline_pw_node_set_param(
+                    (&mut node as *mut SpaInterface).cast(),
+                    SPA_PARAM_PROCESS_LATENCY,
+                    0,
+                    ptr::null(),
+                ),
+                13
+            );
+        }
+        assert_eq!(calls.core_listener, 1);
+        assert_eq!(calls.registry_listener, 1);
+        assert_eq!(calls.bound_id, 42);
+        assert_eq!(calls.node_param, SPA_PARAM_PROCESS_LATENCY);
+    }
 
     struct TestPipeWire {
         child: Child,

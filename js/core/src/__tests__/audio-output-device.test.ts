@@ -159,6 +159,15 @@ describe("re-selecting the current output device", () => {
     player.destroy();
   });
 
+  it("does not reset a rebuilt context that already uses the default", () => {
+    const { player, sinks } = sinkRig();
+    void (
+      player as unknown as { applyOutputDevice(): Promise<void> }
+    ).applyOutputDevice();
+    expect(sinks).toEqual([]);
+    player.destroy();
+  });
+
   it("still applies a genuine change, once", () => {
     const { player, sinks } = sinkRig();
     player.setOutputDevice("headset");
@@ -184,6 +193,9 @@ describe("re-selecting the current output device", () => {
     const { player, sinks } = sinkRig();
     player.setOutputDevice("headset");
     sinks.length = 0;
+    // teardownAudioContext records that the replacement context is back on
+    // the default before initAudioContext restores the remembered choice.
+    (player as unknown as { _sinkDeviceId: string })._sinkDeviceId = "";
     void (
       player as unknown as { applyOutputDevice(): Promise<void> }
     ).applyOutputDevice();

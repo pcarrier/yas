@@ -715,7 +715,9 @@ impl AudioPipeline {
                     "yas-audio-loopback",
                     "--channels",
                     "2",
-                    "--channel-map",
+                    // PipeWire 0.3.65 advertises the long option but only
+                    // accepts its stable short spelling.
+                    "-m",
                     "[ FL FR ]",
                     "--capture-props",
                     "node.name=yas-sink node.nick=Output node.description=Output media.class=Audio/Sink audio.position=[ FL FR ]",

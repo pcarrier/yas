@@ -992,6 +992,10 @@ export class AudioPlayer {
       | null;
     if (!ctx?.setSinkId) return;
     const requested = this._outputDeviceId;
+    // Internal callers restore the remembered choice after rebuilding the
+    // context. The default context is already on `""`; asking Chromium to set
+    // it there again emits `sinkchange` and can immediately reset the graph.
+    if (requested === this._sinkDeviceId) return;
     this._sinkDeviceId = requested;
     try {
       await ctx.setSinkId(requested);

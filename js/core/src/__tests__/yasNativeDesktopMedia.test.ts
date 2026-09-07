@@ -5,7 +5,10 @@ import { YasFontCatalog, YasFontClient } from "../yas/font";
 import {
   YAS_FAMILY_MEDIA,
   YAS_MEDIA_CODEC_OPUS,
+  YAS_MEDIA_DEVICE_AVAILABLE,
   YAS_MEDIA_FRAME,
+  YAS_MEDIA_KIND_AUDIO_OUTPUT,
+  YAS_MEDIA_WIRE_SAMPLE_RATE,
 } from "../yas/generated";
 import {
   YasMediaCatalog,
@@ -62,6 +65,77 @@ function lifecycleWith(
 }
 
 describe("YasNativeDesktopClientLifecycle", () => {
+  it("marks a successfully opened audio output subscribed until close", async () => {
+    const format = {
+      codec: YAS_MEDIA_CODEC_OPUS,
+      channels: 2,
+      sampleRate: YAS_MEDIA_WIRE_SAMPLE_RATE,
+      width: 0,
+      height: 0,
+      frameRateMilli: 0,
+      extensions: [],
+    };
+    let subscribed = false;
+    const audioPlayer = {
+      reset: vi.fn(() => {
+        subscribed = false;
+      }),
+      setSubscribed: vi.fn((value: boolean) => {
+        subscribed = value;
+      }),
+    };
+    const media = {
+      openOutput: vi.fn().mockResolvedValue({
+        streamHandle: 9n,
+        selectedFormat: format,
+      }),
+      closeStream: vi.fn().mockResolvedValue(undefined),
+      sendFrameAck: vi.fn(),
+    };
+    const lifecycle = lifecycleWith(null, null, media);
+    Reflect.deleteProperty(lifecycle, "sendAudioUnsubscribe");
+    Object.assign(lifecycle as object, {
+      audioOutput: null,
+      audioOutputGeneration: 0,
+      pendingAudioOperation: null,
+      audioOutputDrain: null,
+      desiredAudioBitrate: null,
+      mediaSnapshot: {
+        revision: 1n,
+        devices: [
+          {
+            kind: "device",
+            deviceHandle: 7n,
+            revision: 1n,
+            deviceKind: YAS_MEDIA_KIND_AUDIO_OUTPUT,
+            state: YAS_MEDIA_DEVICE_AVAILABLE,
+            flags: 0,
+            name: "Output",
+            formats: [format],
+            extensions: [],
+          },
+        ],
+        leases: [],
+        portals: [],
+        players: [],
+      },
+      options: {
+        audioPlayer,
+      },
+    });
+
+    lifecycle.sendAudioSubscribe(64);
+    await flush();
+    expect(media.openOutput).toHaveBeenCalledOnce();
+    expect(audioPlayer.setSubscribed).toHaveBeenCalledWith(true);
+    expect(subscribed).toBe(true);
+
+    lifecycle.sendAudioUnsubscribe();
+    await flush();
+    expect(media.closeStream).toHaveBeenCalledOnce();
+    expect(subscribed).toBe(false);
+  });
+
   it("cleans WATCHes that settle after invalidated disposal", async () => {
     let resolveWatches!: () => void;
     const watchesSettled = new Promise<void>((resolve) => {
