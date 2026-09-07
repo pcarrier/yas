@@ -44,12 +44,12 @@
   "env": {
     "YAS_SERVER_NAME": "${INSTANCE}",
     "YAS_EDGE": "1",
+    "YAS_SHARE": "1",
     "YAS_ADDR": "127.0.0.1:${PORTS+1}",
     "YAS_WEBTRANSPORT": "1",
     "YAS_WEBTRANSPORT_ADDR": "127.0.0.1:${PORTS+1}",
     "YAS_WEBTRANSPORT_PUBLIC_PORT": "${PORTS+1}",
-    "YAS_CORS": "*",
-    "YAS_FONT_EXPORT": "1"
+    "YAS_CORS": "*"
   },
   "readyWhen": { "http": "http://127.0.0.1:${PORTS+1}/" },
   "timeoutStart": "10m",

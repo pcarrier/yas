@@ -1,6 +1,6 @@
 [package]
 name = "yas-compositor"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "yas headless Wayland compositor"
 license.workspace = true
