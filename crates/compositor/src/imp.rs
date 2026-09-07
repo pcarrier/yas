@@ -17,7 +17,7 @@ use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use calloop::generic::Generic;
@@ -726,15 +726,12 @@ pub enum CompositorEvent {
         logical_width: u16,
         logical_height: u16,
     },
-    ClipboardContent {
-        mime_type: String,
-        data: Vec<u8>,
-    },
     /// Clipboard authority changed.  Browser clients use this to decide
     /// whether Ctrl/Cmd+V should import the host clipboard or preserve a
     /// Wayland client's multi-MIME selection for a direct client splice.
     ClipboardOwner {
         wayland: bool,
+        generation: u64,
         mime_types: Vec<String>,
     },
     SurfaceCursor {
@@ -991,6 +988,7 @@ pub enum CompositorCommand {
     },
     /// Read clipboard content for a specific MIME type.
     ClipboardGet {
+        generation: u64,
         mime_type: String,
         reply: mpsc::SyncSender<Option<Vec<u8>>>,
     },
@@ -1849,6 +1847,94 @@ struct ExternalClipboard {
 
 const MAX_CLIPBOARD_READ_BYTES: usize = 8 * 1024 * 1024;
 const CLIPBOARD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+const CLIPBOARD_READ_QUEUE: usize = 16;
+const CLIPBOARD_READ_WORKERS: usize = 2;
+
+struct ClipboardReadJob {
+    read_fd: OwnedFd,
+    generation: u64,
+    reply: mpsc::SyncSender<Option<Vec<u8>>>,
+}
+
+fn spawn_clipboard_reader(
+    current_generation: Arc<AtomicU64>,
+) -> mpsc::SyncSender<ClipboardReadJob> {
+    let (jobs, pending) = mpsc::sync_channel::<ClipboardReadJob>(CLIPBOARD_READ_QUEUE);
+    let pending = Arc::new(std::sync::Mutex::new(pending));
+    for worker in 0..CLIPBOARD_READ_WORKERS {
+        let pending = Arc::clone(&pending);
+        let current_generation = Arc::clone(&current_generation);
+        std::thread::Builder::new()
+            .name(format!("compositor-clipboard-reader-{worker}"))
+            .spawn(move || {
+                loop {
+                    let job = match pending.lock() {
+                        Ok(pending) => pending.recv(),
+                        Err(poisoned) => poisoned.into_inner().recv(),
+                    };
+                    let Ok(job) = job else { break };
+                    let bytes = (current_generation.load(Ordering::Acquire) == job.generation)
+                        .then(|| read_clipboard_fd(job.read_fd))
+                        .flatten()
+                        .filter(|_| current_generation.load(Ordering::Acquire) == job.generation);
+                    let _ = job.reply.send(bytes);
+                }
+            })
+            .expect("failed to spawn compositor clipboard reader");
+    }
+    jobs
+}
+
+fn read_clipboard_fd(read_fd: OwnedFd) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + CLIPBOARD_READ_TIMEOUT;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = unsafe {
+            libc::read(
+                read_fd.as_raw_fd(),
+                tmp.as_mut_ptr() as *mut libc::c_void,
+                tmp.len(),
+            )
+        };
+        if n > 0 {
+            let n = n as usize;
+            if buf.len().saturating_add(n) > MAX_CLIPBOARD_READ_BYTES {
+                return None;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            continue;
+        }
+        if n == 0 {
+            return Some(buf);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let remaining = deadline.duration_since(now);
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut poll_fd = libc::pollfd {
+            fd: read_fd.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready == 0 {
+            return None;
+        }
+        if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+}
 
 impl ExternalClipboard {
     /// Whether this selection answers to `mime_type`.
@@ -2531,6 +2617,13 @@ struct Compositor {
     selection_source: Option<WlDataSource>,
     /// External clipboard data offered from the browser or CLI.
     external_clipboard: Option<ExternalClipboard>,
+    /// Changes on every clipboard authority transition. Lazy reads carry the
+    /// generation they catalogued so a replacement source cannot answer an
+    /// older Selection revision.
+    clipboard_generation: Arc<AtomicU64>,
+    /// Bounded worker lane for Wayland source pipes. Reading an unresponsive
+    /// client must never block frame and input dispatch on this thread.
+    clipboard_read_tx: mpsc::SyncSender<ClipboardReadJob>,
     /// Browser-initiated drag session in flight, if any.
     drag: Option<DragSessionState>,
     /// Client-initiated drag session in flight, if any.  While one is
@@ -6358,9 +6451,12 @@ impl Compositor {
                 let mimes = self.collect_clipboard_mime_types();
                 let _ = reply.send(mimes);
             }
-            CompositorCommand::ClipboardGet { mime_type, reply } => {
-                let data = self.get_clipboard_content(&mime_type);
-                let _ = reply.send(data);
+            CompositorCommand::ClipboardGet {
+                generation,
+                mime_type,
+                reply,
+            } => {
+                self.begin_clipboard_get(generation, &mime_type, reply);
             }
             CompositorCommand::SetExternalOutputBuffers {
                 surface_id,
@@ -7116,97 +7212,65 @@ impl Compositor {
     /// native clients without eagerly copying every representation.
     fn emit_clipboard_owner(&self) {
         let wayland = self.selection_source.is_some();
+        let generation = self
+            .clipboard_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
         let mime_types = self.collect_clipboard_mime_types();
         let _ = self.event_tx.send(CompositorEvent::ClipboardOwner {
             wayland,
+            generation,
             mime_types,
         });
         (self.event_notify)();
     }
 
-    /// Get clipboard content for a specific MIME type.
-    fn get_clipboard_content(&mut self, mime_type: &str) -> Option<Vec<u8>> {
-        // If external clipboard matches, return its data directly.
+    /// Begin a generation-pinned clipboard read. Requesting bytes from the
+    /// Wayland source happens on the compositor thread, but waiting for its
+    /// pipe happens on the bounded clipboard worker.
+    fn begin_clipboard_get(
+        &mut self,
+        generation: u64,
+        mime_type: &str,
+        reply: mpsc::SyncSender<Option<Vec<u8>>>,
+    ) {
+        if self.clipboard_generation.load(Ordering::Acquire) != generation {
+            let _ = reply.send(None);
+            return;
+        }
         if let Some(ref cb) = self.external_clipboard
             && self.selection_source.is_none()
         {
-            // External clipboard is active.
-            return cb.data(mime_type).map(ToOwned::to_owned);
+            let _ = reply.send(cb.data(mime_type).map(ToOwned::to_owned));
+            return;
         }
-        // If a Wayland app owns the selection, read from it via pipe.
-        if let Some(src) = self.selection_source.clone() {
-            return self.read_data_source_sync(&src, mime_type);
-        }
-        None
-    }
-
-    /// Synchronously read data from a Wayland data source via pipe.
-    fn read_data_source_sync(&mut self, source: &WlDataSource, mime_type: &str) -> Option<Vec<u8>> {
+        let Some(source) = self.selection_source.clone() else {
+            let _ = reply.send(None);
+            return;
+        };
         let mut fds = [0i32; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return None;
+            let _ = reply.send(None);
+            return;
         }
         let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         source.send(mime_type.to_string(), write_fd.as_fd());
         let _ = self.display_handle.flush_clients();
         drop(write_fd); // close write end so read gets EOF
-        // Keep the compositor responsive to a source that never answers, but
-        // do not assume the client can service wl_data_source.send within one
-        // scheduler tick. In particular Chromium commonly takes longer than
-        // the old fixed 5 ms delay on a busy remote desktop.
         unsafe {
             libc::fcntl(read_fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
         }
-        let deadline = std::time::Instant::now() + CLIPBOARD_READ_TIMEOUT;
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 8192];
-        loop {
-            let n = unsafe {
-                libc::read(
-                    read_fd.as_raw_fd(),
-                    tmp.as_mut_ptr() as *mut libc::c_void,
-                    tmp.len(),
-                )
+        let job = ClipboardReadJob {
+            read_fd,
+            generation,
+            reply,
+        };
+        if let Err(error) = self.clipboard_read_tx.try_send(job) {
+            let job = match error {
+                mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job) => job,
             };
-            if n > 0 {
-                let n = n as usize;
-                if buf.len().saturating_add(n) > MAX_CLIPBOARD_READ_BYTES {
-                    return None;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-                continue;
-            }
-            if n == 0 {
-                return Some(buf);
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            if error.kind() != std::io::ErrorKind::WouldBlock {
-                return None;
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            let remaining = deadline.duration_since(now);
-            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
-            let mut poll_fd = libc::pollfd {
-                fd: read_fd.as_raw_fd(),
-                events: libc::POLLIN | libc::POLLHUP,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-            if ready == 0 {
-                return None;
-            }
-            if ready < 0
-                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
-                return None;
-            }
+            let _ = job.reply.send(None);
         }
     }
 }
@@ -10123,23 +10187,6 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                 state.selection_source = source.clone();
                 state.offer_clipboard_selection();
                 state.emit_clipboard_owner();
-                // Try to read text content and emit an event.
-                if let Some(ref src) = source {
-                    let data = src.data::<DataSourceData>().unwrap();
-                    let mimes = data.mime_types.lock().unwrap();
-                    let text_mime = mimes
-                        .iter()
-                        .find(|m| {
-                            m.as_str() == "text/plain;charset=utf-8"
-                                || m.as_str() == "text/plain"
-                                || m.as_str() == "UTF8_STRING"
-                        })
-                        .cloned();
-                    drop(mimes);
-                    if let Some(mime) = text_mime {
-                        state.read_data_source_and_emit(src, &mime);
-                    }
-                }
             }
             Request::StartDrag {
                 source,
@@ -10602,50 +10649,6 @@ impl Dispatch<WlDataOffer, DataOfferData> for Compositor {
 }
 
 impl Compositor {
-    /// Create a pipe, ask the data source to write into it, read the result,
-    /// and emit a `ClipboardContent` event.
-    fn read_data_source_and_emit(&mut self, source: &WlDataSource, mime_type: &str) {
-        let mut fds = [0i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return;
-        }
-        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        source.send(mime_type.to_string(), write_fd.as_fd());
-        let _ = self.display_handle.flush_clients();
-        // Non-blocking read with a modest limit.
-        unsafe {
-            libc::fcntl(read_fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
-        }
-        // Give the client a moment to write.
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 8192];
-        loop {
-            let n = unsafe {
-                libc::read(
-                    read_fd.as_raw_fd(),
-                    tmp.as_mut_ptr() as *mut libc::c_void,
-                    tmp.len(),
-                )
-            };
-            if n <= 0 {
-                break;
-            }
-            buf.extend_from_slice(&tmp[..n as usize]);
-            if buf.len() > 1024 * 1024 {
-                break; // 1 MiB cap
-            }
-        }
-        if !buf.is_empty() {
-            let _ = self.event_tx.send(CompositorEvent::ClipboardContent {
-                mime_type: mime_type.to_string(),
-                data: buf,
-            });
-            (self.event_notify)();
-        }
-    }
-
     /// Hand the current clipboard selection to one data device, or clear it.
     /// External selections are served from pinned bytes; Wayland-client
     /// selections are fd-spliced directly back to their source.
@@ -12521,6 +12524,8 @@ fn run_compositor(
     let _ = signal_tx.send(loop_signal.clone());
 
     let cleanup_needed = Arc::new(AtomicBool::new(false));
+    let clipboard_generation = Arc::new(AtomicU64::new(0));
+    let clipboard_read_tx = spawn_clipboard_reader(Arc::clone(&clipboard_generation));
     let mut compositor = Compositor {
         display_handle: dh,
         cleanup_needed: Arc::clone(&cleanup_needed),
@@ -12594,6 +12599,8 @@ fn run_compositor(
         data_devices: Vec::new(),
         selection_source: None,
         external_clipboard: None,
+        clipboard_generation,
+        clipboard_read_tx,
         drag: None,
         client_drag: None,
         toplevel_drags: Vec::new(),

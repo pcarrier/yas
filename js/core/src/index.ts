@@ -1,6 +1,7 @@
 export { YasWorkspace, consoleLogger, nullLogger } from "./YasWorkspace";
 export type { YasLogger, YasWorkspaceConnection } from "./YasWorkspace";
 export { YasNativeWorkspaceConnection } from "./YasNativeWorkspaceConnection";
+export { noteBrowserClipboardMayHaveChanged } from "./clipboardAuthority";
 export { YasNativeRelayTransport } from "./yas/nativeRelayTransport";
 export { YasActivityStore } from "./activity";
 export type {

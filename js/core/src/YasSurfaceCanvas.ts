@@ -878,6 +878,7 @@ function textPayload(text: string): ClipboardPayload {
  * anything above it is not suitable for an inline paste.
  */
 const MAX_CLIPBOARD_BYTES = 8 * 1024 * 1024;
+const CLIPBOARD_OPERATION_TIMEOUT_MS = 10_000;
 
 /**
  * The page's text selection as a payload, or null when there is none.
@@ -1542,11 +1543,16 @@ export class YasSurfaceCanvas {
     | null = null;
   /** Stand the in-flight chord down without pressing V, releasing anything
    *  the deferral held back.  Runs when the clipboard is known to hold
-   *  nothing pastable, when an image we declined is all it held, or when
-   *  focus leaves mid-chord.  No timer: every clipboard read is a promise
-   *  that settles, and the paste event is dispatched with the keydown, so
-   *  the chord's outcome is always decided by an event, never guessed. */
+   *  nothing pastable, when an image we declined is all it held, when focus
+   *  leaves mid-chord, or when a browser permission promise never settles. */
   private _pendingPasteAbandon: (() => void) | null = null;
+  private _pendingPasteTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A browser PRIMARY offer must commit before its middle-button press. The
+   * matching release chains behind the same barrier so it cannot overtake. */
+  private primaryPointerBarrier: Promise<boolean> | null = null;
+  /** Invalidates delayed PRIMARY pointer callbacks on blur or teardown without
+   * treating a subsequent middle click as cancellation of an earlier one. */
+  private primaryPointerGeneration = 0;
 
   // scroll batching; see queueScroll()
   private scrollAccum: {
@@ -1624,7 +1630,6 @@ export class YasSurfaceCanvas {
   private boundDocumentPaste: ((e: ClipboardEvent) => void) | null = null;
   private boundWindowBlur: (() => void) | null = null;
   private boundDocumentVisibilityChange: (() => void) | null = null;
-  private boundBrowserClipboardChange: (() => void) | null = null;
   private boundDragEnter: ((e: DragEvent) => void) | null = null;
   private boundDragOver: ((e: DragEvent) => void) | null = null;
   private boundDragLeave: ((e: DragEvent) => void) | null = null;
@@ -2912,7 +2917,6 @@ export class YasSurfaceCanvas {
     // reliable key-state boundary.  Release here as well: app/tab switching
     // commonly consumes the modifier key-up that completed the switch.
     this.boundWindowBlur = () => {
-      this.getConn()?.noteBrowserClipboardMayHaveChanged?.();
       this.compositionActive = false;
       this._pendingPasteAbandon?.();
       this.releaseAllKeys();
@@ -2933,9 +2937,6 @@ export class YasSurfaceCanvas {
         this.sendPointerLeave();
       }
     };
-    this.boundBrowserClipboardChange = () =>
-      this.getConn()?.noteBrowserClipboardMayHaveChanged();
-
     canvas.addEventListener("mousedown", this.boundMouseDown);
     canvas.addEventListener("mouseup", this.boundMouseUp);
     canvas.addEventListener("mousemove", this.boundMouseMove);
@@ -2971,8 +2972,6 @@ export class YasSurfaceCanvas {
       "visibilitychange",
       this.boundDocumentVisibilityChange,
     );
-    document.addEventListener("copy", this.boundBrowserClipboardChange, true);
-    document.addEventListener("cut", this.boundBrowserClipboardChange, true);
 
     // OS drag-and-drop onto the surface.  Drags that carry only custom
     // MIMEs (pane/tile moves inside the page) are not ours: the handlers
@@ -3107,18 +3106,6 @@ export class YasSurfaceCanvas {
         this.boundDocumentVisibilityChange,
       );
     }
-    if (this.boundBrowserClipboardChange) {
-      document.removeEventListener(
-        "copy",
-        this.boundBrowserClipboardChange,
-        true,
-      );
-      document.removeEventListener(
-        "cut",
-        this.boundBrowserClipboardChange,
-        true,
-      );
-    }
     if (this.boundDragEnter)
       canvas.removeEventListener("dragenter", this.boundDragEnter);
     if (this.boundDragOver)
@@ -3148,6 +3135,12 @@ export class YasSurfaceCanvas {
     this._pendingPaste = null;
     this._pendingPasteFlush = null;
     this._pendingPasteAbandon = null;
+    if (this._pendingPasteTimer !== null) {
+      clearTimeout(this._pendingPasteTimer);
+      this._pendingPasteTimer = null;
+    }
+    this.primaryPointerBarrier = null;
+    this.primaryPointerGeneration += 1;
     if (this._iosInputRepadTimer !== null) {
       clearTimeout(this._iosInputRepadTimer);
       this._iosInputRepadTimer = null;
@@ -3193,15 +3186,9 @@ export class YasSurfaceCanvas {
     // focus that a left press brings, and `contextmenu` is cancelled
     // separately so a right press is already harmless.
     if (e.button === 1 || e.button >= 3) e.preventDefault();
-    // Hand PRIMARY over on the press that pastes it, the way the clipboard
-    // is pushed on paste rather than on copy. The compositor serves these
-    // bytes itself, so owning the selection continuously would displace
-    // whichever Wayland client the user last selected text in — including
-    // when they middle-click with nothing selected here, which has to keep
-    // pasting that client's selection. Ordering holds because both
-    // messages ride the same connection, and the compositor advertises the
-    // offer before it delivers the button.
-    if (primary) this.getConn()?.sendPrimary(primary.mime, primary.data);
+    // Hand PRIMARY over on the press that pastes it, rather than continuously
+    // displacing whichever Wayland client last selected text. Large values
+    // use a staged Transfer, so the button must wait for the commit result.
     // Ctrl+click and Shift+click are chords too, and the app hears a modifier
     // only from that modifier's own key press — one that never reached this
     // canvas if the key went down before the canvas had focus.  Focus has to
@@ -3241,15 +3228,55 @@ export class YasSurfaceCanvas {
       }
       this.syncModifiers(e, conn);
     }
-    this.sendPointerAt(
-      e.clientX,
-      e.clientY,
-      type,
-      e.button,
-      e.timeStamp,
-      geometry,
-      remoteFocusReady,
-    );
+    const clientX = e.clientX;
+    const clientY = e.clientY;
+    const button = e.button;
+    const timeStamp = e.timeStamp;
+    const surfaceId = this._surfaceId;
+    const sendPointer = () => {
+      if (this.getConn() !== conn || this._surfaceId !== surfaceId) return;
+      this.sendPointerAt(
+        clientX,
+        clientY,
+        type,
+        button,
+        timeStamp,
+        geometry,
+        remoteFocusReady,
+      );
+    };
+    if (primary && conn) {
+      const generation = this.primaryPointerGeneration;
+      const barrier = conn.sendPrimary(primary.mime, primary.data).then(
+        () => true,
+        (error) => {
+          console.warn("YAS: failed to publish PRIMARY before paste", error);
+          return false;
+        },
+      );
+      this.primaryPointerBarrier = barrier;
+      void barrier.then((published) => {
+        if (this.primaryPointerGeneration === generation && published)
+          sendPointer();
+      });
+      return;
+    }
+    if (
+      button === 1 &&
+      type === SURFACE_POINTER_UP &&
+      this.primaryPointerBarrier
+    ) {
+      const barrier = this.primaryPointerBarrier;
+      const generation = this.primaryPointerGeneration;
+      void barrier.then((published) => {
+        if (this.primaryPointerGeneration !== generation) return;
+        if (this.primaryPointerBarrier === barrier)
+          this.primaryPointerBarrier = null;
+        if (published) sendPointer();
+      });
+      return;
+    }
+    sendPointer();
     if (
       type === SURFACE_POINTER_DOWN &&
       e.button === 0 &&
@@ -4903,7 +4930,13 @@ export class YasSurfaceCanvas {
             data: new Uint8Array(buf),
           };
           if (flush) flush(payload);
-          else conn.sendClipboard(payload.mime, payload.data);
+          else {
+            void conn
+              .sendClipboard(payload.mime, payload.data)
+              .catch((error) =>
+                console.warn("YAS: failed to publish clipboard image", error),
+              );
+          }
         })
         // Same for a blob we could not read: we know an image was there, so
         // pressing V would paste something the user did not copy.
@@ -4913,15 +4946,15 @@ export class YasSurfaceCanvas {
 
     const text = e.clipboardData?.getData("text/plain") ?? "";
     if (flush) {
-      // An empty clipboard still presses V, and that is not the stale paste
-      // the image paths above refuse.  Nothing was withheld here, so the
-      // selection the app goes on to read is whichever *Wayland* client owns
-      // it — copy in one surface and paste into another, with the browser
-      // never in the middle.  Standing the chord down would break that.
-      flush(text ? textPayload(text) : null);
+      if (text) flush(textPayload(text));
+      else abandon?.();
     } else if (text) {
       const payload = textPayload(text);
-      conn.sendClipboard(payload.mime, payload.data);
+      void conn
+        .sendClipboard(payload.mime, payload.data)
+        .catch((error) =>
+          console.warn("YAS: failed to publish clipboard text", error),
+        );
     }
   }
 
@@ -5234,13 +5267,15 @@ export class YasSurfaceCanvas {
     // release) before V press and interpret it as plain 'v' typing.
     if (isPasteShortcut) {
       const keycode = domKeyToEvdev(code);
+      this._pendingPasteAbandon?.();
       // Do NOT add keycode to pressedKeys yet — the flush below does it.
-      this._pendingPaste = {
+      const pending = {
         keycode,
         released: false,
         deferredCtrlRelease: false,
         metaChord: e.metaKey && !e.ctrlKey,
       };
+      this._pendingPaste = pending;
 
       // On macOS, Cmd+V arrives with metaKey set.  Wayland apps expect
       // Ctrl+V, so swap the already-pressed Meta → Ctrl before forwarding
@@ -5262,15 +5297,16 @@ export class YasSurfaceCanvas {
       }
 
       const surfaceId = this._surfaceId;
-      const flush = (payload: ClipboardPayload | null) => {
-        const p = this._pendingPaste;
-        if (!p || p.keycode !== keycode) return;
+      let pasteClaimed = false;
+      const finishPaste = () => {
+        if (this._pendingPaste !== pending) return;
+        if (this._pendingPasteTimer !== null) {
+          clearTimeout(this._pendingPasteTimer);
+          this._pendingPasteTimer = null;
+        }
         this._pendingPaste = null;
         this._pendingPasteFlush = null;
         this._pendingPasteAbandon = null;
-        if (payload) {
-          conn.sendClipboard(payload.mime, payload.data);
-        }
         if (keycode !== 0) {
           this.pressedKeys.add(keycode);
           sendKey(surfaceId, keycode, true);
@@ -5278,13 +5314,13 @@ export class YasSurfaceCanvas {
           // consumes the key equivalent whole — see metaChord above), so
           // its release goes out with the press; waiting for it would
           // leave V held and the app key-repeating the paste forever.
-          if (p.released || p.metaChord) {
+          if (pending.released || pending.metaChord) {
             this.pressedKeys.delete(keycode);
             sendKey(surfaceId, keycode, false);
           }
         }
-        if (p.deferredCtrlRelease) {
-          if (keycode !== 0 && !p.released && !p.metaChord) {
+        if (pending.deferredCtrlRelease) {
+          if (keycode !== 0 && !pending.released && !pending.metaChord) {
             // V is still physically held — defer Ctrl release until the
             // keyup V event arrives.  Releasing Ctrl now would leave a
             // bare V press on the Wayland side which the app would
@@ -5297,26 +5333,52 @@ export class YasSurfaceCanvas {
           }
         }
       };
+      const flush = (payload: ClipboardPayload | null) => {
+        if (pasteClaimed || this._pendingPaste !== pending) return;
+        pasteClaimed = true;
+        this._pendingPasteFlush = null;
+        if (!payload) {
+          finishPaste();
+          return;
+        }
+        void conn
+          .sendClipboard(payload.mime, payload.data)
+          .then(finishPaste, (error) => {
+            console.warn(
+              "YAS: failed to publish clipboard before paste",
+              error,
+            );
+            if (this._pendingPaste === pending) {
+              this._pendingPasteAbandon?.();
+            }
+          });
+      };
       this._pendingPasteFlush = flush;
 
       // Stand-down for the outcomes that must not press V: a clipboard
       // holding nothing we can paste, or an image we declined to forward —
       // pressing V behind either would paste something the user did not
-      // copy.  Releases whatever the deferral held back and undoes the
-      // Meta→Ctrl translation.  Never on a timer: the chord's outcome is
-      // decided by the clipboard reads settling, the paste event, or blur.
+      // copy. Releases whatever the deferral held back and undoes the
+      // Meta→Ctrl translation. A bounded timer covers browser permission
+      // prompts which neither resolve nor reject.
       this._pendingPasteAbandon = () => {
-        const p = this._pendingPaste;
-        if (!p || p.keycode !== keycode) return;
+        if (this._pendingPaste !== pending) return;
+        if (this._pendingPasteTimer !== null) {
+          clearTimeout(this._pendingPasteTimer);
+          this._pendingPasteTimer = null;
+        }
         this._pendingPaste = null;
         this._pendingPasteFlush = null;
         this._pendingPasteAbandon = null;
-        if (p.deferredCtrlRelease) {
+        if (pending.deferredCtrlRelease) {
           this.pressedKeys.delete(29);
           sendKey(surfaceId, 29, false);
           this._metaToCtrlKey = 0;
         }
       };
+      this._pendingPasteTimer = setTimeout(() => {
+        if (this._pendingPaste === pending) this._pendingPasteAbandon?.();
+      }, CLIPBOARD_OPERATION_TIMEOUT_MS);
 
       // The compositor already has a live client-owned selection.  Press V
       // immediately and let the destination receive its chosen MIME
@@ -5370,19 +5432,30 @@ export class YasSurfaceCanvas {
         if (!metaChord)
           this.readClipboardImage(imageRead ?? startImageRead(), flush);
       };
-      navigator.clipboard.readText().then((text) => {
-        if (!this._pendingPasteFlush) return; // a paste event claimed it
-        // Only flush when readText actually returned content.  Some
-        // browsers (Brave with sanitization) resolve with `""` instead
-        // of rejecting — if we flushed on empty here, we'd close out
-        // the pending paste and dispatch V with no clipboard update,
-        // causing the Wayland app to paste its previous selection.
-        if (text) {
-          flush(textPayload(text));
-          return;
-        }
-        imageFallback();
-      }, imageFallback);
+      const readText = navigator.clipboard?.readText?.bind(navigator.clipboard);
+      if (!readText) {
+        // Let the keydown's default action dispatch its synchronous paste
+        // event before deciding that this browser has no async fallback.
+        setTimeout(imageFallback, 0);
+        return;
+      }
+      try {
+        Promise.resolve(readText()).then((text) => {
+          if (!this._pendingPasteFlush) return; // a paste event claimed it
+          // Only flush when readText actually returned content.  Some
+          // browsers (Brave with sanitization) resolve with `""` instead
+          // of rejecting — if we flushed on empty here, we'd close out
+          // the pending paste and dispatch V with no clipboard update,
+          // causing the Wayland app to paste its previous selection.
+          if (text) {
+            flush(textPayload(text));
+            return;
+          }
+          imageFallback();
+        }, imageFallback);
+      } catch {
+        setTimeout(imageFallback, 0);
+      }
       return;
     }
 
@@ -5816,6 +5889,12 @@ export class YasSurfaceCanvas {
     this._pendingPaste = null;
     this._pendingPasteFlush = null;
     this._pendingPasteAbandon = null;
+    if (this._pendingPasteTimer !== null) {
+      clearTimeout(this._pendingPasteTimer);
+      this._pendingPasteTimer = null;
+    }
+    this.primaryPointerBarrier = null;
+    this.primaryPointerGeneration += 1;
     this._ctrlReleaseDeferred = false;
     this._metaToCtrlKey = 0;
     // Held-back and swallowed Alt presses never reached the compositor, so

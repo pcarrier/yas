@@ -38,6 +38,7 @@ import { YasActivityStore } from "./activity";
 import { YasConnection as NativeYasConnection } from "./yas/session";
 import { YasEdgeWebSocketTransport } from "./yas/edge";
 import { yasBrowserConnectionOptions } from "./yas/defaults";
+import { retainBrowserClipboardObserver } from "./clipboardAuthority";
 
 export interface AddYasConnectionOptions {
   id: ConnectionId;
@@ -119,6 +120,7 @@ function workspaceError(message: string): Error {
 }
 
 export class YasWorkspace {
+  private readonly releaseClipboardObserver: () => void;
   private readonly listeners = new Set<() => void>();
   private readonly connectionListeners = new Map<ConnectionId, () => void>();
   private readonly termCwdListeners = new Set<
@@ -143,6 +145,7 @@ export class YasWorkspace {
   };
 
   constructor({ wasm, connections = [], logger }: CreateYasWorkspaceOptions) {
+    this.releaseClipboardObserver = retainBrowserClipboardObserver();
     this.defaultWasm = wasm;
     this.logger = logger ?? consoleLogger;
     for (const connection of connections) {
@@ -220,6 +223,7 @@ export class YasWorkspace {
     }
     this.listeners.clear();
     this.activities.clear();
+    this.releaseClipboardObserver();
   }
 
   getConnection(connectionId: ConnectionId): YasWorkspaceConnection | null {

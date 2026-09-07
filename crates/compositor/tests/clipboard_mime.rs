@@ -330,16 +330,18 @@ fn a_wayland_clients_image_selection_splices_directly_to_another_client() {
         .expect("publish owner selection");
 
     std::thread::sleep(Duration::from_millis(50));
-    assert!(
-        fx.drain_events().iter().any(|event| matches!(
-            event,
+    let events = fx.drain_events();
+    let generation = events
+        .iter()
+        .find_map(|event| match event {
             CompositorEvent::ClipboardOwner {
                 wayland: true,
+                generation,
                 mime_types,
-            } if mime_types == &["image/png".to_string()]
-        )),
-        "the web side must learn that browser paste may not replace this selection"
-    );
+            } if mime_types == &["image/png".to_string()] => Some(*generation),
+            _ => None,
+        })
+        .expect("the web side must learn that browser paste may not replace this selection");
 
     // Selection GET asks the compositor to fetch lazily from the owner. The
     // owner deliberately answers after the old fixed 5 ms read delay, proving
@@ -349,11 +351,29 @@ fn a_wayland_clients_image_selection_splices_directly_to_another_client() {
     handle
         .command_tx
         .send(CompositorCommand::ClipboardGet {
+            generation,
             mime_type: "image/png".to_owned(),
             reply,
         })
         .expect("send clipboard get");
     handle.wake();
+
+    // A source which has not answered yet must not stall the compositor's
+    // command/event loop. The MIME query queues behind ClipboardGet and still
+    // completes before the source pipe is serviced.
+    let (list_reply, list_response) = std::sync::mpsc::sync_channel(1);
+    handle
+        .command_tx
+        .send(CompositorCommand::ClipboardListMimes { reply: list_reply })
+        .expect("send clipboard MIME query");
+    handle.wake();
+    assert_eq!(
+        list_response
+            .recv_timeout(Duration::from_millis(250))
+            .expect("clipboard GET blocked compositor commands"),
+        vec!["image/png".to_string()],
+    );
+
     answer_source_send(&mut owner_queue, &mut owner);
     assert_eq!(
         response
@@ -394,9 +414,29 @@ fn a_wayland_clients_image_selection_splices_directly_to_another_client() {
             event,
             CompositorEvent::ClipboardOwner {
                 wayland: false,
+                generation: _,
                 mime_types,
             } if mime_types.is_empty()
         )),
         "destroying the owner must re-enable browser clipboard import"
+    );
+
+    let (stale_reply, stale_response) = std::sync::mpsc::sync_channel(1);
+    let handle = fx.handle.as_ref().expect("compositor running");
+    handle
+        .command_tx
+        .send(CompositorCommand::ClipboardGet {
+            generation,
+            mime_type: "image/png".to_owned(),
+            reply: stale_reply,
+        })
+        .expect("send stale clipboard get");
+    handle.wake();
+    assert_eq!(
+        stale_response
+            .recv_timeout(Duration::from_millis(250))
+            .expect("stale clipboard get reply"),
+        None,
+        "an old Selection revision must not read from a replacement owner",
     );
 }

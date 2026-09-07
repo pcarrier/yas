@@ -2314,6 +2314,13 @@ SET_COMMIT discards the handle and every sibling item upload. GET names slot, re
 MIME type and returns inline bytes or a Transfer. CLEAR is conditional on the
 observed revision, so one client cannot erase a newer owner accidentally.
 
+The server's Wayland adapter pins each compositor-owned record to the
+compositor source generation announced with its MIME catalogue. Lazy GET sends
+that generation back to the compositor; a replaced or destroyed source cannot
+answer an older Selection revision. The compositor requests the source fd on
+its protocol thread, then reads the bounded pipe on a dedicated worker lane so
+a slow client cannot block frame or input dispatch.
+
 A drag is a session-scoped resource with offered MIME types, optional named
 items, source actions, current target, and revision. Motion remains an Event;
 begin, drop, and cancel are correlated Requests. Drop data is fetched lazily by

@@ -67,6 +67,7 @@ import {
 import { CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264 } from "../surfaceModel";
 import { SurfaceStore } from "../SurfaceStore";
 import { YasSurfaceClient, type YasSurfaceView } from "../yas/surface";
+import { currentBrowserClipboardEpoch } from "../clipboardAuthority";
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -125,6 +126,7 @@ function deferred<T>() {
 function surfaceTestView(codecVersion: number, firstSequence = 1n) {
   return {
     result: {
+      viewId: 7,
       firstSequence,
       maxInflightFrames: 3,
       codecVersion,
@@ -132,6 +134,7 @@ function surfaceTestView(codecVersion: number, firstSequence = 1n) {
     subscribe: vi.fn(() => vi.fn()),
     configure: vi.fn().mockResolvedValue(undefined),
     reset: vi.fn().mockResolvedValue(undefined),
+    acknowledge: vi.fn(),
     close: vi.fn().mockResolvedValue(undefined),
   };
 }
@@ -196,6 +199,154 @@ function surfaceTestConnection(openView: ReturnType<typeof vi.fn>) {
 }
 
 describe("YasNativeWorkspaceConnection", () => {
+  it("lets a browser copy supersede Wayland owners on every connection", () => {
+    const epoch = currentBrowserClipboardEpoch();
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    const peer = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    const state = {
+      selectionSlots: [
+        {
+          slot: YAS_SELECTION_SLOT_CLIPBOARD,
+          ownerKind: YAS_SELECTION_OWNER_EXTERNAL,
+          revision: 4n,
+          mimeTypes: ["text/plain;charset=utf-8"],
+        },
+      ],
+      waylandClipboardExpected: false,
+      waylandClipboardExpectedAfterRevision: 0n,
+      waylandClipboardExpectedAtBrowserEpoch: 0n,
+      clipboardBrowserEpoch: epoch,
+    };
+    Object.assign(connection as object, state);
+    Object.assign(peer as object, state);
+
+    expect(connection.usesWaylandClipboard()).toBe(true);
+    expect(peer.usesWaylandClipboard()).toBe(true);
+
+    connection.noteBrowserClipboardMayHaveChanged();
+    expect(connection.usesWaylandClipboard()).toBe(false);
+    expect(peer.usesWaylandClipboard()).toBe(false);
+
+    connection.noteWaylandClipboardMayHaveChanged();
+    expect(connection.usesWaylandClipboard()).toBe(true);
+
+    peer.noteBrowserClipboardMayHaveChanged();
+    expect(connection.usesWaylandClipboard()).toBe(false);
+  });
+
+  it("waits for the copied Wayland revision even when an older owner exists", async () => {
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    const nextWaylandClipboardText = vi.fn().mockResolvedValue("fresh");
+    Object.assign(connection as object, {
+      selectionSlots: [
+        {
+          slot: YAS_SELECTION_SLOT_CLIPBOARD,
+          ownerKind: YAS_SELECTION_OWNER_EXTERNAL,
+          revision: 4n,
+          mimeTypes: ["text/plain;charset=utf-8"],
+        },
+      ],
+      waylandClipboardExpected: true,
+      waylandClipboardExpectedAfterRevision: 4n,
+      waylandClipboardExpectedAtBrowserEpoch: currentBrowserClipboardEpoch(),
+      nextWaylandClipboardText,
+    });
+
+    await expect(connection.readWaylandClipboardText()).resolves.toBe("fresh");
+    expect(nextWaylandClipboardText).toHaveBeenCalledWith(4n);
+  });
+
+  it("does not decode a non-UTF-8 text offer as UTF-8", async () => {
+    const get = vi.fn();
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    Object.assign(connection as object, {
+      selectionSlots: [
+        {
+          slot: YAS_SELECTION_SLOT_CLIPBOARD,
+          ownerKind: YAS_SELECTION_OWNER_EXTERNAL,
+          revision: 5n,
+          mimeTypes: ["text/plain;charset=iso-8859-1"],
+        },
+      ],
+      waylandClipboardExpected: false,
+      clipboardBrowserEpoch: currentBrowserClipboardEpoch(),
+      selectionClient: { get },
+    });
+
+    await expect(connection.readWaylandClipboardText()).resolves.toBeNull();
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed bytes from an advertised UTF-8 offer", async () => {
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    Object.assign(connection as object, {
+      selectionSlots: [
+        {
+          slot: YAS_SELECTION_SLOT_CLIPBOARD,
+          ownerKind: YAS_SELECTION_OWNER_EXTERNAL,
+          revision: 5n,
+          mimeTypes: ["text/plain; format=flowed; charset=UTF-8"],
+        },
+      ],
+      waylandClipboardExpected: false,
+      clipboardBrowserEpoch: currentBrowserClipboardEpoch(),
+      selectionClient: {
+        get: vi.fn().mockResolvedValue({
+          bytes: () => Promise.resolve(new Uint8Array([0xc3, 0x28])),
+        }),
+      },
+    });
+
+    await expect(connection.readWaylandClipboardText()).resolves.toBeNull();
+  });
+
+  it("commits clipboard writes in user order", async () => {
+    let finishFirst!: () => void;
+    const setSelection = vi
+      .fn()
+      .mockReturnValueOnce(
+        new Promise<void>((resolve) => {
+          finishFirst = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(undefined);
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    Object.assign(connection as object, {
+      selectionSlots: [],
+      selectionWrites: new Map(),
+      waylandClipboardExpected: false,
+      waylandClipboardExpectedAfterRevision: 0n,
+      waylandClipboardExpectedAtBrowserEpoch: 0n,
+      setSelection,
+    });
+
+    const first = connection.sendClipboard("text/plain", new Uint8Array([1]));
+    const second = connection.sendClipboard("text/plain", new Uint8Array([2]));
+    await flush();
+    expect(setSelection).toHaveBeenCalledTimes(1);
+
+    finishFirst();
+    await first;
+    await second;
+    expect(setSelection).toHaveBeenCalledTimes(2);
+    expect(setSelection.mock.calls.map((call) => Array.from(call[2]))).toEqual([
+      [1],
+      [2],
+    ]);
+  });
+
   it("reserves a host clipboard write until the Wayland selection arrives", async () => {
     const originalClipboard = Object.getOwnPropertyDescriptor(
       navigator,
@@ -230,6 +381,10 @@ describe("YasNativeWorkspaceConnection", () => {
       const connection = Object.create(
         YasNativeWorkspaceConnection.prototype,
       ) as YasNativeWorkspaceConnection;
+      const peer = Object.create(
+        YasNativeWorkspaceConnection.prototype,
+      ) as YasNativeWorkspaceConnection;
+      const browserEpoch = currentBrowserClipboardEpoch();
       Object.assign(connection as object, {
         listeners,
         selectionSlots: [
@@ -241,10 +396,23 @@ describe("YasNativeWorkspaceConnection", () => {
           },
         ],
         selectionClient: { get },
+        clipboardBrowserEpoch: browserEpoch,
         subscribe: (listener: () => void) => {
           listeners.add(listener);
           return () => listeners.delete(listener);
         },
+      });
+      Object.assign(peer as object, {
+        selectionSlots: [
+          {
+            slot: YAS_SELECTION_SLOT_CLIPBOARD,
+            ownerKind: YAS_SELECTION_OWNER_EXTERNAL,
+            revision: 9n,
+            mimeTypes: ["image/png"],
+          },
+        ],
+        clipboardBrowserEpoch: browserEpoch,
+        waylandClipboardExpected: false,
       });
 
       connection.copyWaylandClipboardToHost();
@@ -265,6 +433,7 @@ describe("YasNativeWorkspaceConnection", () => {
       ];
       for (const listener of listeners) listener();
       await write.mock.results[0]!.value;
+      await Promise.resolve();
 
       expect(get).toHaveBeenCalledWith({
         target: {
@@ -275,6 +444,66 @@ describe("YasNativeWorkspaceConnection", () => {
         mime: "text/plain;charset=utf-8",
       });
       expect(written).toBe("from guest");
+      expect(connection.usesWaylandClipboard()).toBe(true);
+      expect(peer.usesWaylandClipboard()).toBe(false);
+    } finally {
+      if (originalClipboard)
+        Object.defineProperty(navigator, "clipboard", originalClipboard);
+      else Reflect.deleteProperty(navigator, "clipboard");
+      if (originalClipboardItem)
+        Object.defineProperty(
+          globalThis,
+          "ClipboardItem",
+          originalClipboardItem,
+        );
+      else Reflect.deleteProperty(globalThis, "ClipboardItem");
+    }
+  });
+
+  it("cancels a delayed Wayland export after a newer browser copy", async () => {
+    const originalClipboard = Object.getOwnPropertyDescriptor(
+      navigator,
+      "clipboard",
+    );
+    const originalClipboardItem = Object.getOwnPropertyDescriptor(
+      globalThis,
+      "ClipboardItem",
+    );
+    let promisedBlob!: Promise<Blob>;
+    class PendingClipboardItem {
+      constructor(values: Record<string, Promise<Blob>>) {
+        promisedBlob = values["text/plain"]!;
+      }
+    }
+    const writeText = vi.fn();
+    Object.defineProperty(globalThis, "ClipboardItem", {
+      configurable: true,
+      value: PendingClipboardItem,
+    });
+    const write = vi.fn(() => promisedBlob.then(() => undefined));
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { write, writeText },
+    });
+
+    try {
+      const connection = Object.create(
+        YasNativeWorkspaceConnection.prototype,
+      ) as YasNativeWorkspaceConnection;
+      Object.assign(connection as object, {
+        selectionSlots: [],
+        nextWaylandClipboardText: vi.fn().mockResolvedValue("stale guest"),
+        waylandClipboardExpected: false,
+        waylandClipboardExpectationTimer: null,
+      });
+
+      connection.copyWaylandClipboardToHost();
+      connection.noteBrowserClipboardMayHaveChanged();
+
+      await expect(promisedBlob).rejects.toThrow(
+        "browser clipboard changed during Wayland export",
+      );
+      expect(writeText).not.toHaveBeenCalled();
     } finally {
       if (originalClipboard)
         Object.defineProperty(navigator, "clipboard", originalClipboard);
@@ -2103,6 +2332,7 @@ describe("YasNativeWorkspaceConnection", () => {
           maxInflightFrames: 1,
           codecVersion: YAS_SURFACE_CODEC_H264_V1,
         },
+        acknowledge: vi.fn(),
       };
       const state = {
         view,
@@ -2112,6 +2342,9 @@ describe("YasNativeWorkspaceConnection", () => {
         lastPresented: 0n,
         decoderQueueDepth: 0,
       };
+      Object.assign(connection as object, {
+        surfaceViews: new Map([[1n, state]]),
+      });
       const payload = encodeSurfaceCodecPayload(YAS_SURFACE_CODEC_H264_V1, {
         damage: [{ x: 1, y: 2, width: 3, height: 4 }],
         dimensions: { width: 424, height: 302 },
@@ -2163,6 +2396,10 @@ describe("YasNativeWorkspaceConnection", () => {
           ? { width: 400, height: 300 }
           : { width: 800, height: 600 },
       );
+      expect(handleSurfaceFrame.mock.calls[0]?.[10]).toEqual({
+        viewId: 7,
+        sequence: 1n,
+      });
 
       handleSurfaceFrame.mockClear();
       lifecycle.acceptSurfaceFrame(1n, state, {
@@ -2182,6 +2419,51 @@ describe("YasNativeWorkspaceConnection", () => {
       expect(state.lastReceived).toBe(2n);
     },
   );
+
+  it("advances Surface credit only across contiguous decoder completions", () => {
+    const connection = Object.create(
+      YasNativeWorkspaceConnection.prototype,
+    ) as YasNativeWorkspaceConnection;
+    const acknowledge = vi.fn();
+    const state = {
+      view: {
+        result: { viewId: 7, firstSequence: 1n, maxInflightFrames: 4 },
+        acknowledge,
+      },
+      lastReceived: 2n,
+      lastPresented: 0n,
+      decoderQueueDepth: 2,
+      pendingFrames: [
+        { sequence: 1n, complete: false },
+        { sequence: 2n, complete: false },
+      ],
+    };
+    Object.assign(connection as object, {
+      surfaceViews: new Map([[1n, state]]),
+    });
+    const lifecycle = connection as unknown as {
+      acknowledgeSurface(
+        surfaceId: bigint,
+        token: { viewId: number; sequence: bigint },
+        decoderQueueDepth: number,
+      ): void;
+    };
+
+    lifecycle.acknowledgeSurface(1n, { viewId: 7, sequence: 2n }, 1);
+    expect(acknowledge).toHaveBeenLastCalledWith({
+      presentedSequence: 0n,
+      decoderQueueDepth: 1,
+      availableSlots: 3,
+    });
+
+    lifecycle.acknowledgeSurface(1n, { viewId: 7, sequence: 1n }, 0);
+    expect(acknowledge).toHaveBeenLastCalledWith({
+      presentedSequence: 2n,
+      decoderQueueDepth: 0,
+      availableSlots: 4,
+    });
+    expect(state.pendingFrames).toEqual([]);
+  });
 
   it("sends logical Surface dimensions with the measured 2x scale", () => {
     const resize = vi.fn();

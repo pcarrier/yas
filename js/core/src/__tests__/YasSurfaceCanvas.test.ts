@@ -1226,6 +1226,7 @@ function attachScrolling(
     origin?: [number, number];
     directTouch?: boolean;
     appId?: string;
+    primaryCommit?: Promise<void>;
   } = {},
 ) {
   const [fw, fh] = opts.frame ?? [800, 600];
@@ -1236,6 +1237,7 @@ function attachScrolling(
   const sent: SurfaceAxisEvent[] = [];
   const keys: { keycode: number; pressed: boolean }[] = [];
   const pointers: { type: number; button: number; x: number; y: number }[] = [];
+  const primary: { mime: string; data: Uint8Array }[] = [];
   let focuses = 0;
   const inputOrder: ("pointer" | "axis")[] = [];
   const touches: {
@@ -1277,6 +1279,10 @@ function attachScrolling(
     sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
       keys.push({ keycode, pressed }),
     sendSurfaceFocus: () => focuses++,
+    sendPrimary: (mime: string, data: Uint8Array) => {
+      primary.push({ mime, data });
+      return opts.primaryCommit ?? Promise.resolve();
+    },
     sendSurfacePointer: (
       _id: number,
       type: number,
@@ -1369,6 +1375,7 @@ function attachScrolling(
     sent,
     keys,
     pointers,
+    primary,
     setCursor(shape: string, image: SurfaceCursorImage) {
       cursorShape = shape;
       cursorImage = image;
@@ -1765,6 +1772,45 @@ describe("YasSurfaceCanvas scroll", () => {
     expect(result.focuses).toBe(0);
     expect(result.keys).toEqual([]);
     expect(result.pointers).toEqual([]);
+  });
+
+  it("holds consecutive middle clicks behind the PRIMARY Selection commit", async () => {
+    let commit!: () => void;
+    const result = attachScrolling({
+      primaryCommit: new Promise<void>((resolve) => {
+        commit = resolve;
+      }),
+    });
+    const selection = vi
+      .spyOn(document, "getSelection")
+      .mockReturnValue({ toString: () => "selected text" } as Selection);
+
+    for (const type of ["mousedown", "mouseup", "mousedown", "mouseup"]) {
+      result.canvas.dispatchEvent(
+        new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          button: 1,
+          clientX: 200,
+          clientY: 150,
+        }),
+      );
+    }
+
+    expect(result.primary).toHaveLength(2);
+    expect(result.pointers).toEqual([]);
+
+    commit();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(result.pointers.map(({ type }) => type)).toEqual([
+      SURFACE_POINTER_DOWN,
+      SURFACE_POINTER_UP,
+      SURFACE_POINTER_DOWN,
+      SURFACE_POINTER_UP,
+    ]);
+    selection.mockRestore();
+    result.surface.dispose();
   });
 
   it("does not refocus a pane that pointerdown already focused", () => {
@@ -3132,13 +3178,18 @@ const EVDEV_V = 47;
 
 /** A canvas wired for paste: captures what reaches the Wayland selection
  *  and which keycodes are forwarded, in order. */
-function attachPasting(initialWaylandOwner = false) {
+function attachPasting(
+  initialWaylandOwner = false,
+  clipboardCommit: Promise<void> = Promise.resolve(),
+) {
   const clipboard: { mime: string; data: Uint8Array }[] = [];
   const keys: { keycode: number; pressed: boolean }[] = [];
   let waylandOwner: boolean | null = initialWaylandOwner;
   const conn = {
-    sendClipboard: (mime: string, data: Uint8Array) =>
-      clipboard.push({ mime, data }),
+    sendClipboard: (mime: string, data: Uint8Array) => {
+      clipboard.push({ mime, data });
+      return clipboardCommit;
+    },
     sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
       keys.push({ keycode, pressed }),
     sendSurfaceText: () => {},
@@ -3322,6 +3373,48 @@ describe("YasSurfaceCanvas paste", () => {
       { keycode: 29, pressed: true },
       { keycode: EVDEV_V, pressed: true },
     ]);
+    dispose();
+  });
+
+  it("does not press V until the clipboard Selection commit completes", async () => {
+    let commit!: () => void;
+    const clipboardCommit = new Promise<void>((resolve) => {
+      commit = resolve;
+    });
+    const { keys, pressCtrlV, firePaste, dispose } = attachPasting(
+      false,
+      clipboardCommit,
+    );
+    pressCtrlV();
+    firePaste({ text: "staged clipboard" });
+    await settle();
+
+    expect(keys).toEqual([{ keycode: 29, pressed: true }]);
+
+    commit();
+    await settle();
+    expect(keys).toEqual([
+      { keycode: 29, pressed: true },
+      { keycode: EVDEV_V, pressed: true },
+    ]);
+    dispose();
+  });
+
+  it("uses the paste event when the async clipboard API is unavailable", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {},
+    });
+    const { clipboard, keys, pressCtrlV, firePaste, dispose } = attachPasting();
+
+    pressCtrlV();
+    firePaste({ text: "event-only clipboard" });
+    await settle();
+
+    expect(new TextDecoder().decode(clipboard[0]?.data)).toBe(
+      "event-only clipboard",
+    );
+    expect(keys).toContainEqual({ keycode: EVDEV_V, pressed: true });
     dispose();
   });
 

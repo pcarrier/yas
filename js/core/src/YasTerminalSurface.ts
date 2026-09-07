@@ -57,6 +57,57 @@ const CTRL_V = 0x16;
  *  paste should risk the session on. */
 const MAX_CLIPBOARD_BYTES = 8 * 1024 * 1024;
 
+interface ClipboardTextReservation {
+  finish(text: string): Promise<void>;
+  cancel(): void;
+}
+
+/** Reserve a clipboard write while the initiating pointer/key event still
+ * has browser activation. The selected text may require a server copy-range
+ * request before it is available. */
+function reserveClipboardTextWrite(): ClipboardTextReservation | null {
+  if (
+    typeof ClipboardItem === "undefined" ||
+    typeof navigator.clipboard?.write !== "function"
+  ) {
+    return null;
+  }
+  let resolveBlob!: (blob: Blob) => void;
+  let rejectBlob!: (reason?: unknown) => void;
+  const blob = new Promise<Blob>((resolve, reject) => {
+    resolveBlob = resolve;
+    rejectBlob = reject;
+  });
+  void blob.catch(() => undefined);
+  let write: Promise<void>;
+  try {
+    write = navigator.clipboard.write([
+      new ClipboardItem({ "text/plain": blob }),
+    ]);
+  } catch {
+    rejectBlob(new Error("clipboard reservation failed"));
+    return null;
+  }
+  // The browser may reject immediately while the remote copy-range request
+  // is still in flight. Mark it handled now; finish() still observes it.
+  void write.catch(() => undefined);
+  let settled = false;
+  return {
+    async finish(text: string) {
+      if (!settled) {
+        settled = true;
+        resolveBlob(new Blob([text], { type: "text/plain" }));
+      }
+      await write;
+    },
+    cancel() {
+      if (settled) return;
+      settled = true;
+      rejectBlob(new Error("clipboard copy cancelled"));
+    },
+  };
+}
+
 /** The mounted terminal surface owning each hidden keyboard textarea. */
 const terminalSurfaceByInput = new WeakMap<
   HTMLTextAreaElement,
@@ -572,6 +623,9 @@ export class YasTerminalSurface {
   // the ^V byte once the clipboard has been forwarded).
   private _ctrlVPastePending = false;
   private _ctrlVFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Late browser/Selection promises from an older gesture must not act after
+   * a newer terminal clipboard operation. */
+  private _clipboardOperation = 0;
   private mouseCleanup: (() => void) | null = null;
 
   constructor(options: YasTerminalSurfaceOptions) {
@@ -802,6 +856,8 @@ export class YasTerminalSurface {
     const se = this.selEnd;
     const t = this.terminal;
     if (!ss || !se || !t) return null;
+    const clipboardOperation = ++this._clipboardOperation;
+    let reservation: ClipboardTextReservation | null = null;
     let start = ss;
     let end = se;
     // Normalise so start precedes end.
@@ -828,6 +884,7 @@ export class YasTerminalSurface {
       this._sessionId !== null &&
       this._yasConn.supportsCopyRange()
     ) {
+      reservation = reserveClipboardTextWrite();
       try {
         ({ text } = await this._yasConn.copyRange(
           this._sessionId,
@@ -837,18 +894,28 @@ export class YasTerminalSurface {
           end.col,
         ));
       } catch {
+        reservation?.cancel();
         return null;
       }
     }
-    if (!text) return null;
+    if (this._clipboardOperation !== clipboardOperation) {
+      reservation?.cancel();
+      return null;
+    }
+    if (!text) {
+      reservation?.cancel();
+      return null;
+    }
     try {
-      await navigator.clipboard.writeText(text);
+      if (reservation) await reservation.finish(text);
+      else await navigator.clipboard.writeText(text);
       // Programmatic writes do not emit a DOM `copy` event.  Tell the
       // connection explicitly so a later paste into a Wayland surface does
       // not preserve the client-owned selection that predates this terminal
       // drag selection.
       this._yasConn?.noteBrowserClipboardMayHaveChanged();
     } catch {
+      reservation?.cancel();
       // Clipboard write rejected (e.g. no permission). Surface the text
       // so callers can fall back to a manual copy affordance.
     }
@@ -869,11 +936,17 @@ export class YasTerminalSurface {
   async pasteFromClipboard(): Promise<string | null> {
     if (this._readOnly) return null;
     if (this._sessionId === null || this.status !== "connected") return null;
+    const clipboardOperation = ++this._clipboardOperation;
     const sid = this._sessionId;
     const conn = this._yasConn;
     if (conn?.usesWaylandClipboard?.()) {
       const text = await conn.readWaylandClipboardText();
-      if (this._sessionId !== sid || this.status !== "connected") return null;
+      if (
+        this._clipboardOperation !== clipboardOperation ||
+        this._sessionId !== sid ||
+        this.status !== "connected"
+      )
+        return null;
       if (text) {
         this.pasteText(text);
         return text;
@@ -891,11 +964,12 @@ export class YasTerminalSurface {
       // readText rejects for image-only clipboards on some browsers; the
       // image attempt below is the fallback.
     }
+    if (this._clipboardOperation !== clipboardOperation) return null;
     if (text) {
       this.pasteText(text);
       return text;
     }
-    await this.pasteImageFromClipboard();
+    await this.pasteImageFromClipboard(clipboardOperation);
     return null;
   }
 
@@ -903,7 +977,9 @@ export class YasTerminalSurface {
    *  pushing it to the server clipboard and triggering the app's read with
    *  ^V — the same convention as the Ctrl+V paste-event path.  Returns true
    *  when an image was forwarded. */
-  private async pasteImageFromClipboard(): Promise<boolean> {
+  private async pasteImageFromClipboard(
+    clipboardOperation: number,
+  ): Promise<boolean> {
     if (typeof navigator.clipboard.read !== "function") return false;
     const conn = this._yasConn;
     const sid = this._sessionId;
@@ -914,6 +990,7 @@ export class YasTerminalSurface {
     } catch {
       return false; // empty clipboard, or read() rejected
     }
+    if (this._clipboardOperation !== clipboardOperation) return false;
     // Same preference order as YasSurfaceCanvas: PNG is what every toolkit
     // asks for.
     for (const mime of ["image/png", "image/webp", "image/jpeg"]) {
@@ -921,6 +998,7 @@ export class YasTerminalSurface {
       if (!item) continue;
       try {
         const buf = await (await item.getType(mime)).arrayBuffer();
+        if (this._clipboardOperation !== clipboardOperation) return false;
         if (buf.byteLength > MAX_CLIPBOARD_BYTES) {
           console.warn(
             `yas: clipboard image is ${buf.byteLength} bytes, over the ` +
@@ -930,9 +1008,15 @@ export class YasTerminalSurface {
         }
         if (this._sessionId !== sid || this.status !== "connected")
           return false;
-        // Transport messages are ordered, so the clipboard is populated
-        // server-side before the ^V input arrives and the app reads it.
-        conn.sendClipboard(mime, new Uint8Array(buf));
+        // Wait for the Selection SET result. Large images use a staged
+        // Transfer and are not ordered ahead of terminal input until commit.
+        await conn.sendClipboard(mime, new Uint8Array(buf));
+        if (
+          this._clipboardOperation !== clipboardOperation ||
+          this._sessionId !== sid ||
+          this.status !== "connected"
+        )
+          return false;
         this.sendInput(sid, new Uint8Array([CTRL_V]));
         return true;
       } catch {
@@ -1195,6 +1279,7 @@ export class YasTerminalSurface {
 
   /** Detach from the current container. Removes all DOM elements and listeners. */
   detach(): void {
+    this._clipboardOperation += 1;
     this.teardownMouse();
     this.teardownScrollSurface();
     this.teardownKeyboard();
@@ -1249,6 +1334,7 @@ export class YasTerminalSurface {
 
   setConnection(conn: YasTerminalConnection | null): void {
     if (this._yasConn === conn) return;
+    this._clipboardOperation += 1;
     this.teardownDirtyListener();
     this.teardownTerminal();
     this.teardownResizeObserver();
@@ -1266,6 +1352,7 @@ export class YasTerminalSurface {
 
   setSessionId(id: SessionId | null): void {
     if (this._sessionId === id) return;
+    this._clipboardOperation += 1;
     // Whatever the field was mirroring belonged to the session being left.
     this.resetPrediction();
     this.teardownDirtyListener();
@@ -3147,6 +3234,7 @@ export class YasTerminalSurface {
   private handlePaste(e: ClipboardEvent): void {
     if (this._readOnly) return;
     if (this._sessionId === null || this.status !== "connected") return;
+    const clipboardOperation = ++this._clipboardOperation;
 
     // Consume the pending Ctrl+V arm (if this paste came from Ctrl+V) so the
     // fallback timer doesn't also fire a ^V.
@@ -3188,18 +3276,25 @@ export class YasTerminalSurface {
       const mime = file.type || "image/png";
       void file
         .arrayBuffer()
-        .then((buf) => {
-          if (this._sessionId !== sid || this.status !== "connected") return;
-          // Transport messages are ordered, so the clipboard is populated
-          // server-side before the ^V input arrives and the app reads it.
-          conn.sendClipboard(mime, new Uint8Array(buf));
+        .then(async (buf) => {
+          if (
+            this._clipboardOperation !== clipboardOperation ||
+            this._sessionId !== sid ||
+            this.status !== "connected"
+          )
+            return;
+          await conn.sendClipboard(mime, new Uint8Array(buf));
+          if (
+            this._clipboardOperation !== clipboardOperation ||
+            this._sessionId !== sid ||
+            this.status !== "connected"
+          )
+            return;
           this.sendInput(sid, new Uint8Array([CTRL_V]));
         })
-        .catch(() => {
-          // Reading the blob failed — fall back to a bare ^V so the keypress
-          // isn't swallowed entirely.
-          this.sendCtrlV();
-        });
+        .catch((error) =>
+          console.warn("YAS: failed to publish clipboard image", error),
+        );
       return;
     }
 

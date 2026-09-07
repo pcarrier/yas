@@ -1281,15 +1281,60 @@ describe("SurfaceStore decoder recovery", () => {
     },
   );
 
-  it("reports WebCodecs queue depth with each surface ACK", () => {
+  it("ACKs only decoder output and reports chunks still awaiting output", () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      drawImage: vi.fn(),
+    } as any);
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn(() => 1),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
     const store = newStore();
-    const acks: Array<[number, number]> = [];
-    store.setAckSender((sid, queueDepth) => acks.push([sid, queueDepth]));
-    store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
-    store.handleSurfaceFrame(1, 1, DELTA_AV1, 1280, 720, frame);
+    const acks: Array<[number, bigint | undefined, number]> = [];
+    store.setAckSender((sid, token, queueDepth) =>
+      acks.push([sid, token?.sequence, queueDepth]),
+    );
+    store.handleSurfaceFrame(
+      1,
+      0,
+      KEY_AV1,
+      1280,
+      720,
+      frame,
+      0,
+      1280,
+      720,
+      undefined,
+      { viewId: 7, sequence: 10n },
+    );
+    store.handleSurfaceFrame(
+      1,
+      1,
+      DELTA_AV1,
+      1280,
+      720,
+      frame,
+      0,
+      1280,
+      720,
+      undefined,
+      { viewId: 7, sequence: 11n },
+    );
+    expect(acks).toEqual([]);
+
+    const output = (timestamp: number) =>
+      ({
+        displayWidth: 1280,
+        displayHeight: 720,
+        timestamp,
+        close: vi.fn(),
+      }) as unknown as VideoFrame;
+    FakeDecoder.instances[0].output(output(0));
+    FakeDecoder.instances[0].output(output(1000));
     expect(acks).toEqual([
-      [1, 1],
-      [1, 2],
+      [1, 10n, 1],
+      [1, 11n, 0],
     ]);
     store.destroy();
   });
@@ -1388,6 +1433,44 @@ describe("SurfaceStore decoder recovery", () => {
     expect(thumbnailDecoder.decoded).toBe(1);
     expect(nativeDecoder.configured).toEqual(["av01.0.09M.08"]);
     expect(nativeDecoder.decoded).toBe(1);
+    store.destroy();
+  });
+
+  it("consumes old pending chunks when a decoder is replaced", () => {
+    const store = newStore();
+    const acks: Array<[bigint | undefined, number]> = [];
+    store.setAckSender((_sid, token, depth) =>
+      acks.push([token?.sequence, depth]),
+    );
+    store.handleSurfaceFrame(
+      1,
+      0,
+      KEY_AV1,
+      320,
+      180,
+      frame,
+      0,
+      320,
+      180,
+      undefined,
+      { viewId: 7, sequence: 1n },
+    );
+    store.handleSurfaceFrame(
+      1,
+      1,
+      KEY_AV1,
+      1280,
+      720,
+      frame,
+      0,
+      1280,
+      720,
+      undefined,
+      { viewId: 7, sequence: 2n },
+    );
+
+    expect(acks).toEqual([[1n, 0]]);
+    expect(FakeDecoder.instances).toHaveLength(2);
     store.destroy();
   });
 
@@ -1497,6 +1580,32 @@ describe("SurfaceStore decoder recovery", () => {
       store.handleSurfaceFrame(1, 0, DELTA_AV1, 1280, 720, frame);
     }
     expect(requests).toHaveLength(2);
+    store.destroy();
+  });
+
+  it("consumes pending chunks when the decoder errors asynchronously", () => {
+    const store = newStore();
+    const acks: Array<[bigint | undefined, number]> = [];
+    store.setAckSender((_sid, token, depth) =>
+      acks.push([token?.sequence, depth]),
+    );
+    FakeDecoder.failDecodeAsync = true;
+
+    store.handleSurfaceFrame(
+      1,
+      0,
+      KEY_AV1,
+      1280,
+      720,
+      frame,
+      0,
+      1280,
+      720,
+      undefined,
+      { viewId: 7, sequence: 1n },
+    );
+
+    expect(acks).toEqual([[1n, 0]]);
     store.destroy();
   });
 

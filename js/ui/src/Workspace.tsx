@@ -6564,6 +6564,11 @@ function WorkspaceScreen(props: {
               layoutFocusedSurface();
               return focusedKeyboardInput();
             }}
+            clipboardConnection={() =>
+              workspace.getConnection(
+                focusedSurfaceConnId() ?? activeConnectionId(),
+              )
+            }
             theme={theme()}
             scale={chromeScale()}
           />

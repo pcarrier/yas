@@ -444,6 +444,7 @@ describe("YasTerminalSurface mobile copy/paste API", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -458,7 +459,7 @@ describe("YasTerminalSurface mobile copy/paste API", () => {
   } {
     const s = new YasTerminalSurface({ sessionId: "s1" });
     const sendInput = vi.fn();
-    const sendClipboard = vi.fn();
+    const sendClipboard = vi.fn().mockResolvedValue(undefined);
     // @ts-expect-error — install a fake workspace stub.
     s["_workspace"] = { sendInput };
     // @ts-expect-error — connection exposing a connected transport + clipboard.
@@ -576,6 +577,48 @@ describe("YasTerminalSurface mobile copy/paste API", () => {
     ]);
   });
 
+  it("reserves an off-viewport clipboard write before copy-range resolves", async () => {
+    let copiedBlob!: Promise<Blob>;
+    class PendingClipboardItem {
+      constructor(values: Record<string, Promise<Blob>>) {
+        copiedBlob = values["text/plain"]!;
+      }
+    }
+    vi.stubGlobal("ClipboardItem", PendingClipboardItem);
+    const write = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator.clipboard, "write", {
+      configurable: true,
+      value: write,
+    });
+
+    let finishRange!: (value: { text: string }) => void;
+    const copyRange = vi.fn(
+      () =>
+        new Promise<{ text: string }>((resolve) => {
+          finishRange = resolve;
+        }),
+    );
+    const noteBrowserClipboardMayHaveChanged = vi.fn();
+    const s = new YasTerminalSurface({ sessionId: "s1" });
+    s["terminal"] = {} as never;
+    s["selStart"] = { row: 0, col: 0, tailOffset: 100 };
+    s["selEnd"] = { row: 0, col: 4, tailOffset: 100 };
+    s["_yasConn"] = {
+      supportsCopyRange: () => true,
+      copyRange,
+      noteBrowserClipboardMayHaveChanged,
+    } as never;
+
+    const copying = s.copySelection();
+    expect(write).toHaveBeenCalledOnce();
+    expect(copyRange).toHaveBeenCalledOnce();
+
+    finishRange({ text: "remote selection" });
+    await expect(copying).resolves.toBe("remote selection");
+    expect(await (await copiedBlob).text()).toBe("remote selection");
+    expect(noteBrowserClipboardMayHaveChanged).toHaveBeenCalledOnce();
+  });
+
   it("invalidates stale Wayland clipboard ownership after copying a drag selection", async () => {
     const s = newSurface();
     const noteBrowserClipboardMayHaveChanged = vi.fn();
@@ -673,6 +716,39 @@ describe("YasTerminalSurface mobile copy/paste API", () => {
     expect(sendClipboard.mock.invocationCallOrder[0]).toBeLessThan(
       sendInput.mock.invocationCallOrder[0],
     );
+  });
+
+  it("waits for the image Selection commit before sending ^V", async () => {
+    const { s, sendInput, sendClipboard } = newConnectedSurface();
+    let commit!: () => void;
+    sendClipboard.mockReturnValue(
+      new Promise<void>((resolve) => {
+        commit = resolve;
+      }),
+    );
+    vi.mocked(navigator.clipboard.read).mockResolvedValue([
+      imageClipboardItem(new Uint8Array([137, 80, 78, 71])),
+    ]);
+
+    const paste = s.pasteFromClipboard();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sendClipboard).toHaveBeenCalledOnce();
+    expect(sendInput).not.toHaveBeenCalled();
+
+    commit();
+    await paste;
+    expect(sendInput).toHaveBeenCalledWith("s1", new Uint8Array([0x16]));
+  });
+
+  it("does not send ^V when publishing an image Selection fails", async () => {
+    const { s, sendInput, sendClipboard } = newConnectedSurface();
+    sendClipboard.mockRejectedValue(new Error("Selection SET failed"));
+    vi.mocked(navigator.clipboard.read).mockResolvedValue([
+      imageClipboardItem(new Uint8Array([137, 80, 78, 71])),
+    ]);
+
+    await expect(s.pasteFromClipboard()).resolves.toBeNull();
+    expect(sendInput).not.toHaveBeenCalled();
   });
 
   it("pasteFromClipboard() tries the image read when readText rejects", async () => {
@@ -904,7 +980,7 @@ describe("YasTerminalSurface Ctrl+V image paste", () => {
 
   function attach(sendInput: (data: Uint8Array) => void) {
     const s = new YasTerminalSurface({ sessionId: "s1" });
-    const sendClipboard = vi.fn();
+    const sendClipboard = vi.fn().mockResolvedValue(undefined);
     // @ts-expect-error — install a fake workspace stub.
     s["_workspace"] = { sendInput };
     // @ts-expect-error — connection exposing a connected transport + clipboard.

@@ -478,7 +478,6 @@ trait PtyDriver: Send {
     fn title(&self) -> &str;
     fn search_result(&self, query: &str) -> Option<PtySearchResult>;
     fn take_title_dirty(&mut self) -> bool;
-    fn take_clipboard_stores(&mut self) -> Vec<String>;
     fn used_rows(&self) -> u16;
     fn take_used_rows_dirty(&mut self) -> bool;
     fn cursor_position(&self) -> (u16, u16);
@@ -549,10 +548,6 @@ impl PtyDriver for AlacrittyDriver {
 
     fn take_title_dirty(&mut self) -> bool {
         AlacrittyDriver::take_title_dirty(self)
-    }
-
-    fn take_clipboard_stores(&mut self) -> Vec<String> {
-        AlacrittyDriver::take_clipboard_stores(self)
     }
 
     fn used_rows(&self) -> u16 {
@@ -2354,14 +2349,14 @@ struct SurfaceSubState {
     /// bypass time-based pacing so bandwidth estimates ramp up fast
     /// on high-latency links.
     burst_remaining: u8,
-    /// WebCodecs decodeQueueSize reported with the latest ACK. This is the
-    /// decoder-pressure signal; aggregate ACKed bytes separately control the
-    /// client-wide transport credit without treating callback age as RTT.
+    /// Submitted chunks still awaiting WebCodecs output at the latest ACK.
+    /// This is the decoder-pressure signal; aggregate ACKed bytes separately
+    /// control the client-wide transport credit.
     decoder_queue_depth: u8,
     /// Queue depth admitted as sustained decoder pressure.  A raw
-    /// `decodeQueueSize` spike can be a batch of `decode()` calls issued
-    /// after the JavaScript event loop wakes; pacing from that instantaneous
-    /// value needlessly drops frames on an otherwise idle local link.
+    /// pending-output spike can be a batch of `decode()` calls issued after
+    /// the JavaScript event loop wakes; pacing from that instantaneous value
+    /// needlessly drops frames on an otherwise idle local link.
     decoder_pressure_depth: u8,
     /// Start of the current continuously-high decoder-queue episode.
     decoder_queue_high_since: Option<Instant>,
@@ -3596,19 +3591,19 @@ fn surface_work_order(client: &mut ClientState) -> SmallVec<[u16; 4]> {
     surfaces
 }
 
-/// Browser decoder ACKs arrive on the JS event loop.  Keep enough history to
-/// match a burst of delayed ACKs without evicting live records and attributing
-/// their bytes/timestamps to newer frames. Individual ACK age is accounting
-/// only; aggregate ACKed bytes over time control the shared surface credit.
+/// Browser decoder-output ACKs arrive on the JS event loop. Keep enough
+/// history to match a burst of delayed ACKs without evicting live records and
+/// attributing their bytes/timestamps to newer frames. Individual ACK age is
+/// accounting only; aggregate ACKed bytes over time control shared credit.
 const SURFACE_ACK_TRACKING_ALLOWANCE: Duration = Duration::from_millis(250);
 
 fn surface_ack_tracking_frames(fps: f32) -> usize {
     (fps.max(1.0) * SURFACE_ACK_TRACKING_ALLOWANCE.as_secs_f32()).ceil() as usize
 }
 
-/// A few accepted chunks are normal WebCodecs pipeline depth.  Beyond this,
-/// the decoder may be falling behind, but the report must persist long
-/// enough to exclude one JavaScript callback batch before it affects pacing.
+/// A few pending outputs are normal WebCodecs pipeline depth. Beyond this, the
+/// decoder may be falling behind, but the report must persist long enough to
+/// exclude one JavaScript callback batch before it affects pacing.
 const SURFACE_DECODE_QUEUE_ALLOWANCE: u8 = 4;
 const SURFACE_DECODE_PRESSURE_GRACE: Duration = Duration::from_millis(50);
 
@@ -3638,9 +3633,9 @@ fn update_surface_decoder_queue(sub: &mut SurfaceSubState, depth: u8, now: Insta
 /// the client only reports every 250 ms, the cut outlived the burst that
 /// caused it.
 ///
-/// WebCodecs `decodeQueueSize` is still useful as sustained pressure for the
-/// adaptive quality controller, but not as a rate signal: a healthy hardware
-/// decoder may keep 5–6 requests accepted while running at full throughput.
+/// WebCodecs pending-output depth is still useful as sustained pressure for
+/// the adaptive quality controller, but not as a rate signal: a healthy
+/// hardware decoder may keep several frames in flight at full throughput.
 /// Cutting cadence from that standing pipeline depth creates the very misses
 /// the controller is meant to prevent. Real transport overload is bounded by
 /// the aggregate surface credit and socket outbox; decoder pressure buys
@@ -9231,14 +9226,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                         resized_surface_ids.push(surface_id);
                     }
                 }
-                CompositorEvent::ClipboardContent { .. } => {}
                 CompositorEvent::ClipboardOwner {
                     wayland,
+                    generation,
                     mime_types,
                 } => {
                     cs.wayland_clipboard_owned = wayland;
                     if wayland {
-                        state.selection.set_compositor_clipboard(mime_types);
+                        state
+                            .selection
+                            .set_compositor_clipboard(generation, mime_types);
                     } else {
                         state.selection.clear_compositor_clipboard();
                     }
@@ -12043,7 +12040,6 @@ async fn tick(state: &AppState) -> TickOutcome {
         if pty.driver.take_title_dirty() || pty.driver.take_used_rows_dirty() {
             pty.mark_dirty();
         }
-        drop(pty.driver.take_clipboard_stores());
     }
 
     // Drain bytes from PTY reader channels. This is the only place

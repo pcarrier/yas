@@ -311,21 +311,16 @@ impl alacritty_terminal::vte::ansi::Timeout for NoSyncTimeout {
 #[derive(Clone)]
 struct YasEventProxy {
     title: Arc<Mutex<Option<String>>>,
-    clipboard_stores: Arc<Mutex<Vec<String>>>,
 }
 
 impl YasEventProxy {
     fn new() -> Self {
         Self {
             title: Arc::new(Mutex::new(None)),
-            clipboard_stores: Arc::new(Mutex::new(Vec::new())),
         }
     }
     fn take_title(&self) -> Option<String> {
         self.title.lock().unwrap().take()
-    }
-    fn take_clipboard_stores(&self) -> Vec<String> {
-        std::mem::take(&mut *self.clipboard_stores.lock().unwrap())
     }
 }
 
@@ -338,9 +333,9 @@ impl EventListener for YasEventProxy {
             Event::ResetTitle => {
                 *self.title.lock().unwrap() = Some(String::new());
             }
-            Event::ClipboardStore(_, text) => {
-                self.clipboard_stores.lock().unwrap().push(text);
-            }
+            // PTY output is untrusted. OSC 52 must not asynchronously replace
+            // the user's browser or Wayland clipboard without a user gesture.
+            Event::ClipboardStore(_, _) => {}
             _ => {}
         }
     }
@@ -714,10 +709,6 @@ impl TerminalDriver {
 
     pub fn take_title_dirty(&mut self) -> bool {
         std::mem::take(&mut self.title_dirty)
-    }
-
-    pub fn take_clipboard_stores(&mut self) -> Vec<String> {
-        self.event_proxy.take_clipboard_stores()
     }
 
     pub fn synced_output(&self) -> bool {
@@ -1606,14 +1597,6 @@ mod tests {
         assert_eq!(frame.link_segments(0, 9), expected);
         assert_eq!(frame.link_segments(1, 0), expected);
         assert_eq!(frame.link_segments(1, 3), expected);
-    }
-
-    #[test]
-    fn osc52_clipboard_store() {
-        let mut driver = TerminalDriver::new(24, 80, 1000);
-        driver.process(b"\x1b]52;c;SGVsbG8sIE9TQyA1MiE=\x07");
-        assert_eq!(driver.take_clipboard_stores(), vec!["Hello, OSC 52!"]);
-        assert!(driver.take_clipboard_stores().is_empty());
     }
 
     #[test]

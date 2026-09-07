@@ -1,0 +1,144 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "modal>=1.4.1,<2",
+# ]
+# ///
+
+"""Provision a temporary Modal-hosted YAS edge and print its browser URL."""
+
+import argparse
+import contextlib
+import os
+import secrets
+import sys
+from urllib.parse import quote
+
+import modal
+
+PORT = 3264
+TIMEOUT = 24 * 60 * 60
+CPU_CORES = 8.0
+MEMORY_MIB = 16 * 1024
+# YAS prefers AV1 NVENC; T4's Turing encoder cannot encode AV1.
+GPU = "L4"
+EXTENSIONS = (
+    ("doctor", "doctor.js"),
+    ("muster", "muster.wasm"),
+    ("xdg-desktop", "xdg-desktop.wasm"),
+)
+
+
+def install_extensions(sandbox: modal.Sandbox) -> None:
+    for name, module in EXTENSIONS:
+        print(f"Installing YAS extension {name}", file=sys.stderr)
+        process = sandbox.exec(
+            "/usr/local/bin/yas",
+            "ext",
+            "run",
+            "--persist",
+            "--restart",
+            "always",
+            name,
+            f"https://yas.run/ext/{module}",
+            timeout=60,
+        )
+        process.wait()
+        if process.returncode != 0:
+            stdout = process.stdout.read().strip()
+            stderr = process.stderr.read().strip()
+            detail = "\n".join(part for part in (stdout, stderr) if part)
+            raise RuntimeError(
+                f"failed to install YAS extension {name}"
+                + (f":\n{detail}" if detail else "")
+            )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--region",
+        metavar="REGION",
+        help="Modal region in which to provision the Sandbox (default: automatic)",
+    )
+    args = parser.parse_args()
+
+    configured_passphrase = os.environ.get("YAS_MODAL_PASSPHRASE")
+    if configured_passphrase is not None and not configured_passphrase.strip():
+        parser.error("YAS_MODAL_PASSPHRASE must not be blank")
+    passphrase = configured_passphrase or secrets.token_urlsafe(24)
+    app = modal.App.lookup("yas", create_if_missing=True)
+    image = (
+        modal.Image.debian_slim()
+        .apt_install(
+            "ca-certificates",
+            "chromium",
+            "curl",
+            "firefox-esr",
+            "mesa-vulkan-drivers",
+        )
+        .run_commands(
+            (
+                "printf '%s\\n' "
+                "'CHROMIUM_FLAGS=\"$CHROMIUM_FLAGS "
+                "--no-sandbox --disable-dev-shm-usage\"' "
+                "> /etc/chromium.d/yas"
+            ),
+            "curl -fsSL https://yas.run/install.sh -o /tmp/install-yas",
+            "YAS_PREFIX=/usr/local sh /tmp/install-yas",
+            "rm /tmp/install-yas",
+            force_build=True,
+        )
+    )
+
+    sandbox = modal.Sandbox.create(
+        "/bin/sh",
+        "-c",
+        'mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR" '
+        "&& exec /usr/local/bin/yas server --edge --verbose "
+        ">/tmp/yas.log 2>&1",
+        app=app,
+        cpu=CPU_CORES,
+        gpu=GPU,
+        image=image,
+        memory=MEMORY_MIB,
+        env={
+            # Firefox's internal Wayland proxy uses sendmsg flags unsupported
+            # by Modal's gVisor runtime; connect to YAS Wayland directly.
+            "MOZ_DISABLE_WAYLAND_PROXY": "1",
+            "XDG_RUNTIME_DIR": "/tmp/yas-runtime",
+            "YAS_ADDR": f"0.0.0.0:{PORT}",
+            "YAS_PASSPHRASE": passphrase,
+        },
+        encrypted_ports=[PORT],
+        readiness_probe=modal.Probe.with_tcp(PORT),
+        region=args.region,
+        timeout=TIMEOUT,
+    )
+    print(f"Modal sandbox {sandbox.object_id} starting", file=sys.stderr)
+
+    try:
+        sandbox.wait_until_ready()
+        install_extensions(sandbox)
+        edge_url = sandbox.tunnels()[PORT].url.rstrip("/")
+        print(f"{edge_url}/#psk={quote(passphrase, safe='')}")
+        print(
+            f"Modal sandbox {sandbox.object_id} will stop after 24 hours",
+            file=sys.stderr,
+        )
+    except BaseException:
+        with contextlib.suppress(Exception):
+            sandbox.terminate()
+        with contextlib.suppress(Exception):
+            stderr = sandbox.stderr.read().strip()
+            if stderr:
+                print(stderr, file=sys.stderr)
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            sandbox.detach()
+
+
+if __name__ == "__main__":
+    main()

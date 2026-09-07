@@ -4,8 +4,12 @@ import { serverPlatform, type YasPlatform } from "./yas/core";
 import { DesktopStore } from "./desktopModel";
 import { EXIT_STATUS_UNKNOWN } from "./exit-status";
 import { MediaStore, MprisStore } from "./mediaModel";
-import { SurfaceStore } from "./SurfaceStore";
+import { SurfaceStore, type SurfaceFrameAckToken } from "./SurfaceStore";
 import { TerminalStore, type YasWasmModule } from "./TerminalStore";
+import {
+  currentBrowserClipboardEpoch,
+  noteBrowserClipboardMayHaveChanged as noteBrowserClipboardChange,
+} from "./clipboardAuthority";
 import type {
   ConnectionId,
   ConnectionStatus,
@@ -225,14 +229,31 @@ import { equalBytes, YasResultError, YasWriter } from "./yas/wire";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+const clipboardTextDecoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_QUERY_BYTES = 8 * 1024 * 1024;
+const WAYLAND_CLIPBOARD_EXPECTATION_TIMEOUT_MS = 10_000;
 
 function selectionTextMime(mimeTypes: readonly string[]): string | undefined {
-  return (
-    mimeTypes.find((value) => value === "text/plain;charset=utf-8") ??
-    mimeTypes.find((value) => value.startsWith("text/plain")) ??
-    mimeTypes.find((value) => value === "UTF8_STRING")
-  );
+  for (const mime of mimeTypes) {
+    if (mime.trim().toLowerCase() === "utf8_string") return mime;
+    const [type, ...parameters] = mime
+      .split(";")
+      .map((part) => part.trim().toLowerCase());
+    if (type !== "text/plain") continue;
+    const charsets: string[] = [];
+    for (const parameter of parameters) {
+      const [name, ...value] = parameter.split("=");
+      if (name?.trim() !== "charset") continue;
+      charsets.push(value.join("=").trim().replace(/^"|"$/g, ""));
+    }
+    if (
+      charsets.length === 0 ||
+      charsets.every((charset) => charset === "utf-8" || charset === "utf8")
+    ) {
+      return mime;
+    }
+  }
+  return undefined;
 }
 
 /** A custom Wayland cursor expressed as a valid CSS cursor value. */
@@ -278,12 +299,11 @@ function sameSurfaceStateExtension(
     : right !== undefined && equalBytes(left, right);
 }
 // One slot turns the reliable Surface stream into stop-and-wait: every frame
-// has to cross the link, enter WebCodecs, and send its ACK back before the
-// server may emit the next one. Worse, browser/native scheduling can batch
-// otherwise-immediate decode ACKs for about 100 ms. Cover that at 120 Hz plus
-// four scheduling slots. Byte credit independently bounds queued video, so
-// this sequence window supplies RTT headroom for small frames without
-// admitting a second oversized frame.
+// has to cross the link, leave WebCodecs, and send its ACK back before the
+// server may emit the next one. Cover about 100 ms at 120 Hz plus four normal
+// decoder-pipeline slots. Byte credit independently bounds queued video, and
+// output-based ACKs make this sequence window a hard bound on retained decode
+// work rather than allowing accepted inputs to accumulate without limit.
 const NATIVE_SURFACE_DECODER_CAPACITY = 16;
 
 interface NativeTerminalViewState {
@@ -337,6 +357,7 @@ interface NativeSurfaceViewState {
   lastReceived: bigint;
   lastPresented: bigint;
   decoderQueueDepth: number;
+  pendingFrames?: { sequence: bigint; complete: boolean }[];
 }
 
 interface NativeDragItemData {
@@ -466,10 +487,20 @@ export class YasNativeWorkspaceConnection {
     Set<(offset: number) => void>
   >();
   private selectionSlots: readonly YasSelectionSlotRecord[] = [];
+  /** Preserve user order across asynchronous staged SETs for each slot. */
+  private readonly selectionWrites = new Map<number, Promise<void>>();
   /** A Wayland copy/cut chord was forwarded but its Selection update may not
    * have completed the server round trip yet. */
   private waylandClipboardExpected = false;
   private waylandClipboardExpectedAfterRevision = 0n;
+  private waylandClipboardExpectedAtBrowserEpoch = 0n;
+  private waylandClipboardExpectationTimer: ReturnType<
+    typeof setTimeout
+  > | null = null;
+  /** Browser epoch observed when the current clipboard revision arrived.
+   * A later page-global browser copy supersedes this connection's stale
+   * Wayland owner until its next Selection revision. */
+  private clipboardBrowserEpoch = currentBrowserClipboardEpoch();
   private removeCatalog: (() => void) | null = null;
   private removeSelectionCatalog: (() => void) | null = null;
   private removeSurfaceCatalog: (() => void) | null = null;
@@ -550,8 +581,8 @@ export class YasNativeWorkspaceConnection {
     this.surfaceStore.onPresentationClock(({ surfaceId, sourceMs, clientMs }) =>
       this.noteSurfacePresentation(surfaceId, sourceMs, clientMs),
     );
-    this.surfaceStore.setAckSender((surfaceId, queueDepth) =>
-      this.acknowledgeSurface(surfaceId, queueDepth),
+    this.surfaceStore.setAckSender((surfaceId, ackToken, queueDepth) =>
+      this.acknowledgeSurface(surfaceId, ackToken, queueDepth),
     );
     this.surfaceStore.setKeyframeSender((surfaceId) => {
       void this.surfaceViews.get(surfaceId)?.view.reset();
@@ -763,6 +794,7 @@ export class YasNativeWorkspaceConnection {
     this.familyReconfigurationNeeded = false;
     this.familyInitializationQueued = false;
     this.familyGenerationBumpPending = false;
+    this.clearWaylandClipboardExpectation();
     this.cancelBrowserDrag("connection disposed");
     this.cancelAllNativeSurfaceViewRetries();
     this.pendingSurfaceResizeApplied = [];
@@ -1917,25 +1949,28 @@ export class YasNativeWorkspaceConnection {
 
   /** Direct typed Selection write. Large values use the family's bounded
    * Transfer lifecycle rather than an ad hoc browser fragmenter. */
-  sendClipboard(mimeType: string, data: Uint8Array): void {
-    this.waylandClipboardExpected = false;
-    this.waylandClipboardExpectedAfterRevision = 0n;
-    void this.setSelection(YAS_SELECTION_SLOT_CLIPBOARD, mimeType, data);
+  sendClipboard(mimeType: string, data: Uint8Array): Promise<void> {
+    this.noteBrowserClipboardMayHaveChanged();
+    return this.queueSelectionWrite(
+      YAS_SELECTION_SLOT_CLIPBOARD,
+      mimeType,
+      data,
+    );
   }
 
-  sendPrimary(mimeType: string, data: Uint8Array): void {
-    void this.setSelection(YAS_SELECTION_SLOT_PRIMARY, mimeType, data);
+  sendPrimary(mimeType: string, data: Uint8Array): Promise<void> {
+    return this.queueSelectionWrite(YAS_SELECTION_SLOT_PRIMARY, mimeType, data);
   }
 
   usesWaylandClipboard(): boolean {
-    return (
-      this.waylandClipboardExpected ||
-      this.selectionSlots.some(
-        (slot) =>
-          slot.slot === YAS_SELECTION_SLOT_CLIPBOARD &&
-          slot.ownerKind !== YAS_SELECTION_OWNER_NONE &&
-          slot.ownerKind !== YAS_SELECTION_OWNER_SESSION,
-      )
+    if (this.expectsWaylandClipboard()) return true;
+    if (currentBrowserClipboardEpoch() > this.clipboardBrowserEpoch)
+      return false;
+    return this.selectionSlots.some(
+      (slot) =>
+        slot.slot === YAS_SELECTION_SLOT_CLIPBOARD &&
+        slot.ownerKind !== YAS_SELECTION_OWNER_NONE &&
+        slot.ownerKind !== YAS_SELECTION_OWNER_SESSION,
     );
   }
 
@@ -1943,24 +1978,23 @@ export class YasNativeWorkspaceConnection {
     const slot = this.selectionSlots.find(
       (candidate) => candidate.slot === YAS_SELECTION_SLOT_CLIPBOARD,
     );
-    if (
-      this.waylandClipboardExpected &&
-      (!slot ||
-        slot.ownerKind === YAS_SELECTION_OWNER_NONE ||
-        slot.ownerKind === YAS_SELECTION_OWNER_SESSION)
-    ) {
-      return this.nextWaylandClipboardText(slot?.revision ?? 0n).catch(
-        () => null,
-      );
+    if (this.expectsWaylandClipboard()) {
+      return this.nextWaylandClipboardText(
+        this.waylandClipboardExpectedAfterRevision,
+      ).catch(() => null);
     }
     if (!slot) return null;
     const mime = selectionTextMime(slot.mimeTypes);
     if (!mime) return null;
-    const result = await this.selection.get({
-      target: { kind: "slot", slot: slot.slot, revision: slot.revision },
-      mime,
-    });
-    return textDecoder.decode(await result.bytes());
+    try {
+      const result = await this.selection.get({
+        target: { kind: "slot", slot: slot.slot, revision: slot.revision },
+        mime,
+      });
+      return clipboardTextDecoder.decode(await result.bytes());
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1982,10 +2016,32 @@ export class YasNativeWorkspaceConnection {
     const current = this.selectionSlots.find(
       (candidate) => candidate.slot === YAS_SELECTION_SLOT_CLIPBOARD,
     );
-    const text = this.nextWaylandClipboardText(current?.revision ?? 0n);
+    const browserEpoch = currentBrowserClipboardEpoch();
+    const requireCurrentBrowserEpoch = () => {
+      if (currentBrowserClipboardEpoch() !== browserEpoch) {
+        throw new Error("browser clipboard changed during Wayland export");
+      }
+    };
+    const text = this.nextWaylandClipboardText(current?.revision ?? 0n).then(
+      (value) => {
+        requireCurrentBrowserEpoch();
+        return value;
+      },
+    );
+    const exported = () => {
+      requireCurrentBrowserEpoch();
+      // The host now carries this connection's current Wayland selection.
+      // Invalidate stale Wayland owners on peers, but keep this connection's
+      // richer multi-MIME source authoritative for direct local pastes.
+      this.clipboardBrowserEpoch = noteBrowserClipboardChange();
+    };
     const fallback = () =>
       text
-        .then((value) => navigator.clipboard.writeText(value))
+        .then((value) => {
+          requireCurrentBrowserEpoch();
+          return navigator.clipboard.writeText(value);
+        })
+        .then(exported)
         .catch(() => undefined);
 
     if (
@@ -2001,7 +2057,7 @@ export class YasNativeWorkspaceConnection {
           (value) => new Blob([value], { type: "text/plain" }),
         ),
       });
-      void navigator.clipboard.write([item]).catch(fallback);
+      void navigator.clipboard.write([item]).then(exported).catch(fallback);
     } catch {
       void fallback();
     }
@@ -2046,7 +2102,8 @@ export class YasNativeWorkspaceConnection {
             mime,
           })
           .then((result) => result.bytes())
-          .then((bytes) => resolve(textDecoder.decode(bytes)), reject);
+          .then((bytes) => clipboardTextDecoder.decode(bytes))
+          .then(resolve, reject);
       };
       remove = this.subscribe(finish);
       finish();
@@ -2054,16 +2111,51 @@ export class YasNativeWorkspaceConnection {
   }
 
   noteWaylandClipboardMayHaveChanged(): void {
+    this.clearWaylandClipboardExpectation();
     this.waylandClipboardExpected = true;
+    this.waylandClipboardExpectedAtBrowserEpoch =
+      currentBrowserClipboardEpoch();
     this.waylandClipboardExpectedAfterRevision =
       this.selectionSlots.find(
         (candidate) => candidate.slot === YAS_SELECTION_SLOT_CLIPBOARD,
       )?.revision ?? 0n;
+    const revision = this.waylandClipboardExpectedAfterRevision;
+    const epoch = this.waylandClipboardExpectedAtBrowserEpoch;
+    this.waylandClipboardExpectationTimer = setTimeout(() => {
+      if (
+        this.waylandClipboardExpectedAfterRevision === revision &&
+        this.waylandClipboardExpectedAtBrowserEpoch === epoch
+      ) {
+        this.clearWaylandClipboardExpectation();
+      }
+    }, WAYLAND_CLIPBOARD_EXPECTATION_TIMEOUT_MS);
   }
 
   noteBrowserClipboardMayHaveChanged(): void {
+    this.clearWaylandClipboardExpectation();
+    noteBrowserClipboardChange();
+  }
+
+  private clearWaylandClipboardExpectation(): void {
     this.waylandClipboardExpected = false;
     this.waylandClipboardExpectedAfterRevision = 0n;
+    this.waylandClipboardExpectedAtBrowserEpoch = 0n;
+    if (this.waylandClipboardExpectationTimer !== null) {
+      clearTimeout(this.waylandClipboardExpectationTimer);
+      this.waylandClipboardExpectationTimer = null;
+    }
+  }
+
+  private expectsWaylandClipboard(): boolean {
+    if (!this.waylandClipboardExpected) return false;
+    if (
+      currentBrowserClipboardEpoch() <=
+      this.waylandClipboardExpectedAtBrowserEpoch
+    ) {
+      return true;
+    }
+    this.clearWaylandClipboardExpectation();
+    return false;
   }
 
   subscribeClients(
@@ -2505,17 +2597,26 @@ export class YasNativeWorkspaceConnection {
       );
       this.removeSelectionCatalog?.();
       this.removeSelectionCatalog = selection.catalog.subscribe((snapshot) => {
+        const previousClipboard = this.selectionSlots.find(
+          (slot) => slot.slot === YAS_SELECTION_SLOT_CLIPBOARD,
+        );
         this.selectionSlots = snapshot.slots;
         const clipboard = snapshot.slots.find(
           (slot) => slot.slot === YAS_SELECTION_SLOT_CLIPBOARD,
         );
         if (
+          clipboard &&
+          (!previousClipboard ||
+            clipboard.revision !== previousClipboard.revision)
+        ) {
+          this.clipboardBrowserEpoch = currentBrowserClipboardEpoch();
+        }
+        if (
           this.waylandClipboardExpected &&
           clipboard &&
           clipboard.revision > this.waylandClipboardExpectedAfterRevision
         ) {
-          this.waylandClipboardExpected = false;
-          this.waylandClipboardExpectedAfterRevision = 0n;
+          this.clearWaylandClipboardExpectation();
         }
         this.emit();
       });
@@ -2532,6 +2633,8 @@ export class YasNativeWorkspaceConnection {
       this.selectionClient.dispose();
       this.selectionClient = null;
       this.selectionSlots = [];
+      this.clearWaylandClipboardExpectation();
+      this.clipboardBrowserEpoch = currentBrowserClipboardEpoch();
     }
     if (
       this.supportsStateCatalogue(
@@ -3278,6 +3381,7 @@ export class YasNativeWorkspaceConnection {
       lastReceived: view.result.firstSequence - 1n,
       lastPresented: view.result.firstSequence - 1n,
       decoderQueueDepth: 0,
+      pendingFrames: [],
     };
     this.surfaceViews.set(surfaceId, state);
     this.deliverSurfaceResizeFrameReady(surfaceId, resizeCallbacks);
@@ -3297,9 +3401,17 @@ export class YasNativeWorkspaceConnection {
   ): void {
     if (frame.viewId !== state.view.result.viewId) return;
     state.lastReceived = frame.sequence;
+    const ackToken = { viewId: frame.viewId, sequence: frame.sequence };
+    (state.pendingFrames ??= []).push({
+      sequence: frame.sequence,
+      complete: false,
+    });
     // EOS carries only the packed-codec metadata envelope. It is a reliable
     // lifetime boundary, not an empty access unit for WebCodecs to validate.
-    if (frame.flags & YAS_SURFACE_FRAME_END_OF_STREAM) return;
+    if (frame.flags & YAS_SURFACE_FRAME_END_OF_STREAM) {
+      this.acknowledgeSurface(surfaceId, ackToken, state.decoderQueueDepth);
+      return;
+    }
     // Audio and video capture times share the compositor epoch. The server's
     // presentation timestamp is stamped after encoding on a different clock
     // and cannot participate in end-to-end A/V latency measurement.
@@ -3318,18 +3430,24 @@ export class YasNativeWorkspaceConnection {
         ? SURFACE_FRAME_FLAG_KEYFRAME
         : 0);
     const packed = decodeSurfaceCodecPayload(frame.codecVersion, frame.payload);
-    this.surfaceStore.handleSurfaceFrame(
-      surfaceId,
-      timestampMs,
-      flags,
-      packed.dimensions?.width ?? state.width,
-      packed.dimensions?.height ?? state.height,
-      packed.bitstream,
-      timestampSubUs,
-      state.width,
-      state.height,
-      packed.logicalDimensions ?? this.surfaceLogicalSize(surfaceId),
-    );
+    try {
+      this.surfaceStore.handleSurfaceFrame(
+        surfaceId,
+        timestampMs,
+        flags,
+        packed.dimensions?.width ?? state.width,
+        packed.dimensions?.height ?? state.height,
+        packed.bitstream,
+        timestampSubUs,
+        state.width,
+        state.height,
+        packed.logicalDimensions ?? this.surfaceLogicalSize(surfaceId),
+        ackToken,
+      );
+    } catch (error) {
+      this.surfaceStore.sendAckFallback(surfaceId, ackToken);
+      throw error;
+    }
   }
 
   private surfaceLogicalSize(
@@ -3345,12 +3463,22 @@ export class YasNativeWorkspaceConnection {
 
   private acknowledgeSurface(
     surfaceId: SurfaceId,
+    ackToken: SurfaceFrameAckToken | undefined,
     decoderQueueDepth: number,
   ): void {
     const state = this.surfaceViews.get(surfaceId);
     if (!state || state.lastReceived < state.view.result.firstSequence) return;
     state.decoderQueueDepth = Math.max(0, Math.min(0xffff, decoderQueueDepth));
-    state.lastPresented = state.lastReceived;
+    if (ackToken?.viewId === state.view.result.viewId) {
+      const pendingFrames = (state.pendingFrames ??= []);
+      const completed = pendingFrames.find(
+        (frame) => frame.sequence === ackToken.sequence,
+      );
+      if (completed) completed.complete = true;
+      while (pendingFrames[0]?.complete) {
+        state.lastPresented = pendingFrames.shift()!.sequence;
+      }
+    }
     state.view.acknowledge(this.surfaceFeedback(state));
   }
 
@@ -3871,6 +3999,29 @@ export class YasNativeWorkspaceConnection {
     transfer.closeWrite();
     await transfer.closed;
     await this.selection.commitSet(batch.stagingHandle, operationId());
+  }
+
+  private queueSelectionWrite(
+    slot: number,
+    mime: string,
+    data: Uint8Array,
+  ): Promise<void> {
+    const previous = this.selectionWrites.get(slot) ?? Promise.resolve();
+    const write = previous
+      .catch(() => undefined)
+      .then(() => this.setSelection(slot, mime, data));
+    this.selectionWrites.set(slot, write);
+    void write.then(
+      () => {
+        if (this.selectionWrites.get(slot) === write)
+          this.selectionWrites.delete(slot);
+      },
+      () => {
+        if (this.selectionWrites.get(slot) === write)
+          this.selectionWrites.delete(slot);
+      },
+    );
+    return write;
   }
 
   private sessionId(handle: bigint): SessionId {

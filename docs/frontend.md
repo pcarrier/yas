@@ -239,16 +239,37 @@ Wayland-owned selections are published in the native Selection catalogue with
 their full MIME offer. Content remains in the owning application and is fetched
 through Selection `GET` only when a terminal, editor, or host clipboard bridge
 requests a representation. If the browser rejects the host write, the
-catalogued selection remains available inside yas.
+catalogued selection remains available inside YAS.
+
+Terminal selections outside the rendered viewport require a server
+`COPY_RANGE` request. They reserve the same promised `ClipboardItem` during the
+initiating gesture, then resolve it when the range arrives, so browser user
+activation does not expire mid-copy. OSC 52 writes from PTY output are ignored:
+terminal output is untrusted and cannot asynchronously replace the user's host
+or Wayland clipboard.
+
+Host clipboard authority is page-global. One epoch is advanced by DOM copy/cut,
+window blur, every successful programmatic UI copy, and every completed
+Wayland-to-host mirror. Each connection records the epoch at which its current
+Selection revision arrived, so a host copy in one pane or connection supersedes
+stale Wayland owners in every other connection. A completed mirror attributes
+that new epoch to its source connection, preserving its richer multi-MIME owner
+for direct local pastes.
 
 ### Paste
 
 Pasting into a Wayland surface is not a keystroke, it is a keystroke with a
 prerequisite: the app reads the selection the instant it sees Ctrl+V, so
 `YasSurfaceCanvas` holds the V press back until the clipboard has been stored
-through the native Selection family, then releases press, V release and Ctrl
-release in order. Clipboard reads and focus loss settle the chord; a failed
-read gives up rather than delivering V with a stale selection behind it.
+through the native Selection family and its SET result has succeeded, then
+releases press, V release and Ctrl release in order. This result barrier matters
+for values above 32 KiB, whose hash, upload Transfer, close, and SET_COMMIT are
+asynchronous. Clipboard reads and focus loss settle the chord; a failed read,
+failed SET, or empty host clipboard gives up rather than delivering V with a
+stale selection behind it. A
+10-second safety timer also releases deferred modifiers if a browser permission
+promise never settles. PRIMARY offers use the same commit barrier before the
+middle-button press.
 
 A paste event and async clipboard reads can supply the content, because neither
 path is reliable alone. `navigator.clipboard.readText()` may be denied without
@@ -273,10 +294,9 @@ takes the stand-down path rather than the flush's: warn, stand the chord down,
 no V. Values within that browser limit use Selection's bounded inline or
 Transfer delivery and are never truncated. Pressing V after refusing the new
 value would paste whatever the selection held _before_, which is not what was
-copied. An empty clipboard is the one case that still presses V without
-sending, and deliberately: nothing
-was withheld, so the selection the app reads is whichever Wayland client owns
-it — copy in one surface, paste into another, browser never in the middle.
+copied. An empty host clipboard also stands down. A known live Wayland owner
+still takes the direct path without importing the browser clipboard — copy in
+one surface, paste into another, browser never in the middle.
 The copy/cut keydown marks that ownership locally before the Selection snapshot
 can complete its server round trip, so an immediate switch to another surface
 cannot import a stale host clipboard in the gap.
@@ -288,11 +308,12 @@ would go out once per listener.
 
 Terminal paste observes the same clipboard authority. While a Wayland client
 owns the selection, `YasTerminalSurface` takes text from the connection's
-in-memory mirror instead of `navigator.clipboard`; if the eager content did not
-reach this web client, it watches the Selection catalogue and uses Selection
-`GET` to fetch it from the compositor. This keeps surface-to-terminal copy working when the browser
-rejects the unsolicited host-clipboard write. A live Wayland selection with
-no text representation does not fall through to stale host clipboard text.
+Selection catalogue instead of `navigator.clipboard`, then uses Selection `GET`
+to fetch it lazily from the compositor. This keeps surface-to-terminal copy
+working when the browser rejects the host-clipboard write. A live Wayland
+selection with no supported UTF-8 text representation does not fall through to
+stale host clipboard text. Image paste waits for its Selection SET result before
+sending the terminal's paste-trigger byte.
 
 ### Hyperlinks
 
@@ -367,6 +388,12 @@ GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headl
 
 - Codec is selected by native Surface view negotiation and carried as the `codec_version` on each Surface `FRAME`; frame flags identify keyframes, codec configuration, and discardable frames.
 - `optimizeForLatency: true` is set on the decoder to minimize decode delay.
+- Surface frame credit advances from the WebCodecs output callback, not from
+  `decode()`. The reported decoder depth counts submitted chunks still waiting
+  for output, so a platform decoder cannot hide a deep internal queue by merely
+  accepting more input. Intentionally dropped and failed chunks are consumed in
+  sequence, and cumulative feedback never jumps over an earlier unfinished
+  frame.
 - Decoder configurations include the current encoded dimensions and square-pixel display aspect for H.264 and AV1, including after rotation and adaptive resolution changes. These come from the stream, not the pane or logical window, so Android hardware decoding does not start from Chromium's default 1280×720 size guess.
 - Decoded `VideoFrame`s are rendered to a canvas by `YasSurfaceView` (React/Solid component).
 - Shared surface sizing first expands each viewer's logical box by any zoom-out forced by the application's minimum size, then takes the tightest bound on each axis. A 360×780 pane facing a 500px minimum width can therefore offer 500×1083 logical pixels; another viewer can still limit the height. Committed minima travel separately from rendered geometry so repeated frames cannot inflate the window, and releasing a minimum restores the original bounds. Maximum hints remain enforced by the compositor. Stream pixels stay bounded by viewers' physical panes.

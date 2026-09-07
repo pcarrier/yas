@@ -362,7 +362,7 @@ struct SelectionSlot {
 
 enum SelectionItem {
     Retained(Arc<Vec<u8>>),
-    Compositor,
+    Compositor(u64),
 }
 
 struct SelectionOperationReplay {
@@ -461,7 +461,7 @@ impl SelectionStore {
     /// Replace the clipboard record with the offer owned by a Wayland data
     /// source. Its bytes stay in that source and are fetched through the
     /// compositor only when a Selection client issues GET.
-    pub(crate) fn set_compositor_clipboard(&self, mut mime_types: Vec<String>) {
+    pub(crate) fn set_compositor_clipboard(&self, generation: u64, mut mime_types: Vec<String>) {
         mime_types.retain(|mime| !mime.is_empty() && mime.len() <= yas_selection::MAX_MIME_BYTES);
         mime_types.sort();
         mime_types.dedup();
@@ -479,7 +479,7 @@ impl SelectionStore {
                 record: yas_selection::SelectionRecord {
                     slot: yas_wire::schema::selection::SLOT_CLIPBOARD as u8,
                     owner_kind: yas_wire::schema::selection::OWNER_EXTERNAL as u8,
-                    owner_handle: revision,
+                    owner_handle: generation,
                     revision,
                     mime_types,
                     extensions: Extensions::default(),
@@ -677,7 +677,7 @@ impl SelectionStore {
                 .iter()
                 .any(|offered| offered == mime)
         {
-            return Ok(SelectionItem::Compositor);
+            return Ok(SelectionItem::Compositor(current.record.owner_handle));
         }
         Err(SelectionStoreError::NotFound)
     }
@@ -10503,8 +10503,11 @@ impl Session {
         let store = self.selection.as_ref().ok_or(())?.store.clone();
         let bytes = match store.get(slot, revision, &request.mime) {
             Ok(SelectionItem::Retained(bytes)) => bytes,
-            Ok(SelectionItem::Compositor) => {
-                match self.read_compositor_clipboard(&request.mime).await {
+            Ok(SelectionItem::Compositor(generation)) => {
+                match self
+                    .read_compositor_clipboard(generation, &request.mime)
+                    .await
+                {
                     Ok(Some(bytes)) => Arc::new(bytes),
                     Ok(None) => {
                         return self
@@ -10577,7 +10580,11 @@ impl Session {
         Ok(())
     }
 
-    async fn read_compositor_clipboard(&self, mime: &str) -> Result<Option<Vec<u8>>, Status> {
+    async fn read_compositor_clipboard(
+        &self,
+        generation: u64,
+        mime: &str,
+    ) -> Result<Option<Vec<u8>>, Status> {
         let Some(state) = self.services.app_state.as_ref() else {
             return Err(Status::Unavailable);
         };
@@ -10590,6 +10597,7 @@ impl Session {
             try_send_compositor_command(
                 &compositor.handle.command_tx,
                 yas_compositor::CompositorCommand::ClipboardGet {
+                    generation,
                     mime_type: mime.to_owned(),
                     reply,
                 },
@@ -10670,10 +10678,6 @@ impl Session {
             .iter()
             .map(|(mime, data)| (mime.clone(), data.as_ref().clone()))
             .collect::<Vec<_>>();
-        let shared = state.session.lock().await;
-        let Some(compositor) = shared.compositor.as_ref() else {
-            return Ok(());
-        };
         let command = if slot == yas_wire::schema::selection::SLOT_PRIMARY as u8 {
             if items.is_empty() {
                 yas_compositor::CompositorCommand::PrimaryClear
@@ -10685,8 +10689,17 @@ impl Session {
         } else {
             yas_compositor::CompositorCommand::ClipboardOffers { items }
         };
-        try_send_compositor_command(&compositor.handle.command_tx, command)?;
-        compositor.handle.wake();
+        let sender = {
+            let shared = state.session.lock().await;
+            let Some(compositor) = shared.compositor.as_ref() else {
+                return Ok(());
+            };
+            compositor.handle.command_sender()
+        };
+        tokio::task::spawn_blocking(move || sender.send(command))
+            .await
+            .map_err(|_| Status::Internal)?
+            .map_err(|_| Status::Unavailable)?;
         Ok(())
     }
 
@@ -37255,12 +37268,15 @@ mod tests {
     #[test]
     fn compositor_clipboard_is_catalogued_and_fetched_lazily() {
         let store = SelectionStore::new();
-        store.set_compositor_clipboard(vec![
-            "text/plain;charset=utf-8".to_owned(),
-            "image/png".to_owned(),
-            "text/plain;charset=utf-8".to_owned(),
-            "".to_owned(),
-        ]);
+        store.set_compositor_clipboard(
+            73,
+            vec![
+                "text/plain;charset=utf-8".to_owned(),
+                "image/png".to_owned(),
+                "text/plain;charset=utf-8".to_owned(),
+                "".to_owned(),
+            ],
+        );
 
         let snapshot = store.snapshot();
         let clipboard = snapshot
@@ -37271,6 +37287,7 @@ mod tests {
             clipboard.record.owner_kind,
             yas_wire::schema::selection::OWNER_EXTERNAL as u8,
         );
+        assert_eq!(clipboard.record.owner_handle, 73);
         assert_eq!(
             clipboard.record.mime_types,
             vec![
@@ -37284,7 +37301,7 @@ mod tests {
                 clipboard.record.revision,
                 "text/plain;charset=utf-8",
             ),
-            Ok(SelectionItem::Compositor),
+            Ok(SelectionItem::Compositor(73)),
         ));
 
         store.clear_compositor_clipboard();

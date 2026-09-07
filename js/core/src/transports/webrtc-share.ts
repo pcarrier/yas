@@ -18,6 +18,11 @@ import {
 } from "../types";
 
 const PBKDF2_ROUNDS = 100_000;
+// The producer gathers its non-trickle candidates before answering (up to
+// three seconds), and TURN/TCP permission setup can continue after that.
+// Ten seconds from RTCPeerConnection construction cut off healthy restrictive
+// network attempts while ICE was still checking.
+const SHARE_CONNECT_TIMEOUT_MS = 30_000;
 
 async function pbkdf2Derive(
   input: Uint8Array,
@@ -325,7 +330,10 @@ export function createShareTransport(
     dbg.log("status %s → %s", _status, s);
     _status = s;
     for (const l of statusListeners) l(s);
-    if (s === "disconnected" || s === "error") {
+    // A listener can request an immediate reconnect synchronously. Do not
+    // leave the delayed retry armed behind that fresh generation: it would
+    // tear the new peer down one second into ICE checking.
+    if (_status === s && (s === "disconnected" || s === "error")) {
       scheduleReconnect();
     }
   }
@@ -516,7 +524,13 @@ export function createShareTransport(
       peerConnection.onsignalingstatechange = () =>
         dbg.log("pc.signalingState = %s", peerConnection.signalingState);
 
-      const dcTransport = createWebRtcDataChannelTransport(peerConnection);
+      // Replacing the RTCPeerConnection is the only useful recovery after ICE
+      // failure. The wrapper owns that retry; reopening SCTP channels on the
+      // failed connection only competes with it.
+      const dcTransport = createWebRtcDataChannelTransport(peerConnection, {
+        connectTimeoutMs: SHARE_CONNECT_TIMEOUT_MS,
+        reconnect: false,
+      });
       inner = dcTransport;
 
       // Forward inner transport events

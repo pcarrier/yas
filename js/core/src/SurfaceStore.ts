@@ -205,7 +205,11 @@ export function estimateSourceToReceiveMs(
 type SurfaceCodec = "h264" | "av1";
 
 interface DecoderEntry {
-  pendingPresentation: { ptsUs: number; size: SurfaceFramePresentationSize }[];
+  pendingPresentation: {
+    ptsUs: number;
+    size: SurfaceFramePresentationSize;
+    ackToken?: SurfaceFrameAckToken;
+  }[];
   decoder: VideoDecoder;
   codec: SurfaceCodec;
   pendingKeyframe: boolean;
@@ -241,6 +245,12 @@ export interface SurfaceFramePresentationSize {
   height: number;
   logicalWidth?: number;
   logicalHeight?: number;
+}
+
+/** Opaque native-view identity carried from receipt through decoder output. */
+export interface SurfaceFrameAckToken {
+  viewId: number;
+  sequence: bigint;
 }
 
 interface CanvasEntry {
@@ -1030,12 +1040,16 @@ export class SurfaceStore {
 
   /**
    * Callback to send a surface ACK to the server.  Injected by the
-   * connection layer; each ACK carries the current WebCodecs queue depth so
-   * the server sees decoder pressure without interpreting JS scheduling as
-   * congestion.
+   * connection layer. A frame token is returned only after WebCodecs outputs
+   * it (or YAS deliberately consumes it without decoding), and queue depth is
+   * the number of submitted chunks still waiting for output.
    */
   private _ackSender:
-    | ((surfaceId: SurfaceId, decoderQueueDepth: number) => void)
+    | ((
+        surfaceId: SurfaceId,
+        ackToken: SurfaceFrameAckToken | undefined,
+        decoderQueueDepth: number,
+      ) => void)
     | null = null;
 
   /**
@@ -1047,7 +1061,11 @@ export class SurfaceStore {
 
   /** Install the ACK sender callback (called once by YasConnection). */
   setAckSender(
-    fn: (surfaceId: SurfaceId, decoderQueueDepth: number) => void,
+    fn: (
+      surfaceId: SurfaceId,
+      ackToken: SurfaceFrameAckToken | undefined,
+      decoderQueueDepth: number,
+    ) => void,
   ): void {
     this._ackSender = fn;
   }
@@ -1216,23 +1234,25 @@ export class SurfaceStore {
     this._codecDemoter?.(surfaceId, bits);
   }
 
-  private sendAck(surfaceId: SurfaceId): void {
-    let decoderQueueDepth = 0;
-    const entry = this.decoders.get(surfaceId);
-    try {
-      if (entry?.decoder.state === "configured") {
-        decoderQueueDepth = entry.decoder.decodeQueueSize;
-      }
-    } catch {
-      // The decoder can close between the state and queue-depth reads.
-    }
-    this._ackSender?.(surfaceId, decoderQueueDepth);
+  private sendAck(surfaceId: SurfaceId, ackToken?: SurfaceFrameAckToken): void {
+    const decoderQueueDepth =
+      this.decoders.get(surfaceId)?.pendingPresentation.length ?? 0;
+    this._ackSender?.(surfaceId, ackToken, decoderQueueDepth);
+  }
+
+  /** Consume every chunk owned by a decoder that cannot produce more output. */
+  private discardPendingDecoderFrames(
+    surfaceId: SurfaceId,
+    entry: DecoderEntry,
+  ): void {
+    const pending = entry.pendingPresentation.splice(0);
+    for (const frame of pending) this.sendAck(surfaceId, frame.ackToken);
   }
 
   /** Send an ACK unconditionally — used by the connection layer's catch
    *  path when handleSurfaceFrame throws before it can ACK itself. */
-  sendAckFallback(surfaceId: SurfaceId): void {
-    this.sendAck(surfaceId);
+  sendAckFallback(surfaceId: SurfaceId, ackToken?: SurfaceFrameAckToken): void {
+    this.sendAck(surfaceId, ackToken);
   }
 
   /**
@@ -1344,7 +1364,7 @@ export class SurfaceStore {
     dropped: number;
     /** Cumulative decode error count. */
     errors: number;
-    /** Current WebCodecs decode queue depth. */
+    /** Submitted chunks still waiting for WebCodecs output. */
     queueDepth: number;
     /** RTT of the midpoint clock sample used for latency estimation. */
     clockRttMs: number | null;
@@ -1355,15 +1375,7 @@ export class SurfaceStore {
       // don't have their own encoder or codec.
       if (surface.parentId !== 0n) continue;
       const entry = this.decoders.get(id);
-      let queueDepth = 0;
-      try {
-        queueDepth =
-          entry && entry.decoder.state === "configured"
-            ? entry.decoder.decodeQueueSize
-            : 0;
-      } catch {
-        // decoder may be closed
-      }
+      const queueDepth = entry?.pendingPresentation.length ?? 0;
       result.push({
         surfaceId: id,
         codec: entry?.codec ?? "",
@@ -1559,6 +1571,7 @@ export class SurfaceStore {
     presentationWidth: number = width,
     presentationHeight: number = height,
     logicalSize?: { width: number; height: number },
+    ackToken?: SurfaceFrameAckToken,
   ): void {
     this._diag.received++;
     const receiveT = performance.now();
@@ -1601,6 +1614,7 @@ export class SurfaceStore {
     let entry = this.decoders.get(surfaceId);
     if (!entry || entry.codec !== codec) {
       if (entry) {
+        this.discardPendingDecoderFrames(surfaceId, entry);
         safeClose(entry.decoder);
       }
       this.decoders.delete(surfaceId);
@@ -1611,7 +1625,7 @@ export class SurfaceStore {
     }
     if (!entry) {
       // No decoder — ACK immediately so the server doesn't stall.
-      this.sendAck(surfaceId);
+      this.sendAck(surfaceId, ackToken);
       // initDecoder could not configure one for the codec string it had.
       // A re-subscribe rebuilds the session and re-announces that string,
       // which is the only thing that can change the outcome.  Rate-limited
@@ -1628,7 +1642,7 @@ export class SurfaceStore {
         (this._surfaceDrops.get(surfaceId) ?? 0) + 1,
       );
       // Dropped frame — ACK immediately.
-      this.sendAck(surfaceId);
+      this.sendAck(surfaceId, ackToken);
       // Deltas arriving while we wait mean the keyframe this flag was set
       // for may never come on its own — the reconfigure path relies on the
       // server's promise that a rebuilt session opens with one, and that
@@ -1665,7 +1679,7 @@ export class SurfaceStore {
     if (isKey && streamDimensionsChanged) {
       entry = this.replaceDecoder(surfaceId, codec, width, height);
       if (!entry) {
-        this.sendAck(surfaceId);
+        this.sendAck(surfaceId, ackToken);
         this.retryUnconfigured(surfaceId);
         return;
       }
@@ -1769,7 +1783,7 @@ export class SurfaceStore {
       // configuration (for example VPS/SPS/PPS or an HVCC prefix).
       if (entry.decoder.state !== "configured") {
         this._diag.dropped++;
-        this.sendAck(surfaceId);
+        this.sendAck(surfaceId, ackToken);
         // Nothing else will configure this decoder on its own — ask for a
         // keyframe, which re-subscribes and rebuilds the session (and with
         // it the codec announcement).  Rate-limited and capped.
@@ -1799,6 +1813,7 @@ export class SurfaceStore {
       // this frame. Updating the canvas here relabels still-visible old pixels.
       entry.pendingPresentation.push({
         ptsUs,
+        ackToken,
         size: {
           width: presentationWidth || width,
           height: presentationHeight || height,
@@ -1816,11 +1831,6 @@ export class SurfaceStore {
       // that the decoder actually produced a frame.
       if (isKey) entry.pendingKeyframe = false;
       this._diag.decoded++;
-
-      // ACK immediately with decodeQueueSize.  Deferring until output would
-      // mix decode latency into delivery accounting; queue depth reports the
-      // same pressure directly and independently of path RTT.
-      this.sendAck(surfaceId);
     } catch (e) {
       const pending = entry.pendingPresentation;
       if (pending[pending.length - 1]?.ptsUs === ptsUs) pending.pop();
@@ -1829,6 +1839,10 @@ export class SurfaceStore {
         const pending = this._pendingFrameSamples.get(surfaceId);
         pending?.removeToken(sampleToken);
       }
+      // This chunk was not accepted by WebCodecs. Mark it consumed without
+      // jumping over older chunks that are still awaiting output; the
+      // connection layer advances only contiguous completed sequences.
+      this.sendAck(surfaceId, ackToken);
       console.warn(
         "[yas] surface decode error:",
         surfaceId,
@@ -2925,7 +2939,10 @@ export class SurfaceStore {
     height: number,
   ): DecoderEntry | undefined {
     const previous = this.decoders.get(surfaceId);
-    if (previous) safeClose(previous.decoder);
+    if (previous) {
+      this.discardPendingDecoderFrames(surfaceId, previous);
+      safeClose(previous.decoder);
+    }
     this.decoders.delete(surfaceId);
     this._pendingFrameSamples.delete(surfaceId);
     this._pendingFrameReceiveTimes.delete(surfaceId);
@@ -2966,6 +2983,13 @@ export class SurfaceStore {
         // painted forever even while native-size frames keep arriving.
         if (active?.decoder !== decoder) {
           this._diag.dropped++;
+          const pendingIndex = entry.pendingPresentation.findIndex(
+            (pending) => pending.ptsUs === frame.timestamp,
+          );
+          if (pendingIndex >= 0) {
+            const [pending] = entry.pendingPresentation.splice(pendingIndex, 1);
+            this.sendAck(surfaceId, pending.ackToken);
+          }
           this._pendingFrameReceiveTimes
             .get(surfaceId)
             ?.takeByPts(frame.timestamp);
@@ -2988,9 +3012,11 @@ export class SurfaceStore {
         const pendingIndex = active.pendingPresentation.findIndex(
           (p) => p.ptsUs === frame.timestamp,
         );
+        let ackToken: SurfaceFrameAckToken | undefined;
         if (pendingIndex >= 0) {
           const [pending] = active.pendingPresentation.splice(pendingIndex, 1);
           this.framePresentation.set(frame, pending.size);
+          ackToken = pending.ackToken;
         }
         this._diag.output++;
         // A decoded frame ends any failure streak — demotion is for
@@ -3000,6 +3026,7 @@ export class SurfaceStore {
         this._unconfiguredRetry.delete(surfaceId);
         active.pendingKeyframe = false;
         active.keyframeRequested = false;
+        if (pendingIndex >= 0) this.sendAck(surfaceId, ackToken);
 
         const outputT = performance.now();
         const receiveT =
@@ -3051,6 +3078,7 @@ export class SurfaceStore {
         // instance by the time this async callback fires.
         const entry = this.decoders.get(surfaceId);
         if (entry?.decoder === decoder) {
+          this.discardPendingDecoderFrames(surfaceId, entry);
           safeClose(entry.decoder);
           this.decoders.delete(surfaceId);
         }

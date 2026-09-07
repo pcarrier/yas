@@ -252,12 +252,9 @@ mod stub {
             logical_width: u16,
             logical_height: u16,
         },
-        ClipboardContent {
-            mime_type: String,
-            data: Vec<u8>,
-        },
         ClipboardOwner {
             wayland: bool,
+            generation: u64,
             mime_types: Vec<String>,
         },
         SurfaceCursor {
@@ -433,6 +430,7 @@ mod stub {
         },
         /// Read clipboard content for a specific MIME type.
         ClipboardGet {
+            generation: u64,
             mime_type: String,
             reply: mpsc::SyncSender<Option<Vec<u8>>>,
         },

@@ -21,6 +21,7 @@ import {
   SEARCH_SOURCE_SCROLLBACK,
   SEARCH_SOURCE_TITLE,
   SEARCH_SOURCE_VISIBLE,
+  noteBrowserClipboardMayHaveChanged,
 } from "@yas-run/core";
 import type {
   YasSearchResult,
@@ -1645,7 +1646,10 @@ export function SwitcherOverlay(props: {
         props.workspaceSessionId ?? workspaceSessionIdFromHash(location.hash);
       if (sessionId) {
         const url = workspaceSessionShareUrl(location, sessionId);
-        navigator.clipboard.writeText(url).catch(() => {});
+        navigator.clipboard
+          .writeText(url)
+          .then(() => noteBrowserClipboardMayHaveChanged())
+          .catch(() => {});
       }
       props.onClose();
       return;

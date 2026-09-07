@@ -240,6 +240,49 @@ fn decode_data_indication(data: &[u8]) -> Option<(SocketAddr, Vec<u8>)> {
     Some((peer_addr?, payload?))
 }
 
+enum RelayControlMessage {
+    Success,
+    Data(SocketAddr, Vec<u8>),
+    Error(String),
+    Ignore,
+}
+
+/// Classify one message read while a TURN control transaction is pending.
+///
+/// TURN-over-TCP/TLS multiplexes transaction responses and relayed
+/// DATA-INDICATIONs on the same byte stream. A peer can start ICE checks while
+/// we are waiting for CREATE_PERMISSION, so treating the next message as the
+/// response drops that check and leaves every following transaction one
+/// response behind.
+fn relay_control_message(
+    data: &[u8],
+    transaction_id: [u8; 12],
+    success_type: u16,
+) -> RelayControlMessage {
+    if let Some((peer_addr, payload)) = decode_data_indication(data) {
+        return RelayControlMessage::Data(peer_addr, payload);
+    }
+    let Some((message_type, response_id, attrs)) = parse_stun(data) else {
+        return RelayControlMessage::Ignore;
+    };
+    if response_id != transaction_id {
+        return RelayControlMessage::Ignore;
+    }
+    if message_type == success_type {
+        return RelayControlMessage::Success;
+    }
+    let code = attrs
+        .iter()
+        .find(|(kind, _)| *kind == ATTR_ERROR_CODE)
+        .and_then(|(_, value)| {
+            (value.len() >= 4).then(|| (value[2] as u16) * 100 + value[3] as u16)
+        });
+    RelayControlMessage::Error(match code {
+        Some(code) => format!("TURN request error {code}"),
+        None => format!("unexpected TURN response {message_type:#06x}"),
+    })
+}
+
 // --- STUN binding ---
 
 pub async fn stun_binding(
@@ -362,6 +405,7 @@ async fn udp_allocate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn udp_create_permission(
     socket: &UdpSocket,
     server: SocketAddr,
@@ -370,6 +414,7 @@ async fn udp_create_permission(
     realm: &str,
     key: &[u8],
     username: &str,
+    recv_tx: &mpsc::Sender<(SocketAddr, Vec<u8>)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut w = StunWriter::new(CREATE_PERM_REQUEST);
     let tid = w.tid();
@@ -380,19 +425,26 @@ async fn udp_create_permission(
     w.attr(ATTR_NONCE, nonce);
     socket.send_to(&w.build_with_integrity(key), server).await?;
 
-    let mut buf = [0u8; 512];
-    let (n, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        socket.recv_from(&mut buf),
-    )
-    .await??;
-    if let Some((mtype, rtid, _)) = parse_stun(&buf[..n])
-        && rtid == tid
-        && mtype == CREATE_PERM_RESPONSE
-    {
-        return Ok(());
+    let mut buf = vec![0u8; 65535];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("CreatePermission timeout".into());
+        }
+        let (n, source) = tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await??;
+        if source != server {
+            continue;
+        }
+        match relay_control_message(&buf[..n], tid, CREATE_PERM_RESPONSE) {
+            RelayControlMessage::Success => return Ok(()),
+            RelayControlMessage::Data(peer_addr, payload) => {
+                let _ = recv_tx.try_send((peer_addr, payload));
+            }
+            RelayControlMessage::Error(error) => return Err(error.into()),
+            RelayControlMessage::Ignore => {}
+        }
     }
-    Err("CreatePermission failed".into())
 }
 
 async fn udp_refresh(
@@ -402,6 +454,7 @@ async fn udp_refresh(
     realm: &str,
     key: &[u8],
     username: &str,
+    recv_tx: &mpsc::Sender<(SocketAddr, Vec<u8>)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut w = StunWriter::new(REFRESH_REQUEST);
     let tid = w.tid();
@@ -411,19 +464,26 @@ async fn udp_refresh(
     w.attr(ATTR_NONCE, nonce);
     socket.send_to(&w.build_with_integrity(key), server).await?;
 
-    let mut buf = [0u8; 512];
-    let (n, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        socket.recv_from(&mut buf),
-    )
-    .await??;
-    if let Some((mtype, rtid, _)) = parse_stun(&buf[..n])
-        && rtid == tid
-        && mtype == REFRESH_RESPONSE
-    {
-        return Ok(());
+    let mut buf = vec![0u8; 65535];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("TURN refresh timeout".into());
+        }
+        let (n, source) = tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await??;
+        if source != server {
+            continue;
+        }
+        match relay_control_message(&buf[..n], tid, REFRESH_RESPONSE) {
+            RelayControlMessage::Success => return Ok(()),
+            RelayControlMessage::Data(peer_addr, payload) => {
+                let _ = recv_tx.try_send((peer_addr, payload));
+            }
+            RelayControlMessage::Error(error) => return Err(error.into()),
+            RelayControlMessage::Ignore => {}
+        }
     }
-    Err("TURN refresh failed".into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -450,14 +510,19 @@ async fn udp_relay_task(
             msg = send_rx.recv() => {
                 match msg {
                     Some((peer_addr, data)) => {
-                        if !permitted.contains(&peer_addr.ip())
-                            && udp_create_permission(
+                        if !permitted.contains(&peer_addr.ip()) {
+                            match udp_create_permission(
                                 &socket, server, peer_addr, &nonce, &realm, &key, &username,
-                            )
-                            .await
-                            .is_ok()
-                        {
-                            permitted.insert(peer_addr.ip());
+                                &recv_tx,
+                            ).await {
+                                Ok(()) => {
+                                    permitted.insert(peer_addr.ip());
+                                }
+                                Err(error) => {
+                                    verbose!("TURN CreatePermission failed: {error}");
+                                    continue;
+                                }
+                            }
                         }
                         let indication = build_send_indication(peer_addr, &data);
                         let _ = socket.send_to(&indication, server).await;
@@ -473,7 +538,9 @@ async fn udp_relay_task(
                         }
             }
             _ = refresh_timer.tick() => {
-                if let Err(e) = udp_refresh(&socket, server, &nonce, &realm, &key, &username).await {
+                if let Err(e) = udp_refresh(
+                    &socket, server, &nonce, &realm, &key, &username, &recv_tx,
+                ).await {
                     verbose!("TURN refresh failed: {e}");
                     break;
                 }
@@ -623,6 +690,7 @@ async fn tcp_create_permission(
     realm: &str,
     key: &[u8],
     username: &str,
+    recv_tx: &mpsc::Sender<(SocketAddr, Vec<u8>)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut w = StunWriter::new(CREATE_PERM_REQUEST);
     let tid = w.tid();
@@ -633,18 +701,22 @@ async fn tcp_create_permission(
     w.attr(ATTR_NONCE, nonce);
     stream.write_all(&w.build_with_integrity(key)).await?;
 
-    let msg = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        stream.read_stun_message(),
-    )
-    .await??;
-    if let Some((mtype, rtid, _)) = parse_stun(&msg)
-        && rtid == tid
-        && mtype == CREATE_PERM_RESPONSE
-    {
-        return Ok(());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("CreatePermission timeout".into());
+        }
+        let msg = tokio::time::timeout(remaining, stream.read_stun_message()).await??;
+        match relay_control_message(&msg, tid, CREATE_PERM_RESPONSE) {
+            RelayControlMessage::Success => return Ok(()),
+            RelayControlMessage::Data(peer_addr, payload) => {
+                let _ = recv_tx.try_send((peer_addr, payload));
+            }
+            RelayControlMessage::Error(error) => return Err(error.into()),
+            RelayControlMessage::Ignore => {}
+        }
     }
-    Err("CreatePermission failed".into())
 }
 
 async fn tcp_refresh(
@@ -653,6 +725,7 @@ async fn tcp_refresh(
     realm: &str,
     key: &[u8],
     username: &str,
+    recv_tx: &mpsc::Sender<(SocketAddr, Vec<u8>)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut w = StunWriter::new(REFRESH_REQUEST);
     let tid = w.tid();
@@ -662,18 +735,22 @@ async fn tcp_refresh(
     w.attr(ATTR_NONCE, nonce);
     stream.write_all(&w.build_with_integrity(key)).await?;
 
-    let msg = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        stream.read_stun_message(),
-    )
-    .await??;
-    if let Some((mtype, rtid, _)) = parse_stun(&msg)
-        && rtid == tid
-        && mtype == REFRESH_RESPONSE
-    {
-        return Ok(());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("TURN refresh timeout".into());
+        }
+        let msg = tokio::time::timeout(remaining, stream.read_stun_message()).await??;
+        match relay_control_message(&msg, tid, REFRESH_RESPONSE) {
+            RelayControlMessage::Success => return Ok(()),
+            RelayControlMessage::Data(peer_addr, payload) => {
+                let _ = recv_tx.try_send((peer_addr, payload));
+            }
+            RelayControlMessage::Error(error) => return Err(error.into()),
+            RelayControlMessage::Ignore => {}
+        }
     }
-    Err("TURN refresh failed".into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -698,14 +775,19 @@ async fn tcp_relay_task(
             msg = send_rx.recv() => {
                 match msg {
                     Some((peer_addr, data)) => {
-                        if !permitted.contains(&peer_addr.ip())
-                            && tcp_create_permission(
+                        if !permitted.contains(&peer_addr.ip()) {
+                            match tcp_create_permission(
                                 &mut stream, peer_addr, &nonce, &realm, &key, &username,
-                            )
-                            .await
-                            .is_ok()
-                        {
-                            permitted.insert(peer_addr.ip());
+                                &recv_tx,
+                            ).await {
+                                Ok(()) => {
+                                    permitted.insert(peer_addr.ip());
+                                }
+                                Err(error) => {
+                                    verbose!("TURN CreatePermission failed: {error}");
+                                    continue;
+                                }
+                            }
                         }
                         let indication = build_send_indication(peer_addr, &data);
                         if stream.write_all(&indication).await.is_err() {
@@ -726,7 +808,9 @@ async fn tcp_relay_task(
                 }
             }
             _ = refresh_timer.tick() => {
-                if let Err(e) = tcp_refresh(&mut stream, &nonce, &realm, &key, &username).await {
+                if let Err(e) = tcp_refresh(
+                    &mut stream, &nonce, &realm, &key, &username, &recv_tx,
+                ).await {
                     verbose!("TURN refresh failed: {e}");
                     break;
                 }
@@ -845,5 +929,64 @@ impl TurnRelay {
             recv_rx,
             _task: task,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data_indication(peer: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let tid = [7; 12];
+        let mut writer = StunWriter {
+            msg_type: DATA_INDICATION,
+            tid,
+            attrs: Vec::new(),
+        };
+        writer.attr(ATTR_XOR_PEER_ADDRESS, &xor_addr_encode(peer, &tid));
+        writer.attr(ATTR_DATA, payload);
+        writer.build()
+    }
+
+    #[test]
+    fn routes_data_indications_while_control_response_is_pending() {
+        let tid = [3; 12];
+        let peer = "198.51.100.7:49152".parse().unwrap();
+        match relay_control_message(
+            &data_indication(peer, b"ice-check"),
+            tid,
+            CREATE_PERM_RESPONSE,
+        ) {
+            RelayControlMessage::Data(source, payload) => {
+                assert_eq!(source, peer);
+                assert_eq!(payload, b"ice-check");
+            }
+            _ => panic!("relayed data was not routed"),
+        }
+
+        let response = StunWriter {
+            msg_type: CREATE_PERM_RESPONSE,
+            tid,
+            attrs: Vec::new(),
+        }
+        .build();
+        assert!(matches!(
+            relay_control_message(&response, tid, CREATE_PERM_RESPONSE),
+            RelayControlMessage::Success
+        ));
+    }
+
+    #[test]
+    fn ignores_an_unrelated_control_response() {
+        let response = StunWriter {
+            msg_type: CREATE_PERM_RESPONSE,
+            tid: [4; 12],
+            attrs: Vec::new(),
+        }
+        .build();
+        assert!(matches!(
+            relay_control_message(&response, [5; 12], CREATE_PERM_RESPONSE),
+            RelayControlMessage::Ignore
+        ));
     }
 }

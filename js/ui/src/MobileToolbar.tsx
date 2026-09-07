@@ -1,5 +1,9 @@
 import { createSignal, createEffect, onCleanup } from "solid-js";
-import type { YasSurfaceCanvas, YasTerminalSurface } from "@yas-run/core";
+import type {
+  YasSurfaceCanvas,
+  YasTerminalSurface,
+  YasWorkspaceConnection,
+} from "@yas-run/core";
 import { surfaceCanvasForInput, terminalSurfaceForInput } from "@yas-run/core";
 import type { Theme, UIScale } from "./theme";
 import { t } from "./i18n";
@@ -229,6 +233,7 @@ function ArrowButton(props: {
 
 export function MobileToolbar(props: {
   keyboardTarget: () => HTMLElement | null;
+  clipboardConnection: () => YasWorkspaceConnection | null;
   theme: Theme;
   scale: UIScale;
 }) {
@@ -320,15 +325,22 @@ export function MobileToolbar(props: {
       return;
     }
     if (target.closest(".cm-editor")) {
-      // CodeMirror editor: read the host clipboard and insert at the cursor.
-      // A real click gives us the user activation that iOS Safari requires.
+      // CodeMirror editor: prefer a live Wayland selection because its host
+      // mirror may be stale or permission-denied. Otherwise this real click
+      // supplies the activation iOS Safari requires for the browser read.
       void (async () => {
-        let text: string;
-        try {
-          text = await navigator.clipboard.readText();
-        } catch {
-          return;
+        const conn = props.clipboardConnection();
+        let text: string | null;
+        if (conn?.usesWaylandClipboard()) {
+          text = await conn.readWaylandClipboardText();
+        } else {
+          try {
+            text = await navigator.clipboard.readText();
+          } catch {
+            return;
+          }
         }
+        if (text === null) return;
         target.focus();
         document.execCommand("insertText", false, text);
       })();

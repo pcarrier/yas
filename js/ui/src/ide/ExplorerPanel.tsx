@@ -37,6 +37,7 @@ import {
   GIT_OP_BISECT,
   gitOidHex,
   measureCell,
+  noteBrowserClipboardMayHaveChanged,
 } from "@yas-run/core";
 import { diffAssignment, type DiffSide } from "@yas-run/core/layout";
 import type { Theme, UIScale } from "../theme";
@@ -111,6 +112,7 @@ function shortBranch(name: string): string {
 async function copyToClipboard(text: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
+    noteBrowserClipboardMayHaveChanged();
     return;
   } catch {
     // Denied, or no clipboard API at all.
@@ -127,6 +129,7 @@ async function copyToClipboard(text: string): Promise<void> {
     ta.setSelectionRange(0, text.length);
     if (!document.execCommand("copy"))
       throw new Error(t("explorer.copyRefused"));
+    noteBrowserClipboardMayHaveChanged();
   } finally {
     ta.remove();
   }

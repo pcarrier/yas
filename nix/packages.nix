@@ -593,6 +593,9 @@
           pkgs.pnpm
           pkgs.samply
           pkgs.socat
+          # bin/modal-sbx is a PEP 723 script; uv resolves its Modal SDK range.
+          pkgs.python3
+          pkgs.uv
           pkgs.wasm-bindgen-cli
           pkgs.wasm-pack
           # Language servers, so `yas lsp` (docs/design/lsp.md) is
