@@ -1850,11 +1850,10 @@ export class YasSurfaceCanvas {
    */
   private observePresentBox(container: HTMLElement): void {
     if (typeof ResizeObserver === "undefined") return;
-    // Resizable panes deliberately keep their eager unscaled subscribe: the
-    // framework binding is about to hand them a display size.  Passive views
-    // need a box to derive their fixed encode target.  If layout has not run
-    // yet, serverSubscribe() waits for the observer below instead of briefly
-    // opening a native stream.
+    // Resizable panes wait for their binding's first measured size.  Passive
+    // views need a box to derive their fixed encode target.  If layout has not
+    // run yet, serverSubscribe() waits for the observer below instead of
+    // briefly opening a native stream.
     this._waitForPresentBox = !this._expectsDisplaySize;
     // ResizeObserver runs after layout, but attach() subscribes immediately.
     // When the card is already laid out, seed its box synchronously and make
@@ -1865,8 +1864,8 @@ export class YasSurfaceCanvas {
     // builds and a visible native↔thumbnail resolution flip on every load.
     //
     // Do not do this for a resizable pane.  Its binding calls setDisplaySize
-    // immediately after attach; keeping the initial request unscaled avoids
-    // creating the inverse thumbnail→native churn there.
+    // and requestResize immediately after attach; requestResize records that
+    // real pane constraint before the first OPEN_VIEW is allowed through.
     if (!this._expectsDisplaySize) {
       const rect = container.getBoundingClientRect();
       const dpr = (globalThis.devicePixelRatio ?? 1) || 1;
@@ -1930,11 +1929,11 @@ export class YasSurfaceCanvas {
         return;
       }
 
-      this.serverSubscribe();
       // A reconnect while hidden loses the server-side view size along with
       // its subscription.  The container did not resize, so its observer
       // will not send the size again for us.
       this.resendDisplaySize();
+      this.serverSubscribe();
       const store = this.getConn()?.surfaceStore ?? this._store;
       if (store) this.presentFromStore(store);
     });
@@ -2003,8 +2002,8 @@ export class YasSurfaceCanvas {
     this.textInputCursorRect = null;
     this._imeSyncedEpoch = -1;
     this._surfaceId = surfaceId;
-    this.resubscribe();
     this.resendDisplaySize();
+    this.resubscribe();
   }
 
   /** Toggle ownership of the server-side stream without dropping the shared
@@ -2016,8 +2015,8 @@ export class YasSurfaceCanvas {
       this.serverUnsubscribe();
       return;
     }
-    this.serverSubscribe();
     this.resendDisplaySize();
+    this.serverSubscribe();
     const store = this.getConn()?.surfaceStore ?? this._store;
     if (store) this.presentFromStore(store);
   }
@@ -2051,6 +2050,11 @@ export class YasSurfaceCanvas {
     // arrives (the ResizeObserver may fire before the surface is known).
     this._pendingResize = { w, h, scale120 };
     this.flushPendingResize();
+    // A resizable view is deliberately not mounted until its real pane size
+    // has been recorded.  offerSurfaceViewSize stores the claim even before
+    // catalogue metadata or a ready session exists, so OPEN_VIEW can never
+    // race ahead at the surface's native (or a provisional tiny) extent.
+    this.serverSubscribe();
   }
 
   private _pendingResize: {
@@ -2062,7 +2066,7 @@ export class YasSurfaceCanvas {
   private flushPendingResize(): void {
     if (!this._pendingResize) return;
     const conn = this.getConn();
-    if (!conn || !this.surface) {
+    if (!conn) {
       return;
     }
     const { w, h, scale120 } = this._pendingResize;
@@ -2375,9 +2379,9 @@ export class YasSurfaceCanvas {
     this.surface = undefined;
     if (this.canvas) this.canvas.style.cursor = "default";
     if (!this.container) return;
+    this.resendDisplaySize();
     this.resubscribe();
     this.syncTouchCapability();
-    this.resendDisplaySize();
   }
 
   // -----------------------------------------------------------------------
@@ -2393,20 +2397,22 @@ export class YasSurfaceCanvas {
 
     this.surface = store.getSurface(this._surfaceId);
 
-    // Tell the server we want frames for this surface.  Subscribe eagerly
-    // even when the surface metadata hasn't arrived yet (this.surface may
-    // be undefined) — the server already knows the surface and can start
-    // encoding as soon as it sees our view request. Waiting for the catalogue
-    // create to be published first adds latency to the first frame.
+    // Record a resizable pane's constraint before registering its mount.  The
+    // connection can retain that claim before surface metadata arrives, and
+    // its OPEN_VIEW path then sends RESIZE first and opens at the real extent.
+    this.flushPendingResize();
+
+    // Tell the server we want frames for this surface.  Passive views still
+    // subscribe eagerly when the surface metadata hasn't arrived yet
+    // (this.surface may be undefined) — the server already knows the surface
+    // and can start encoding as soon as it sees our view request.
     //
     // Only gate on canDecodeVideo: subscribing when WebCodecs is
     // unavailable (non-secure context) drives the server encoder for
     // nothing and can crash it.
     if (conn && store.canDecodeVideo) this.serverSubscribe(conn, store);
 
-    // Flush any pending resize and paint the latest frame immediately
-    // so newly-mounted views aren't blank.
-    this.flushPendingResize();
+    // Paint the latest frame immediately so newly-mounted views aren't blank.
     this.presentFromStore(store);
     this.restoreRemoteFocus();
 
@@ -2418,6 +2424,10 @@ export class YasSurfaceCanvas {
         this.remoteFocusGeneration = null;
       }
       this.updateRemotePointerOverlay();
+      // A size offered before catalogue creation was retained locally but
+      // could not yet be written.  Flush it before mounting the new view so
+      // RESIZE remains ahead of OPEN_VIEW on this path as well.
+      this.flushPendingResize();
       // A native catalogue removal retires the connection's view before
       // SurfaceStore publishes the removal. A layout leaf can stay mounted
       // across a destroy/recreate of the same handle (notably
@@ -2445,8 +2455,8 @@ export class YasSurfaceCanvas {
       // subscribe eagerly before the surface metadata is available.
       if (this.surface && store.canDecodeVideo) {
         if (this._isIntersecting && !this._subscribedSurface) {
-          this.serverSubscribe(this.getConn(), store);
           this.resendDisplaySize();
+          this.serverSubscribe(this.getConn(), store);
         } else if (
           this._isIntersecting &&
           this._subscribedGeneration !== store.generation
@@ -2475,8 +2485,6 @@ export class YasSurfaceCanvas {
           this.applyLayout();
         }
       }
-      // Flush any pending resize now that we have the surface info.
-      this.flushPendingResize();
       this.restoreRemoteFocus();
       // Repaint on a change to *this* view's surface (a resize, or its first
       // metadata), not on every change the connection publishes.
@@ -2585,6 +2593,12 @@ export class YasSurfaceCanvas {
       !conn ||
       !store?.canDecodeVideo ||
       (this._waitForPresentBox && !this._presentBox) ||
+      // A live pane must publish its first concrete size before it can create
+      // an encoder.  setDisplaySize(null) explicitly turns it back into a
+      // passive preview and is therefore not held by this gate.
+      (this._expectsDisplaySize &&
+        (this._awaitingInitialDisplaySize ||
+          (this._displaySize !== null && !this._resizeConstraintActive))) ||
       this._subscribedSurface
     ) {
       return;

@@ -12,7 +12,9 @@ import argparse
 import contextlib
 import os
 import secrets
+import subprocess
 import sys
+from pathlib import Path
 from urllib.parse import quote
 
 import modal
@@ -28,6 +30,26 @@ EXTENSIONS = (
     ("muster", "muster.wasm"),
     ("xdg-desktop", "xdg-desktop.wasm"),
 )
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def build_yas() -> Path:
+    print("Building local YAS release", file=sys.stderr)
+    output = subprocess.check_output(
+        (
+            "nix",
+            "build",
+            ".#yas-release",
+            "--no-link",
+            "--print-out-paths",
+        ),
+        cwd=REPO_ROOT,
+        text=True,
+    ).strip()
+    binary = Path(output) / "bin" / "yas"
+    if not binary.is_file():
+        raise RuntimeError(f"local YAS build did not produce {binary}")
+    return binary
 
 
 def install_extensions(sandbox: modal.Sandbox) -> None:
@@ -68,6 +90,7 @@ def main() -> None:
     if configured_passphrase is not None and not configured_passphrase.strip():
         parser.error("YAS_MODAL_PASSPHRASE must not be blank")
     passphrase = configured_passphrase or secrets.token_urlsafe(24)
+    yas_binary = build_yas()
     app = modal.App.lookup("yas", create_if_missing=True)
     image = (
         modal.Image.debian_slim()
@@ -75,8 +98,13 @@ def main() -> None:
             "ca-certificates",
             "chromium",
             "curl",
+            "dbus",
             "firefox-esr",
+            "libpipewire-0.3-0",
             "mesa-vulkan-drivers",
+            "pipewire",
+            "pipewire-pulse",
+            "wireplumber",
         )
         .run_commands(
             (
@@ -85,11 +113,8 @@ def main() -> None:
                 "--no-sandbox --disable-dev-shm-usage\"' "
                 "> /etc/chromium.d/yas"
             ),
-            "curl -fsSL https://yas.run/install.sh -o /tmp/install-yas",
-            "YAS_PREFIX=/usr/local sh /tmp/install-yas",
-            "rm /tmp/install-yas",
-            force_build=True,
         )
+        .add_local_file(yas_binary, "/usr/local/bin/yas", copy=True)
     )
 
     sandbox = modal.Sandbox.create(

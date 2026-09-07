@@ -2676,6 +2676,8 @@ function attachTargeting(options?: {
 }) {
   const targets: ({ width: number; height: number } | null)[] = [];
   const maxFps: number[] = [];
+  const events: string[] = [];
+  let mounted = false;
   let roCallback: ResizeObserverCallback | undefined;
   const prevRO = globalThis.ResizeObserver;
   globalThis.ResizeObserver = class {
@@ -2706,6 +2708,8 @@ function attachTargeting(options?: {
       target: { width: number; height: number } | null,
       fps: number,
     ) => {
+      events.push("subscribe");
+      mounted = true;
       targets.push(target);
       maxFps.push(fps);
     },
@@ -2715,11 +2719,24 @@ function attachTargeting(options?: {
       target: { width: number; height: number } | null,
       fps: number,
     ) => {
+      if (!mounted) return;
+      events.push("target");
       targets.push(target);
       maxFps.push(fps);
     },
-    sendSurfaceUnsubscribe: () => {},
-    offerSurfaceViewSize: () => true,
+    sendSurfaceUnsubscribe: () => {
+      mounted = false;
+    },
+    offerSurfaceViewSize: (
+      _sid: number,
+      _viewId: string,
+      width: number,
+      height: number,
+      scale120: number,
+    ) => {
+      events.push(`resize:${width}x${height}@${scale120}`);
+      return true;
+    },
     withdrawSurfaceViewSize: () => {},
     allocSurfaceViewId: () => "s1",
   };
@@ -2750,7 +2767,7 @@ function attachTargeting(options?: {
     surface.dispose();
     globalThis.ResizeObserver = prevRO;
   };
-  return { surface, targets, maxFps, layOut, restore };
+  return { surface, targets, maxFps, events, layOut, restore };
 }
 
 describe("YasSurfaceCanvas size mediation", () => {
@@ -2767,22 +2784,33 @@ describe("YasSurfaceCanvas size mediation", () => {
     restore();
   });
 
-  it("keeps a resizable view on the eager unscaled fast path", () => {
-    const { targets, maxFps, layOut, restore } = attachTargeting({
-      initialBox: { width: 400, height: 200 },
-      resizable: true,
-    });
+  it("records a resizable pane before opening its first view", () => {
+    const { surface, targets, maxFps, events, layOut, restore } =
+      attachTargeting({
+        initialBox: { width: 400, height: 200 },
+        resizable: true,
+      });
 
-    // Its binding is about to call setDisplaySize.  Starting scaled here
-    // would merely reverse the same two-subscribe churn for foreground panes.
-    expect(targets).toEqual([null]);
-    expect(maxFps).toEqual([0]);
+    // attach() cannot open at the surface's 1920x1080 catalogue extent.  The
+    // framework binding has not supplied the pane's authoritative size yet.
+    expect(targets).toEqual([]);
+    expect(maxFps).toEqual([]);
 
     // ResizeObserver can beat the binding's first setDisplaySize call. The
-    // provisional live view must still not switch to a thumbnail target.
+    // view must remain unopened rather than selecting a provisional encoder.
     layOut(400, 200);
-    expect(targets).toEqual([null, null]);
-    expect(maxFps).toEqual([0, 0]);
+    expect(targets).toEqual([]);
+
+    surface.setDisplaySize(800, 400, 120);
+    expect(targets).toEqual([]);
+    surface.requestResize(800, 400, 120);
+
+    // The concrete size claim is registered before sendSurfaceSubscribe.
+    // YasNativeWorkspaceConnection consequently writes RESIZE before
+    // OPEN_VIEW and the first NVENC selection happens at 800x400.
+    expect(events).toEqual(["resize:800x400@120", "subscribe"]);
+    expect(targets).toEqual([null]);
+    expect(maxFps).toEqual([0]);
 
     restore();
   });
@@ -3005,6 +3033,8 @@ describe("YasSurfaceCanvas visibility", () => {
         subscribes.push({ surfaceId, viewId }),
       sendSurfaceUnsubscribe: (surfaceId: SurfaceId, viewId: string) =>
         unsubscribes.push({ surfaceId, viewId }),
+      offerSurfaceViewSize: () => true,
+      withdrawSurfaceViewSize: () => {},
     };
     const workspace = {
       getConnection: () => conn,
@@ -3019,6 +3049,9 @@ describe("YasSurfaceCanvas visibility", () => {
 
     const container = document.createElement("div");
     surface.attach(container);
+    expect(subscribes).toEqual([]);
+    surface.setDisplaySize(1280, 720, 120);
+    surface.requestResize(1280, 720, 120);
     expect(subscribes).toEqual([{ surfaceId: 7n, viewId: "s1" }]);
 
     // The connection has already retired this id's subscription state when

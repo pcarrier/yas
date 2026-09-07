@@ -1,7 +1,9 @@
 /**
- * The deferred PWA install prompt, so the Cmd+K overlay can offer
+ * The retained PWA install prompt, so the Cmd+K overlay can offer
  * "Install App". The browser fires `beforeinstallprompt` only when the
- * manifest is valid and the app isn't already installed.
+ * manifest is valid and the app isn't already installed. Do not cancel its
+ * default action: Chromium can then show its native install affordance while
+ * the retained event still backs the explicit menu action.
  *
  * This lives in its own leaf module rather than in `main.tsx` on purpose.
  * `main.tsx` is the Vite HTML entry; anything importing it makes the entry
@@ -18,7 +20,6 @@ interface BeforeInstallPromptEvent extends Event {
 let deferred: BeforeInstallPromptEvent | null = null;
 
 window.addEventListener("beforeinstallprompt", (e) => {
-  e.preventDefault();
   deferred = e as BeforeInstallPromptEvent;
 });
 window.addEventListener("appinstalled", () => {

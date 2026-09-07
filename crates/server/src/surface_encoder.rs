@@ -335,9 +335,9 @@ pub fn outranking_encoder_pending(
     false
 }
 
-/// Grow a coded extent, aspect preserved, to the smallest one an encoder that
-/// outranks the Vulkan Video tier will accept.  Returns the extent unchanged
-/// when nothing would be unlocked by growing it.
+/// Grow a coded extent, aspect preserved, to the smallest one the highest
+/// ranked encoder above the Vulkan Video tier will accept. Returns the extent
+/// unchanged when nothing would be unlocked by growing it.
 ///
 /// NVENC's engine has minimum dimensions — 192x128 for AV1 and 145x49 for
 /// H.264 on an RTX 4090, queried rather than assumed — and a sidebar preview
@@ -346,8 +346,10 @@ pub fn outranking_encoder_pending(
 /// to the compositor-resident tier: one scarce Vulkan Video session per
 /// preview, each encoding a thumbnail, on the driver path least exercised by
 /// anything else.  Two hundred extra rows of picture at 15fps costs less than
-/// that, so clear the floor instead and keep previews on the encoder the pane
-/// already uses.
+/// that, so clear the preferred encoder's floor instead and keep previews on
+/// the encoder the pane will use. Codec selection is fixed for a view's
+/// lifetime: choosing H.264's cheaper floor here would lock a later full-size
+/// pane to H.264 even though NVENC AV1 ranks first and handles the pane.
 ///
 /// `native` bounds the growth: the compositor downscales its composite into
 /// this target and there is no upscaling past the source.  A surface that is
@@ -361,10 +363,29 @@ pub fn grown_to_hardware_floor(
     native_w: u32,
     native_h: u32,
 ) -> (u32, u32) {
+    grown_to_hardware_floor_with_caps(
+        preferences,
+        codec_support,
+        width,
+        height,
+        native_w,
+        native_h,
+        |codec| crate::nvenc_encode::caps(codec, false).ok(),
+    )
+}
+
+fn grown_to_hardware_floor_with_caps(
+    preferences: &[SurfaceEncoderPreference],
+    codec_support: u8,
+    width: u32,
+    height: u32,
+    native_w: u32,
+    native_h: u32,
+    mut caps_for: impl FnMut(&str) -> Option<crate::nvenc_encode::NvencCaps>,
+) -> (u32, u32) {
     if width == 0 || height == 0 {
         return (width, height);
     }
-    let mut best: Option<(u32, u32)> = None;
     for &pref in preferences {
         // Ranked below the tier: past this point nothing outranks Vulkan
         // Video, so there is no floor left worth clearing.
@@ -385,7 +406,7 @@ pub fn grown_to_hardware_floor(
             // reaches the tier and growing would buy nothing.
             _ => return (width, height),
         };
-        let Ok(caps) = crate::nvenc_encode::caps(codec, false) else {
+        let Some(caps) = caps_for(codec) else {
             continue;
         };
         if caps.refuse(width, height).is_none() {
@@ -406,15 +427,12 @@ pub fn grown_to_hardware_floor(
         ) else {
             continue;
         };
-        // Cheapest by area, so H.264's 145x49 floor wins over AV1's 192x128
-        // rather than whichever happens to be listed first.
-        if best.is_none_or(|(bw, bh)| {
-            (candidate.0 as u64) * (candidate.1 as u64) < (bw as u64) * (bh as u64)
-        }) {
-            best = Some(candidate);
-        }
+        // Preference order is codec order. Returning the first viable floor
+        // keeps a tiny preview from selecting a lower-ranked codec that its
+        // later full-size pane can never upgrade away from.
+        return candidate;
     }
-    best.unwrap_or((width, height))
+    (width, height)
 }
 
 /// Smallest extent that has (near enough) the aspect of `width`x`height`, is
@@ -3141,9 +3159,7 @@ mod tests {
         assert!((w as f32 / h as f32 - 132.0 / 128.0).abs() < 0.02);
 
         // The dock's wide strip is under AV1's floor on height alone, so
-        // width has to grow far more than height to keep the shape — 7x the
-        // pixels.  It already clears H.264's, which is why the caller picks
-        // the cheapest floor by area rather than the first one listed.
+        // width has to grow far more than height to keep the shape.
         assert_eq!(
             grown_to_floor(256, 68, 192, 128, 2318, 2235),
             Some((482, 130))
@@ -3163,6 +3179,37 @@ mod tests {
         // keeps the extent it had and lands on the tier below.
         assert_eq!(grown_to_floor(100, 80, 192, 128, 100, 80), None);
         assert_eq!(grown_to_floor(0, 128, 192, 128, 2318, 2235), None);
+    }
+
+    #[test]
+    fn hardware_floor_honors_encoder_priority_across_codecs() {
+        use crate::nvenc_encode::NvencCaps;
+        use SurfaceEncoderPreference as P;
+
+        let caps = |codec: &str| {
+            let (min_width, min_height) = match codec {
+                "av1" => (192, 128),
+                "h264" => (145, 49),
+                _ => return None,
+            };
+            Some(NvencCaps {
+                min_width,
+                min_height,
+                max_width: 8192,
+                max_height: 4352,
+                yuv444: false,
+                encoder_engines: 2,
+            })
+        };
+        let codecs = CODEC_SUPPORT_AV1 | CODEC_SUPPORT_H264;
+        let prefs = [P::NvencAV1, P::NvencH264, P::VulkanVideoAV1];
+
+        // H.264 accepts 146x146 unchanged. AV1 needs 192x192, but it ranks
+        // first: grow for AV1 rather than making this view H.264 forever.
+        assert_eq!(
+            grown_to_hardware_floor_with_caps(&prefs, codecs, 146, 146, 1920, 1080, caps),
+            (192, 192)
+        );
     }
 
     /// The floor walk stops where the tier does, and only NVENC has a floor
