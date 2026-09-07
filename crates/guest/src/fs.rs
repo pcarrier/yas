@@ -183,10 +183,23 @@ impl StagedWrite {
     }
 
     pub fn commit(&mut self, client: &mut Client, flags: u16) -> Result<wire::CommitResult, Error> {
+        let operation_id = operation_id(client)?;
+        self.commit_with_operation_id(client, operation_id, flags)
+    }
+
+    /// Commit this write with a caller-owned idempotency key.
+    pub fn commit_with_operation_id(
+        &mut self,
+        client: &mut Client,
+        operation_id: [u8; 16],
+        flags: u16,
+    ) -> Result<wire::CommitResult, Error> {
         if self.committed {
             return Err(Error::Protocol("FS staged write already committed"));
         }
-        let operation_id = operation_id(client)?;
+        if operation_id == [0; 16] {
+            return Err(Error::Protocol("FS operation id must be nonzero"));
+        }
         let result = client.request_typed(
             family::FS,
             wire::request_kind::COMMIT,
@@ -595,6 +608,22 @@ mod tests {
                 .unwrap(),
             ]),
         }
+    }
+
+    #[test]
+    fn staged_write_rejects_zero_caller_operation_id_before_send() {
+        let (mut client, state, _guard) = bootstrap_client();
+        let sent_before = state.borrow().sent.len();
+        let mut staged = StagedWrite {
+            staging_handle: 17,
+            committed: false,
+        };
+        assert!(matches!(
+            staged.commit_with_operation_id(&mut client, [0; 16], 0),
+            Err(Error::Protocol("FS operation id must be nonzero"))
+        ));
+        assert_eq!(state.borrow().sent.len(), sent_before);
+        assert!(!staged.committed);
     }
 
     #[test]

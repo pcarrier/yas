@@ -519,6 +519,42 @@ impl Process {
         self.interpret(frame)
     }
 
+    /// Wait for this process's next stream Event up to an absolute deadline,
+    /// preserving unrelated family traffic for the guest's general loop.
+    pub fn next_event_until(
+        &mut self,
+        client: &mut Client,
+        deadline: crate::MonotonicInstant,
+    ) -> Result<Option<Event>, Error> {
+        let stdin = self
+            .stdin
+            .as_ref()
+            .map(|input| input.descriptor.transfer_id);
+        let stdout = self
+            .stdout
+            .pending
+            .is_none()
+            .then_some(self.stdout.descriptor.transfer_id);
+        let stderr = self.stderr.as_ref().and_then(|output| {
+            output
+                .pending
+                .is_none()
+                .then_some(output.descriptor.transfer_id)
+        });
+        if stdout.is_none() && stderr.is_none() && stdin.is_none() {
+            return Err(Error::DeliveryPending);
+        }
+        let Some(frame) = client.next_matching_frame_until(deadline, |frame| {
+            frame.header.family == family::TRANSFER
+                && transfer_id(frame)
+                    .is_some_and(|id| Some(id) == stdin || Some(id) == stdout || Some(id) == stderr)
+        })?
+        else {
+            return Ok(None);
+        };
+        self.interpret(frame).map(Some)
+    }
+
     /// Offer one already-routed native Event to this process without
     /// blocking. Unrelated family or Transfer identities are left untouched
     /// for another resource in the guest's general event loop.
@@ -584,6 +620,24 @@ impl Process {
     ) -> Result<wire::ControlResult, Error> {
         let mut operation_id = [0; 16];
         client.random(&mut operation_id)?;
+        if operation_id == [0; 16] {
+            operation_id[15] = 1;
+        }
+        self.control_with_operation_id(client, operation_id, action, value)
+    }
+
+    /// Control this process with a caller-owned replay identity.
+    ///
+    /// Stable workflow engines should derive this value from their durable
+    /// operation identity. Reusing it replays the original terminal Result
+    /// instead of applying the control action twice.
+    pub fn control_with_operation_id(
+        &mut self,
+        client: &mut Client,
+        operation_id: [u8; 16],
+        action: wire::ControlAction,
+        value: u16,
+    ) -> Result<wire::ControlResult, Error> {
         client
             .request_typed(
                 family::PROCESS,
@@ -1098,6 +1152,66 @@ impl Client {
             return Err(Error::Protocol("Process stream window is zero"));
         }
         let operation_id = operation_id(self)?;
+        self.spawn_process_with_operation_id_and_window(
+            operation_id,
+            flags,
+            environment_kind,
+            cwd,
+            argv,
+            env,
+            extensions,
+            stream_window,
+        )
+    }
+
+    /// Spawn with a caller-owned replay identity and the default output
+    /// window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_process_with_operation_id(
+        &mut self,
+        operation_id: [u8; 16],
+        flags: u16,
+        environment_kind: wire::EnvironmentKind,
+        cwd: wire::Cwd,
+        argv: Vec<Vec<u8>>,
+        env: Vec<wire::EnvEntry>,
+        extensions: Extensions,
+    ) -> Result<Process, Error> {
+        self.spawn_process_with_operation_id_and_window(
+            operation_id,
+            flags,
+            environment_kind,
+            cwd,
+            argv,
+            env,
+            extensions,
+            DEFAULT_STREAM_WINDOW,
+        )
+    }
+
+    /// Spawn with a caller-owned replay identity and explicit output window.
+    ///
+    /// The wire codec rejects the all-zero identity. A repeated identity in
+    /// one YAS session returns the retained Result and never starts another
+    /// process, which is required by reconnect-safe workflow engines.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_process_with_operation_id_and_window(
+        &mut self,
+        operation_id: [u8; 16],
+        flags: u16,
+        environment_kind: wire::EnvironmentKind,
+        cwd: wire::Cwd,
+        argv: Vec<Vec<u8>>,
+        env: Vec<wire::EnvEntry>,
+        extensions: Extensions,
+        stream_window: u64,
+    ) -> Result<Process, Error> {
+        if !self.supports(family::PROCESS, Class::Request, wire::request_kind::SPAWN) {
+            return Err(Error::FeatureMissing);
+        }
+        if stream_window == 0 {
+            return Err(Error::Protocol("Process stream window is zero"));
+        }
         let cleanup_operation_id = distinct_operation_id(self, operation_id)?;
         let merged = flags & yas_wire::schema::process::SPAWN_MERGE_STDERR as u16 != 0;
         let mut stdout_lease = self.receive_credit_exact(stream_window)?;

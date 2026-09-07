@@ -23,6 +23,7 @@ export interface YasContext {
 export interface YasCommandInvocation {
   readonly args: readonly string[];
   readonly streamsStdin: boolean;
+  readonly channelHandle: bigint;
 }
 
 export interface YasHost {
@@ -34,6 +35,35 @@ export interface YasHost {
   commandResult(contentType: string, data: Uint8Array): void;
   commandExit(code: number, detail: string): void;
   commandCancel(): void;
+  commandReadStdin(maximumBytes: number): Uint8Array;
+  supports(familyId: number, classId: 0 | 1 | 2, kind: number): boolean;
+  channelMessageLimit(): bigint;
+  environmentJson(): string;
+  runProcessJson(request: string): string;
+  gitInspectJson(
+    path: string,
+    query: "rebase" | "status" | "resolve",
+    argument?: string,
+  ): string;
+  fsIndexFilesJson(path: string): string;
+  fsRead(
+    root: string,
+    relativePath: string,
+    maximumBytes: number,
+  ): Uint8Array | undefined;
+  fsWrite(
+    operationId: string,
+    root: string,
+    relativePath: string,
+    data: Uint8Array,
+  ): void;
+  blake3(data: Uint8Array): Uint8Array;
+  netExchange(
+    connectionJson: string,
+    request: Uint8Array,
+    maximumResponseBytes: number,
+    deadlineNanos: bigint,
+  ): Uint8Array;
   wait(): 1 | 2;
   waitUntil(deadlineNanos: bigint): 0 | 1 | 2;
   realtimeNow(): bigint;

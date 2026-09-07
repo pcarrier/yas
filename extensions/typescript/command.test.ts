@@ -3,7 +3,7 @@ import { type YasHost, decodeUtf8, encodeUtf8 } from "./yas";
 import { serveCommands } from "./command";
 
 function fakeHost(
-  incoming: Array<{ args: string[]; streamsStdin: boolean }>,
+  incoming: Array<{ args: string[]; streamsStdin: boolean; channelHandle: bigint }>,
 ): YasHost & { calls: Array<[string, ...unknown[]]> } {
   const calls: Array<[string, ...unknown[]]> = [];
   return {
@@ -69,7 +69,9 @@ describe("QuickJS TypeScript support", () => {
   });
 
   test("registers and serves through typed native command bindings", () => {
-    const host = fakeHost([{ args: ["--json"], streamsStdin: false }]);
+    const host = fakeHost([
+      { args: ["--json"], streamsStdin: false, channelHandle: 17n },
+    ]);
     const code = serveCommands(
       {
         protocol: "yas.cli.v1",

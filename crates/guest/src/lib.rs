@@ -12,6 +12,7 @@ pub mod command;
 pub mod env;
 pub mod events;
 pub mod fs;
+pub mod git;
 mod host;
 pub mod kv;
 pub mod net;
