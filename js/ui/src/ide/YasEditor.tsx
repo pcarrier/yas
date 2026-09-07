@@ -122,6 +122,7 @@ import { loadLangForFile } from "./languages";
 import { lspWirePath } from "./paths";
 import { isConnReady, connGeneration } from "./reactive";
 import { consumeReveal, setReveal, revealVersion } from "./reveal";
+import { resolveInitialFileSnapshot } from "./initialFileSnapshot";
 import { symbolKindTag } from "./symbolKinds";
 import { lineWrap, toggleLineWrap } from "./editorPrefs";
 import {
@@ -1647,14 +1648,24 @@ export function YasEditor(props: {
     let opened: YasNativeFsSyncHandle | null = null;
     let limitTimer: ReturnType<typeof setTimeout> | null = null;
     // The file's initial load is resolved once — either it loads, or it's
-    // confirmed missing after the snapshot is coherent (onSync).
+    // confirmed missing after the snapshot is coherent (onSync). The sync can
+    // release a held onSync callback before its promise continuation installs
+    // `opened`, so both events feed the same resolver.
     let initialResolved = false;
-    const tryInitialLoad = () => {
-      if (disposed || initialResolved || !opened) return;
-      const node = opened.live.get(fileKey());
-      if (node) {
-        initialResolved = true;
-        void loadNode(opened, node);
+    let initialSynced = false;
+    const resolveInitialLoad = () => {
+      if (disposed || initialResolved) return;
+      const result = resolveInitialFileSnapshot(opened, initialSynced, (h) => {
+        const node = h.live.get(fileKey());
+        if (!node) return false;
+        void loadNode(h, node);
+        return true;
+      });
+      if (result === "waiting") return;
+      initialResolved = true;
+      if (result === "missing") {
+        setStatus("error");
+        setError(t("editor.fileNotFound"));
       }
     };
     const shared = {
@@ -1664,15 +1675,11 @@ export function YasEditor(props: {
       onSync: () => {
         // The snapshot is now coherent. syncFs resolves the moment the
         // server *accepts* the sync — before any entries land — so the
-        // file only reliably appears here. Only once coherent is a
+        // file only reliably appears here. The callback can also precede the
+        // promise continuation below; only once both have happened is a
         // still-absent file genuinely "not found".
-        if (disposed || initialResolved) return;
-        tryInitialLoad();
-        if (!initialResolved) {
-          initialResolved = true;
-          setStatus("error");
-          setError(t("editor.fileNotFound"));
-        }
+        initialSynced = true;
+        resolveInitialLoad();
       },
       onClosed: () => {
         // A sync closes on a connection reset (server re-establish), or when
@@ -1698,7 +1705,7 @@ export function YasEditor(props: {
         setHandle(h);
         // `live` may still be empty here (entries stream in via onSync). Load if
         // the file is already present; otherwise wait for onSync to decide.
-        tryInitialLoad();
+        resolveInitialLoad();
       })
       .catch((e: unknown) => {
         if (disposed) return;

@@ -531,6 +531,10 @@ export function SwitcherOverlay(props: {
    *  debounced, cancellable call — resolve to [] for "nothing to say"
    *  (no attachment, still warming, backend can't answer). */
   symbolSearch?: (query: string) => Promise<SwitcherSymbolHit[]>;
+  /** Reactive LSP attachment/index state. While a "#" query is active this
+   *  is read synchronously, so the same query is retried when an attachment
+   *  appears or a warming language server advances without another keypress. */
+  symbolSearchGeneration?: () => unknown;
   /** Attach the language server without asking anything of it, so the
    *  first "#" keystroke isn't also waiting on a spawn. Returns a release
    *  called when the switcher closes, so warming for one lookup does not pin
@@ -628,7 +632,9 @@ export function SwitcherOverlay(props: {
     [],
   );
   const [symbolPending, setSymbolPending] = createSignal(false);
-  onMount(() => {
+  // Reactive because the active IDE session can change while the switcher is
+  // open. Release the old root's lease and warm the new one in that case.
+  createEffect(() => {
     const release = props.symbolSearchWarm?.();
     if (release) onCleanup(release);
   });
@@ -638,6 +644,10 @@ export function SwitcherOverlay(props: {
       setSymbolPending(false);
       return;
     }
+    // The async search itself runs from a timer and cannot establish Solid
+    // dependencies. Track readiness here so a query attempted before the LSP
+    // attached (or while it returned WARMING) is not permanently empty.
+    props.symbolSearchGeneration?.();
     const q = symbolQuery();
     const search = props.symbolSearch;
     let cancelled = false;

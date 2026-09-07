@@ -6250,6 +6250,13 @@ function WorkspaceScreen(props: {
                 if (a) openTile(a);
               }}
               symbolSearchWarm={() => activeSession()?.ensureLsp()}
+              symbolSearchGeneration={() => {
+                const s = activeSession();
+                // The handle signal catches the initial async attachment;
+                // version catches backend phase/index changes after attach.
+                s?.lspVersion();
+                return s?.lspHandle() ?? null;
+              }}
               symbolSearch={async (q) => {
                 const s = activeSession();
                 const h = s?.lspHandle();
