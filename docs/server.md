@@ -88,6 +88,9 @@ because it lives in KV. The socket is suffixed with `-NAME`. Clients address it 
 `local:NAME`, for example
 `yas --on local:work terminal list`. Explicit path environment variables
 remain authoritative and may intentionally make instances share a resource.
+The server locks `<kv-path>.server.lock` before opening any persistent service
+and exits if another process owns it. This keeps two differently addressed
+servers from splitting the KV and extension databases between them.
 There is no migration or fallback to the former unnamespaced socket and storage
 paths.
 

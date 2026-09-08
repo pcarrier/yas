@@ -44,6 +44,7 @@ pub mod extension_catalog;
 pub mod extension_store;
 mod font;
 mod gpu_libs;
+mod instance_lock;
 mod ipc;
 mod journal;
 mod kv;
@@ -8442,9 +8443,8 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
     // systemd-managed server failing and systemd restarting it.  Binding late
     // used to let both processes open the same redb files first; the eventual
     // socket winner then killed its predecessor but remained permanently
-    // memory-only, with every persistent extension disabled.  The endpoint
-    // lock is the process-ownership lock, so settle ownership before acquiring
-    // any other process-exclusive resource.
+    // memory-only, with every persistent extension disabled. Settle endpoint
+    // ownership before acquiring any other process-exclusive resource.
     #[cfg(unix)]
     let listener = {
         if let Some(listener) = IpcListener::from_systemd_fd(config.verbose) {
@@ -8459,6 +8459,19 @@ pub async fn run_hosted(config: Config, hosted: Option<HostedServices>) {
     };
     #[cfg(not(unix))]
     let listener = IpcListener::bind(&config.ipc_path, config.verbose).await;
+
+    // The endpoint lock above deliberately permits replacement: a new server
+    // on the same socket terminates its predecessor before taking over.  A
+    // different socket can still name the same persistent instance, though,
+    // and the KV and Extension databases must never be split between two
+    // processes.  Claim that instance as one unit before opening either
+    // database; a loser exits instead of serving with whichever subsystem
+    // happened to win its individual redb lock.
+    let _instance_lock =
+        instance_lock::InstanceLock::acquire(&config.name).unwrap_or_else(|error| {
+            eprintln!("yas-server: {error}");
+            std::process::exit(1);
+        });
 
     let (event_log, startup_event_file) = events::EventLog::from_env();
     yas_event!(event_log, EventType::ServerStart, {

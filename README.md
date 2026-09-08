@@ -161,6 +161,8 @@ yas --on local:test terminal start htop # auto-starts a second instance
 Every server has a name; omitting `--name` uses `default`. Each instance uses a
 named socket and stores its KV database, installed extensions, and object cache
 under `yas/instances/<name>/` in the platform state/cache directories. The
+server holds an exclusive `kv.redb.server.lock` for that persistent instance;
+a second server with the same state exits even if it was given another socket.
 `@xdg-desktop` extension's intent is in that instance's KV database, while
 `@muster` reads the corresponding platform configuration directory at
 `yas/instances/<name>/muster/`. Explicit `YAS_SOCK`, `YAS_KV_PATH`,

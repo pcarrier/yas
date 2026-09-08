@@ -146,6 +146,10 @@ fn db_path() -> Option<std::path::PathBuf> {
         .clone()
 }
 
+pub(crate) fn configured_db_path() -> Option<std::path::PathBuf> {
+    db_path()
+}
+
 #[derive(Clone)]
 struct Entry {
     value: Arc<Vec<u8>>,
