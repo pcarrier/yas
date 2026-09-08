@@ -933,7 +933,7 @@ class NativeFsHandle implements YasNativeFsSyncHandle {
     try {
       const result = await this.native.apply({
         operationId,
-        flags: g.YAS_FS_APPLY_ALL_OR_NONE,
+        flags: 0,
         items: [item],
         extensions: [],
       });

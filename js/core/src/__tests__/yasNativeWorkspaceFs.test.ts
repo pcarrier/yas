@@ -55,6 +55,45 @@ async function openHandle(root: YasFsRoot) {
 }
 
 describe("YasNativeWorkspaceFs mutation retention", () => {
+  it("runs single-item mutations without requiring atomic batch support", async () => {
+    const kinds: string[] = [];
+    const root = nativeRoot(async (request) => {
+      if (request.flags !== 0) throw new Error("Unsupported atomic batch");
+      expect(request.items).toHaveLength(1);
+      kinds.push(request.items[0].kind);
+      return {
+        rootRevision: 1n,
+        items: [
+          {
+            index: 0,
+            status: YAS_STATUS_OK,
+            entryRevision: 1n,
+            modifiedUnixNs: 1n,
+            detail: "",
+          },
+        ],
+        extensions: [],
+      };
+    });
+    const handle = await openHandle(root);
+    try {
+      await handle.mkdir("directory");
+      await handle.rename("before", "after");
+      await handle.remove("removed");
+      await handle.symlink("target", "symbolic-link");
+      await handle.hardlink("source", "hard-link");
+      expect(kinds).toEqual([
+        "mkdir",
+        "rename",
+        "remove",
+        "symlink",
+        "hardlink",
+      ]);
+    } finally {
+      handle.stop();
+    }
+  });
+
   it("advances the public revision before update callbacks derive state", async () => {
     let deliver!: (batch: YasStateBatch) => void;
     const root = nativeRoot(async () => ({
