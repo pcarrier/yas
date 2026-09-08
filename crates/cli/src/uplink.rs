@@ -261,28 +261,126 @@ enum SessionEnd {
 }
 
 async fn run_session(relay: &Relay, current: &Arc<Mutex<Option<wt::Session>>>) -> SessionEnd {
+    let connection_id = format!("{:032x}", rand::random::<u128>());
+    let started = std::time::Instant::now();
+    let mut context = serde_json::json!({
+        "component": "uplink", "connection_id": connection_id,
+        "relay": relay.label, "client_version": env!("CARGO_PKG_VERSION"),
+        "sid": diagnostic_sid(&relay.url),
+    });
     let client = match build_client(relay.cert_hash.as_deref()) {
         Ok(client) => client,
         Err(e) => return SessionEnd::NeverConnected(e),
     };
     // Careful: the URL is the credential — log `relay.label` only.
-    let session = match client.connect(relay.url.clone()).await {
+    let mut request = wt::proto::ConnectRequest::new(relay.url.clone());
+    request
+        .headers
+        .insert("x-blit-connection-id", connection_id.parse().unwrap());
+    request
+        .headers
+        .insert("x-blit-version", env!("CARGO_PKG_VERSION").parse().unwrap());
+    let session = match client.connect(request).await {
         Ok(session) => session,
-        Err(e) => return SessionEnd::NeverConnected(format!("connect failed: {e}")),
+        Err(e) => {
+            context["event"] = "connect_failed".into();
+            context["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+            context["reason"] = format!("{e}").into();
+            eprintln!("{context}");
+            return SessionEnd::NeverConnected(format!("connect failed: {e}"));
+        }
     };
-    eprintln!("[uplink] connected to relay {}", relay.label);
+    log_session(&context, &session, started, "connected", None);
+    let mut diagnostics = SessionDiagnostics {
+        context: context.clone(),
+        session: session.clone(),
+        started,
+        closed: false,
+    };
     *current.lock().unwrap() = Some(session.clone());
-
+    let mut sample = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let reason = loop {
-        match session.accept_bi().await {
+        tokio::select! {
+        _ = sample.tick() => log_session(&context, &session, started, "stats", None),
+        result = session.accept_bi() => match result {
             Ok((send, recv)) => {
                 tokio::spawn(bridge(send, recv));
             }
             Err(e) => break format!("{e}"),
         }
+        }
     };
+    log_session(&context, &session, started, "closed", Some(&reason));
+    diagnostics.closed = true;
     current.lock().unwrap().take();
     SessionEnd::Ended(reason)
+}
+
+// Decode only the sid of an upsidedown credential for log correlation. This is
+// unverified diagnostic metadata, never an authorization decision. Generic
+// relay paths have no sid; never fall back to logging the path or token.
+fn diagnostic_sid(url: &url::Url) -> Option<String> {
+    let token = url.path().strip_prefix("/u/")?;
+    let payload = base64url_decode(token.split('.').nth(1)?)?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    claims
+        .get("sid")?
+        .as_str()
+        .filter(|sid| sid.len() <= 256)
+        .map(str::to_owned)
+}
+
+struct SessionDiagnostics {
+    context: serde_json::Value,
+    session: wt::Session,
+    started: std::time::Instant,
+    closed: bool,
+}
+
+impl Drop for SessionDiagnostics {
+    fn drop(&mut self) {
+        if !self.closed {
+            log_session(
+                &self.context,
+                &self.session,
+                self.started,
+                "cancelled",
+                Some("local uplink task cancelled"),
+            );
+        }
+    }
+}
+
+fn log_session(
+    context: &serde_json::Value,
+    session: &wt::Session,
+    started: std::time::Instant,
+    event: &str,
+    reason: Option<&str>,
+) {
+    let stats = wt::quinn::Connection::stats(session);
+    let mut record = context.clone();
+    record["event"] = event.into();
+    record["timestamp_ms"] = serde_json::json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    record["local_quic_id"] = serde_json::json!(session.stable_id());
+    record["reason"] = serde_json::json!(reason);
+    record["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+    record["rtt_ms"] = serde_json::json!(session.rtt().as_secs_f64() * 1000.0);
+    record["sent_packets"] = stats.path.sent_packets.into();
+    record["lost_packets"] = stats.path.lost_packets.into();
+    record["received_datagrams"] = stats.udp_rx.datagrams.into();
+    record["sent_bytes"] = stats.udp_tx.bytes.into();
+    record["received_bytes"] = stats.udp_rx.bytes.into();
+    eprintln!("{record}");
 }
 
 /// Bridge one relay-initiated stream to one local blit server connection.
@@ -492,5 +590,20 @@ mod tests {
         assert_eq!(base64url_decode("_-8").unwrap(), vec![0xff, 0xef]);
         assert!(base64url_decode("a+b").is_none());
         assert_eq!(base64url_decode("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn diagnostic_sid_never_falls_back_to_credentials() {
+        let url = url::Url::parse(
+            "https://relay/u/header.eyJzaWQiOiJzZXNzaW9uLTEiLCJzZWNyZXQiOiJkb250LWxvZyJ9.signature",
+        )
+        .unwrap();
+        assert_eq!(diagnostic_sid(&url).as_deref(), Some("session-1"));
+        for path in ["/u/secret", "/u/a.invalid.c", "/u/a.e30.c", "/token/secret"] {
+            assert!(
+                diagnostic_sid(&url::Url::parse(&format!("https://relay{path}")).unwrap())
+                    .is_none()
+            );
+        }
     }
 }

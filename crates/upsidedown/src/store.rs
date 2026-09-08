@@ -201,20 +201,22 @@ impl Store {
     /// Announce that `sid`'s uplink just registered, waking any `/attach`
     /// waiting on that session.  Best-effort: a lost notification only means
     /// the waiter falls back to its next store re-check.
-    pub async fn publish_session(&self, sid: &str) {
+    pub async fn publish_session(&self, sid: &str) -> Result<(), String> {
         match self {
             Store::Redis { cm, .. } => {
                 let mut c = cm.clone();
-                let _: Result<(), _> = redis::cmd("PUBLISH")
+                let _: usize = redis::cmd("PUBLISH")
                     .arg(SESSION_CHANNEL)
                     .arg(sid)
                     .query_async(&mut c)
-                    .await;
+                    .await
+                    .map_err(|e| format!("redis PUBLISH: {e}"))?;
             }
             Store::Mem { events, .. } => {
                 let _ = events.send(sid.to_string());
             }
         }
+        Ok(())
     }
 
     /// Subscribe to session-registration events.  Returns a receiver of

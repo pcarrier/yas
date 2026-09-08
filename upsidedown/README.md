@@ -59,6 +59,33 @@ upsidedown mint --secret-key <secret> --sid <session> --role client  --ttl-secs 
 - `client` token → any blit client via `uplink:<jwt>` (default control
   plane `https://usd.blit.sh`), e.g. `blit remote add sandbox uplink:<jwt>`.
 
+## Uplink diagnostics
+
+Clients and workers emit JSON lifecycle events and cumulative QUIC statistics
+every 60 seconds. Correlate by `connection_id` (new for every connection), then
+`sid`. Client logs identify the relay by host/port; worker logs identify `worker`.
+Records include client version, elapsed milliseconds, RTT, sent/lost packet
+counts, received datagrams, sent/received UDP bytes, and close reason. Counters
+include transport overhead, not just relayed application bytes. A client-side
+`cancelled` event means the local task was dropped, including on Ctrl-C. Abrupt
+process termination cannot emit a final event.
+
+The client sends optional `x-blit-connection-id` and `x-blit-version` CONNECT
+headers. Older peers remain compatible; older clients appear as version
+`unknown` and get a worker-generated connection ID. Client-side `sid` is decoded
+from the credential only for diagnostics, not verified or used for authorization.
+JWTs, CONNECT URLs, and bearer headers are never intentionally logged.
+
+Worker `transport_connected` means QUIC/WebTransport was accepted; `registered`
+means the Redis session binding was written successfully. `registration_failed`
+closes the session with code 503 so the client reconnects through the pool.
+`session_publish_failed` leaves the binding intact but warns that attach waiters
+may miss the notification. `session_refresh_failed` means Redis could not refresh
+the binding; `session_refresh_not_owner` means it expired or another worker owns
+it. Existing connections continue during refresh failures; no binding is
+overwritten. `session_delete_failed` reports failed teardown cleanup (TTL remains
+the backstop).
+
 ## Local development
 
 ```bash
