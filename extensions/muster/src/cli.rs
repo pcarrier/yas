@@ -430,7 +430,7 @@ impl Muster {
                 .ports
                 .map_or_else(String::new, |(base, span)| format!(", ports {base}+{span}"));
             out.push_str(&format!(
-                "{name}\t—\t-\t-\t{}{ports}, {}/{} ready\n",
+                "{name}\t-\t-\t-\t{}{ports}, {}/{} ready\n",
                 instance.stack,
                 self.ready_count(instance),
                 instance.members.len()
