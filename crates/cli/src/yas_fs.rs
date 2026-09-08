@@ -696,19 +696,23 @@ async fn run_apply(
     result
 }
 
+fn single_item_apply(root_handle: u64, item: ApplyItem) -> Apply {
+    Apply {
+        root_handle,
+        operation_id: nonzero_operation_id(),
+        flags: 0,
+        items: vec![item],
+        extensions: Extensions::default(),
+    }
+}
+
 async fn apply_one(root: &mut Root, item: ApplyItem, json: bool) -> Result<i32, String> {
     let result: ApplyResult = root
         .client
         .request_typed(
             family::FS,
             fs::request_kind::APPLY,
-            &Apply {
-                root_handle: root.handle,
-                operation_id: nonzero_operation_id(),
-                flags: yas_wire::schema::fs::APPLY_ALL_OR_NONE as u16,
-                items: vec![item],
-                extensions: Extensions::default(),
-            },
+            &single_item_apply(root.handle, item),
             true,
         )
         .await?;
@@ -1225,6 +1229,32 @@ mod tests {
         assert!(wire_path("../secret").is_err());
         assert!(wire_path("/etc/passwd").is_err());
         assert_eq!(display_path(&wire_path(".").unwrap()), ".");
+    }
+
+    #[test]
+    fn single_item_mutations_do_not_require_atomic_batch_support() {
+        for item in [
+            ApplyItem::WriteInline {
+                path: wire_path("small-file").unwrap(),
+                precondition: Precondition::Absent,
+                create_parents: false,
+                mode: 0,
+                content: b"contents".to_vec(),
+            },
+            ApplyItem::Mkdir {
+                path: wire_path("directory").unwrap(),
+                precondition: Precondition::Absent,
+                create_parents: false,
+                mode: 0,
+            },
+        ] {
+            let request = single_item_apply(7, item.clone());
+            let decoded = Apply::decode(&request.encode().unwrap()).unwrap();
+            assert_eq!(decoded.root_handle, 7);
+            assert_eq!(decoded.flags, 0);
+            assert_eq!(decoded.items, vec![item]);
+            assert_ne!(decoded.operation_id, [0; 16]);
+        }
     }
 
     #[test]
