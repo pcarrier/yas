@@ -401,7 +401,11 @@ async fn fetch_message(signal_url_base: &str) -> Option<Message> {
     Some(Message { template, fatal })
 }
 
-pub async fn run(config: Config) {
+/// Publish a share, rejecting blank passphrases before any network activity.
+pub async fn run(config: Config) -> Result<(), String> {
+    if config.passphrase.trim().is_empty() {
+        return Err("share passphrase must not be empty or whitespace-only".to_string());
+    }
     VERBOSE.store(config.verbose, Ordering::Relaxed);
     init_verbose();
     let keys = ProducerKeys::derive(&config.passphrase);
@@ -617,5 +621,45 @@ pub async fn run(config: Config) {
     shutdown.notify_waiters();
     if !peers.is_empty() {
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn run_rejects_blank_passphrases_before_io() {
+        for passphrase in ["", " ", "\t\r\n", "\u{a0}\u{2003}"] {
+            for hosted in [false, true] {
+                let connector: HostedConnector =
+                    Arc::new(|| panic!("blank passphrase must not open a hosted session"));
+                let upstream = Upstream {
+                    hosted: hosted.then_some(connector),
+                    ..Default::default()
+                };
+                let config = Config {
+                    upstream,
+                    signal_url: "not a URL".to_string(),
+                    passphrase: passphrase.to_string(),
+                    message_override: None,
+                    quiet: false,
+                    verbose: false,
+                };
+                // Poll without a runtime: validation must finish before any async I/O.
+                let mut future = Box::pin(run(config));
+                let result = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()));
+                assert_eq!(
+                    result,
+                    Poll::Ready(Err(
+                        "share passphrase must not be empty or whitespace-only".to_string()
+                    ))
+                );
+            }
+        }
     }
 }
