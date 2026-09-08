@@ -90,6 +90,10 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("server instance 'work' is already running"));
+        assert!(error.contains(&path.display().to_string()));
+        // Windows exclusive byte-range locks also deny reads through a second
+        // handle, so the PID stored in the locked file is best-effort there.
+        #[cfg(unix)]
         assert!(error.contains(&format!("held by pid {}", std::process::id())));
 
         drop(first);
