@@ -39,4 +39,5 @@ crypto_box = "0.9"
 rand = "0.10"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"

@@ -8,7 +8,6 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use str0m::change::SdpOffer;
 use str0m::channel::ChannelId;
 use str0m::net::Receive;
 use str0m::{Candidate, Event, Input, Output, Rtc};
@@ -506,7 +505,9 @@ pub async fn handle_peer(
     established: Arc<AtomicBool>,
     ice_config: Option<IceConfig>,
     shutdown: Arc<Notify>,
+    offer: crate::admission::AuthenticatedOffer,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let consumer_access = offer.access;
     // --- Bind sockets ---
     let udp4 = UdpSocket::bind("0.0.0.0:0")?;
     udp4.set_nonblocking(true)?;
@@ -683,27 +684,9 @@ pub async fn handle_peer(
         }
     }
 
-    // Wait for the SDP offer.  Decrypt via ProducerKeys::open_sealed which
-    // tries both the RW and RO consumer keys — the one that works tells us
-    // the consumer's access level.
-    let (offer, consumer_access): (SdpOffer, crate::Access) = loop {
-        match signal_rx.recv().await {
-            Some(raw) => {
-                let Some((data, access)) = keys.open_sealed(&raw) else {
-                    continue;
-                };
-                if let Some(sdp) = data.get("sdp") {
-                    let offer: SdpOffer = serde_json::from_value(sdp.clone())?;
-                    break (offer, access);
-                }
-            }
-            None => return Ok(()),
-        }
-    };
-
     verbose!("consumer access: {:?}", consumer_access);
 
-    let answer = rtc.sdp_api().accept_offer(offer)?;
+    let answer = rtc.sdp_api().accept_offer(offer.sdp)?;
     let answer_json = serde_json::to_value(&answer)?;
     let signal_data = serde_json::json!({ "sdp": answer_json });
     let bk = keys.box_keys_for(consumer_access);
@@ -1195,13 +1178,7 @@ pub async fn handle_peer(
                 }
             } => {
                 match sig {
-                    Some(raw) => {
-                        let Some((data, access)) = keys.open_sealed(&raw) else {
-                            continue;
-                        };
-                        if access != consumer_access {
-                            continue;
-                        }
+                    Some(data) => {
                         if let Some(candidate) = data.get("candidate")
                             && let Ok(c) = serde_json::from_value::<Candidate>(candidate.clone())
                         {

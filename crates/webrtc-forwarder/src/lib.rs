@@ -6,6 +6,7 @@ macro_rules! verbose {
     };
 }
 
+mod admission;
 pub mod client;
 pub mod dtls_dedupe;
 pub mod ice;
@@ -18,7 +19,6 @@ use ed25519_dalek::SigningKey;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
 use sha2::Sha256;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -350,6 +350,13 @@ struct PeerState {
     handle: tokio::task::JoinHandle<()>,
     signal_tx: Option<mpsc::Sender<serde_json::Value>>,
     established: Arc<AtomicBool>,
+    access: Access,
+}
+
+impl Drop for PeerState {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 const MAX_SIGNAL_PEERS: usize = 64;
@@ -449,8 +456,8 @@ pub async fn run(config: Config) {
         public_key_hex,
     );
 
-    // Don't decrypt in the signaling transport layer — the peer handler does
-    // it via ProducerKeys::open_sealed so it can identify RW vs RO consumers.
+    // Admission decrypts offers before allocating peer resources and identifies
+    // RW vs RO consumers; the signaling transport retains the sealed envelope.
     tokio::spawn(signaling::connect(
         signal_url,
         keys.signing.clone(),
@@ -484,127 +491,63 @@ pub async fn run(config: Config) {
         });
     }
 
-    let mut peers: HashMap<String, PeerState> = HashMap::new();
+    let mut peers = admission::Peers::default();
 
     loop {
-        peers.retain(|_, state| !state.handle.is_finished());
+        peers.expire();
+        let deadline = peers.deadline();
         let event = tokio::select! {
             ev = sig_event_rx.recv() => match ev {
                 Some(e) => e,
                 None => break,
             },
             _ = shutdown.notified() => break,
+            _ = admission::Peers::wait_for_expiry(deadline) => continue,
         };
         match event {
             signaling::Event::Registered { session_id } => {
                 verbose!("registered with signaling server (session {session_id})");
                 yas_sd_notify::notify_ready(false);
-                // Do NOT abort unestablished peers here.  The hub will
-                // re-send peer_joined for every consumer that is still
-                // connected; the PeerJoined handler below replaces the peer
-                // task when that happens.  Aborting here would kill a peer
-                // that is mid-ICE-gathering (up to 4 s) just because the
-                // signaling WS briefly dropped — exactly the race that makes
-                // one forwarder connect and another not.
+                // Preserve authenticated peers across signaling reconnects.
             }
-            signaling::Event::PeerJoined { session_id } => {
-                if uuid::Uuid::parse_str(&session_id).is_err() {
-                    verbose!("ignoring invalid signaling peer ID");
-                    continue;
-                }
-                if let Some(existing) = peers.get(&session_id) {
-                    if existing.established.load(Ordering::Relaxed) {
-                        verbose!(
-                            "ignoring duplicate peer_joined for established peer: {session_id}"
-                        );
-                        continue;
-                    }
-                    if let Some(old) = peers.remove(&session_id) {
-                        old.handle.abort();
-                    }
-                }
-                if peers.len() >= MAX_SIGNAL_PEERS {
-                    verbose!("ignoring peer beyond signaling peer budget");
-                    continue;
-                }
-                verbose!("consumer joined: {session_id}");
-                let (peer_sig_tx, peer_sig_rx) = mpsc::channel(SIGNAL_PER_PEER_QUEUE);
-                let established = Arc::new(AtomicBool::new(false));
-                let peer_id = session_id.clone();
-                let upstream = config.upstream.clone();
-                let out_tx = sig_send_tx.clone();
-                let pk = keys.clone();
-                let est = established.clone();
-                let ice = ice_config.clone();
-                let sd = shutdown.clone();
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = peer::handle_peer(
-                        peer_id.clone(),
-                        upstream,
-                        peer_sig_rx,
-                        out_tx,
-                        pk,
-                        est,
-                        ice,
-                        sd,
-                    )
-                    .await
-                    {
-                        verbose!("peer {peer_id} error: {e}");
-                    }
-                });
-                peers.insert(
-                    session_id,
+            signaling::Event::PeerJoined { session_id } => peers.joined(session_id),
+            signaling::Event::PeerLeft { session_id } => peers.left(&session_id),
+            signaling::Event::Signal { from, data } => {
+                let peer_id = from.clone();
+                peers.signal(from, data, &keys, |offer| {
+                    let (peer_sig_tx, peer_sig_rx) = mpsc::channel(SIGNAL_PER_PEER_QUEUE);
+                    let established = Arc::new(AtomicBool::new(false));
+                    let upstream = config.upstream.clone();
+                    let out_tx = sig_send_tx.clone();
+                    let pk = keys.clone();
+                    let est = established.clone();
+                    let ice = ice_config.clone();
+                    let sd = shutdown.clone();
+                    let access = offer.access;
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) = peer::handle_peer(
+                            peer_id.clone(),
+                            upstream,
+                            peer_sig_rx,
+                            out_tx,
+                            pk,
+                            est,
+                            ice,
+                            sd,
+                            offer,
+                        )
+                        .await
+                        {
+                            verbose!("peer {peer_id} error: {e}");
+                        }
+                    });
                     PeerState {
                         handle,
                         signal_tx: Some(peer_sig_tx),
                         established,
-                    },
-                );
-            }
-            signaling::Event::PeerLeft { session_id } => {
-                verbose!("consumer left: {session_id}");
-                if let Some(state) = peers.get_mut(&session_id) {
-                    if state.established.load(Ordering::Relaxed) {
-                        // The signaling WebSocket dropped but the WebRTC
-                        // data path (ICE/DTLS/SCTP) is independent and may
-                        // still be alive.  Don't abort the peer handler —
-                        // it has its own liveness detection via
-                        // PEER_IDLE_TIMEOUT.  Just drop the signaling relay
-                        // so no more SDP messages can be forwarded.
-                        verbose!(
-                            "peer {session_id} is established, \
-                             keeping WebRTC session alive"
-                        );
-                        // Close the signal_tx so the peer handler's
-                        // signal_rx returns None (harmless — signaling is
-                        // only needed during ICE setup).
-                        state.signal_tx = None;
-                    } else {
-                        // Not yet established — the consumer disconnected
-                        // during ICE setup; tear down immediately.
-                        if let Some(state) = peers.remove(&session_id) {
-                            state.handle.abort();
-                        }
+                        access,
                     }
-                }
-            }
-            signaling::Event::Signal { from, data } => {
-                let overflowed = if let Some(state) = peers.get(&from) {
-                    state
-                        .signal_tx
-                        .as_ref()
-                        .is_some_and(|sender| sender.try_send(data).is_err())
-                } else {
-                    verbose!("signal from unknown peer {from}, ignoring");
-                    false
-                };
-                if overflowed {
-                    verbose!("closing peer that exceeded its signaling budget");
-                    if let Some(state) = peers.remove(&from) {
-                        state.handle.abort();
-                    }
-                }
+                });
             }
             signaling::Event::Error { message } => {
                 verbose!("signaling error: {message}");
@@ -615,7 +558,7 @@ pub async fn run(config: Config) {
     // On shutdown, notify all peers so they close their native streams, then
     // give the peer tasks a brief window to tear down cleanly.
     shutdown.notify_waiters();
-    if !peers.is_empty() {
+    if !peers.active.is_empty() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
