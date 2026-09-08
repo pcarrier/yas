@@ -2058,28 +2058,18 @@ fn commit_stage(
     let parent = target
         .parent()
         .ok_or(Error::Invalid("FS target has no parent"))?;
-    let temp = unique_temp_path(parent, "yas-commit")?;
-    let result = (|| {
-        fs::copy(&stage.temp_path, &temp).map_err(map_io)?;
-        set_file_mode(&temp, stage.mode)?;
-        if flags & schema::fs::COMMIT_SYNC_DATA as u16 != 0 {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&temp)
-                .and_then(|file| file.sync_all())
-                .map_err(map_io)?;
-        }
-        fs::rename(&temp, &target).map_err(map_io)?;
-        if flags & schema::fs::COMMIT_SYNC_DIRECTORY as u16 != 0 {
-            sync_directory(parent)?;
-        }
-        Ok::<(), Error>(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    atomic_replace(
+        &target,
+        stage.mode,
+        flags & schema::fs::COMMIT_SYNC_DATA as u16 != 0,
+        |file| {
+            let mut source = File::open(&stage.temp_path)?;
+            io::copy(&mut source, file).map(|_| ())
+        },
+    )?;
+    if flags & schema::fs::COMMIT_SYNC_DIRECTORY as u16 != 0 {
+        sync_directory(parent)?;
     }
-    result?;
     stage
         .root
         .operation_echoes
@@ -2271,25 +2261,57 @@ fn atomic_write(
     if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_dir()) {
         return Err(Error::Conflict(conflict_detail(root, path)));
     }
+    atomic_replace(&target, mode, false, |file| file.write_all(content))
+}
+
+fn atomic_replace(
+    target: &OsPath,
+    mode: u32,
+    sync_data: bool,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> Result<(), Error> {
     let parent = target
         .parent()
         .ok_or(Error::Invalid("FS target has no parent"))?;
-    let temp = unique_temp_path(parent, "yas-write")?;
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".yas-write-");
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = if mode != 0 {
+            Some(fs::Permissions::from_mode(mode))
+        } else {
+            match fs::symlink_metadata(target) {
+                Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
+                Ok(_) => None,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(map_io(error)),
+            }
+        };
+        // Creation must never expose bytes with broader permissions than the destination.
+        builder.permissions(
+            permissions
+                .clone()
+                .unwrap_or_else(|| fs::Permissions::from_mode(0o666)),
+        );
+        permissions
+    };
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut temp = builder.tempfile_in(parent).map_err(map_io)?;
+    write(temp.as_file_mut()).map_err(map_io)?;
+    temp.as_file_mut().flush().map_err(map_io)?;
+    #[cfg(unix)]
+    if let Some(permissions) = permissions {
+        temp.as_file()
+            .set_permissions(permissions)
             .map_err(map_io)?;
-        file.write_all(content).map_err(map_io)?;
-        file.flush().map_err(map_io)?;
-        set_file_mode(&temp, mode)?;
-        fs::rename(&temp, &target).map_err(map_io)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
     }
-    result
+    if sync_data {
+        temp.as_file().sync_all().map_err(map_io)?;
+    }
+    temp.persist(target).map_err(|error| map_io(error.error))?;
+    Ok(())
 }
 
 fn atomic_hardlink(source: &OsPath, target: &OsPath) -> Result<(), Error> {
@@ -2344,20 +2366,6 @@ fn atomic_symlink(target: &[u8], link: &OsPath) -> Result<(), Error> {
 #[cfg(all(not(unix), not(windows)))]
 fn atomic_symlink(_target: &[u8], _link: &OsPath) -> Result<(), Error> {
     Err(Error::Unsupported)
-}
-
-#[cfg(unix)]
-fn set_file_mode(path: &OsPath, mode: u32) -> Result<(), Error> {
-    use std::os::unix::fs::PermissionsExt;
-    if mode != 0 {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(map_io)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_file_mode(_path: &OsPath, _mode: u32) -> Result<(), Error> {
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -2577,6 +2585,89 @@ mod tests {
                 .get(&path(&[b"landed"])),
             Some(&[1; 16])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_and_staged_writes_preserve_or_override_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = TestDir::new();
+        let root = Arc::new(test_root(&directory));
+        let target = directory.0.join("value");
+        let reference = directory.0.join("umask-reference");
+        fs::write(&reference, b"").unwrap();
+        let default_mode = fs::metadata(reference).unwrap().permissions().mode() & 0o777;
+        for staged in [false, true] {
+            for (existing, requested, expected) in [
+                (Some(0o600), 0, 0o600),
+                (Some(0o755), 0, 0o755),
+                (Some(0o644), 0o600, 0o600),
+                (Some(0o600), 0o640, 0o640),
+                (None, 0o600, 0o600),
+                (None, 0, default_mode),
+            ] {
+                let _ = fs::remove_file(&target);
+                if let Some(mode) = existing {
+                    fs::write(&target, b"old").unwrap();
+                    fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+                }
+                let bytes = b"replacement";
+                if staged {
+                    let temp_path = directory.0.join("upload");
+                    fs::write(&temp_path, bytes).unwrap();
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(bytes);
+                    let stage = Stage {
+                        root: root.clone(),
+                        path: path(&[b"value"]),
+                        precondition: wire::Precondition::Any,
+                        flags: 0,
+                        mode: requested,
+                        byte_len: bytes.len() as u64,
+                        content_hash: *blake3::hash(bytes).as_bytes(),
+                        temp_path,
+                        file: None,
+                        hasher,
+                        received: bytes.len() as u64,
+                        sealed: true,
+                    };
+                    commit_stage(
+                        stage,
+                        [3; 16],
+                        (schema::fs::COMMIT_SYNC_DATA | schema::fs::COMMIT_SYNC_DIRECTORY) as u16,
+                    )
+                    .unwrap();
+                } else {
+                    atomic_write(&root, &path(&[b"value"]), false, requested, bytes).unwrap();
+                }
+                assert_eq!(fs::read(&target).unwrap(), bytes);
+                assert_eq!(
+                    fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    expected,
+                    "staged={staged}, existing={existing:?}, requested={requested:o}",
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_temporaries_are_private_before_writing_and_cleaned_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = TestDir::new();
+        let target = directory.0.join("private");
+        fs::write(&target, b"original").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        for mode in [0, 0o600] {
+            let result = atomic_replace(&target, mode, false, |file| {
+                assert_eq!(file.metadata()?.permissions().mode() & 0o077, 0);
+                file.write_all(b"partial secret")?;
+                Err(io::Error::other("synthetic write failure"))
+            });
+            assert!(result.is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"original");
+            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        }
     }
 
     #[test]
