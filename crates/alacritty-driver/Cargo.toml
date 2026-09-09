@@ -1,6 +1,6 @@
 [package]
 name = "yas-terminal-driver"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 description = "YAS driver for the vendored Alacritty terminal engine"
 license.workspace = true

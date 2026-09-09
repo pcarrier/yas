@@ -1,6 +1,6 @@
 [package]
 name = "yas-lsp"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 description = "Language intelligence engine: warm shared language servers projected into yas records"
 license.workspace = true
