@@ -5711,7 +5711,7 @@ fn shell_escape_display(argument: &str) -> String {
 fn install_terminal_child(
     pty: &mut super::Pty,
     new_handle: super::pty::PtyHandle,
-    new_reader: std::thread::JoinHandle<()>,
+    new_reader: super::PtyReaderHandle,
     new_byte_rx: mpsc::Receiver<super::PtyInput>,
     prepared: &PreparedTerminalLaunch,
     rows: u16,

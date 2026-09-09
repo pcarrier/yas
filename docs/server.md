@@ -157,7 +157,7 @@ PTYs are created by a native Terminal `CREATE` Request. The server:
 
    The child runs as the **same user as the server** — there is no `setuid`, `setgid`, `chroot`, or seccomp anywhere in the tree. Closing descriptors keeps one terminal from reaching another's PTY master or the IPC listener; it is hygiene between sibling terminals, not a boundary between a client and the machine. A YAS connection is equivalent to an interactive login shell as the server's user; confinement, if you need it, belongs outside the server (see the `fd-channel` integration point in [transports.md](transports.md)).
 
-4. The master fd is registered with the tokio reactor for async I/O.
+4. A dedicated reader thread sends PTY bytes and synchronized-output boundaries through a bounded channel to the delivery tick.
 5. PTY output is fed through the vendored `yas-alacritty-terminal` parser.
 6. The correlated Result returns the opaque terminal handle, state revision,
    and generation.
@@ -179,6 +179,20 @@ When the PTY subprocess exits, `waitpid` captures the exit status:
 - Normal exit: `WEXITSTATUS` (0, 1, …).
 - Signal death: negative signal number (-9 = SIGKILL, -15 = SIGTERM).
 - Unknown: `i32::MIN`.
+
+YAS publishes exit only after consuming the reader's ordered EOF, which follows
+all preceding output bytes. Once the direct child exits, the tick bypasses the
+four-frame presentation cap and coalesces synchronized redraws while retaining
+its per-terminal and per-session parsing budgets. Queued display snapshots are
+cleared before final state is published, so the final frame uses the drained
+terminal model.
+
+If a descendant holds the slave open, the supervisor requests a reader-side
+drain after 50 ms. The reader finishes its current chunk, captures the number
+of bytes pending in the OS, forwards that finite remainder, and then sends EOF.
+This bounds the capture even if the descendant continues writing. A full byte
+channel can delay completion; it cannot authorize early exit or discard bytes
+already accepted for capture.
 
 Terminal watchers receive an EXITED state record including the portable exit
 record. The terminal state is retained — clients can still scroll and read.

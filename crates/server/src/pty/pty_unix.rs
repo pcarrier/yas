@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
@@ -863,18 +864,67 @@ pub fn respond_to_queries(
     scan
 }
 
-pub fn pty_reader(fd: PtyWriteTarget, tx: mpsc::Sender<PtyInput>, notify: Arc<Notify>) {
+pub fn pty_reader(
+    fd: PtyWriteTarget,
+    tx: mpsc::Sender<PtyInput>,
+    notify: Arc<Notify>,
+    finish: Arc<AtomicBool>,
+) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
     }
-
     let mut buf = vec![0u8; 64 * 1024];
     let mut sync_scan_tail = Vec::new();
+    let mut drain_remaining = None;
 
     loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if drain_remaining.is_none() && finish.load(Ordering::Acquire) {
+            // Take a finite cutoff: a surviving descendant may keep writing.
+            // The previous read's entire chunk has already been sent.
+            let mut available: libc::c_int = 0;
+            if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available) } < 0 {
+                let _ = tx.blocking_send(PtyInput::Eof);
+                notify.notify_one();
+                return;
+            }
+            drain_remaining = Some(available.max(0) as usize);
+        }
+        if drain_remaining == Some(0) {
+            let _ = tx.blocking_send(PtyInput::Eof);
+            notify.notify_one();
+            return;
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 50) };
+        if ready == 0 {
+            continue;
+        }
+        if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        let limit = drain_remaining.unwrap_or(buf.len()).min(buf.len());
+        let n = if ready < 0 {
+            -1
+        } else {
+            unsafe { libc::read(fd, buf.as_mut_ptr().cast(), limit) }
+        };
+        if n < 0
+            && matches!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            )
+        {
+            continue;
+        }
         if n > 0 {
+            if let Some(remaining) = &mut drain_remaining {
+                *remaining -= n as usize;
+            }
             let data = buf[..n as usize].to_vec();
             let mut remaining = data;
             loop {
@@ -1044,13 +1094,10 @@ pub fn spawn_pty(
 
     state.pty_fds.write().unwrap().insert(id, master);
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
-    let reader_handle = std::thread::Builder::new()
-        .name(format!("pty-reader-{id}"))
-        .spawn({
-            let notify = state.delivery_notify.clone();
-            move || pty_reader(master, byte_tx, notify)
-        })
-        .expect("failed to spawn pty-reader thread");
+    let reader_handle = crate::PtyReaderHandle::spawn(id, {
+        let notify = state.delivery_notify.clone();
+        move |finish| pty_reader(master, byte_tx, notify, finish)
+    });
     let handle = PtyHandle {
         master_fd: master,
         child_pid: pid,
@@ -1102,11 +1149,7 @@ pub fn respawn_child(
     spec: ChildSpec<'_>,
     state: AppState,
     session_env: Option<&crate::app_env::SessionEnv>,
-) -> Option<(
-    PtyHandle,
-    std::thread::JoinHandle<()>,
-    mpsc::Receiver<PtyInput>,
-)> {
+) -> Option<(PtyHandle, crate::PtyReaderHandle, mpsc::Receiver<PtyInput>)> {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
     unsafe {
@@ -1207,13 +1250,10 @@ pub fn respawn_child(
 
     state.pty_fds.write().unwrap().insert(pty_id, master);
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
-    let reader_handle = std::thread::Builder::new()
-        .name(format!("pty-reader-{pty_id}"))
-        .spawn({
-            let notify = state.delivery_notify.clone();
-            move || pty_reader(master, byte_tx, notify)
-        })
-        .expect("failed to spawn pty-reader thread");
+    let reader_handle = crate::PtyReaderHandle::spawn(pty_id, {
+        let notify = state.delivery_notify.clone();
+        move |finish| pty_reader(master, byte_tx, notify, finish)
+    });
     let handle = PtyHandle {
         master_fd: master,
         child_pid: pid,
@@ -1231,6 +1271,63 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::CString;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn exit_drain_preserves_reader_chunk_and_pending_kernel_bytes() {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio::sync::{Notify, mpsc};
+
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let mut expected = Vec::new();
+        for i in 0..100 {
+            expected.extend_from_slice(format!("\x1b[?2026hframe-{i}\r\n\x1b[?2026l").as_bytes());
+        }
+        writer.write_all(&expected).unwrap();
+        // The reader has room for one frame, then blocks inside its current
+        // read. More bytes remain in that chunk than the channel can hold.
+        let (tx, mut rx) = mpsc::channel(1);
+        let finish = Arc::new(AtomicBool::new(false));
+        let request = finish.clone();
+        let reader = std::thread::spawn(move || {
+            super::pty_reader(read_fd.as_raw_fd(), tx, Arc::new(Notify::new()), request);
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // These bytes cannot be in the blocked reader's first read.
+        let tail = b"FINAL-KERNEL-MARKER\r\n";
+        writer.write_all(tail).unwrap();
+        expected.extend_from_slice(tail);
+        finish.store(true, Ordering::Release);
+        let actual = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut actual = Vec::new();
+            loop {
+                match rx.recv().await.expect("ordered EOF before channel close") {
+                    crate::PtyInput::Data(data) => actual.extend_from_slice(&data),
+                    crate::PtyInput::SyncBoundary { before } => actual.extend_from_slice(&before),
+                    crate::PtyInput::Eof => break,
+                }
+            }
+            actual
+        })
+        .await
+        .expect("drain completes even while the writer stays open");
+        reader.join().unwrap();
+        assert_eq!(actual, expected);
+        drop(writer);
+    }
 
     /// `build_child_env` with no client overrides — the shape every test that
     /// predates them expects.

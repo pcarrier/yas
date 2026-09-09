@@ -31,6 +31,16 @@ The child's environment is built before `fork()` via `build_child_env()` and pas
 
 On the parent side, `close(slave)` is equally important — the parent must not hold the slave fd, or the master won't get a hangup when the child exits.
 
+## PTY exit draining
+
+The Unix reader uses `poll` before `read` so it can observe an exit-drain
+request while a descendant holds the slave open. `FIONREAD` writes into a live
+`c_int` and establishes a finite remaining byte count. Reads are bounded by
+both that count and the allocated buffer. The reader is the sole consumer of
+the master fd. Ordinary exit cleanup must wait for its ordered EOF before
+closing the fd; emptying the Rust channel alone does not prove the reader or
+kernel buffer is empty.
+
 ## Compositor child spawn
 
 `spawn_compositor_child` in [`crates/server/src/lib.rs`](crates/server/src/lib.rs) is a simpler fork/exec path used to launch Wayland GUI commands (e.g. `foot`). The child calls `chdir()`, mutates the environment (`set_var`/`remove_var` for `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, `DISPLAY`), then `execvp`. Unlike the PTY spawn path, it does not call `setsid`, `TIOCSCTTY`, or `close_fds_except` — the child inherits the parent's fd table. This is acceptable because compositor children don't need a controlling terminal and don't interact with PTYs.
@@ -41,6 +51,7 @@ On the parent side, `close(slave)` is equally important — the parent must not 
 
 - **`CreatePseudoConsole`/`ClosePseudoConsole`** — creating and destroying the pseudo console. The console handle is stored in `PtyHandle` and must outlive all pipe I/O.
 - **`CreateProcessW`** — launching the child process attached to the ConPTY via `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`. The attribute list is initialized with `InitializeProcThreadAttributeList` + `UpdateProcThreadAttribute`.
+- **`CancelSynchronousIo` / `PeekNamedPipe`** — the supervisor cancels a blocked reader after the exit grace, using the live thread handle owned by its `JoinHandle`. It retries to cover cancellation racing the start of `ReadFile`. The reader then captures the available byte count, bounds subsequent reads by that count and buffer capacity, and sends ordered EOF after forwarding the remainder. The output pipe has exactly one reader.
 - **`ReadFile`/`WriteFile`** — blocking reads from the output pipe (in a dedicated reader thread) and writes to the input pipe. The pipe handles come from `CreatePipe` and must be closed in the correct order — the parent's end of the input pipe is closed by `ClosePseudoConsole`, and the child's inherited ends are closed immediately after `CreateProcessW`.
 - **`unsafe impl Send + Sync`** for `PtyHandle`, `PtyWriteTarget`, and `SendHandle` — these wrap raw Windows `HANDLE` values that are safe to use from any thread once created.
 
