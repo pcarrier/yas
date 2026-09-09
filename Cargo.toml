@@ -9,7 +9,6 @@ members = [
     "crates/alacritty-driver",
     "crates/server",
     "crates/gateway",
-    "crates/upsidedown",
     "crates/browser",
     "crates/cli",
     "crates/fonts",
