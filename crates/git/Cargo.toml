@@ -1,6 +1,6 @@
 [package]
 name = "yas-git"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 description = "Git introspection engine: repo state streaming, object reads, diffs and patches"
 license.workspace = true

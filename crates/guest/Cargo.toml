@@ -1,6 +1,6 @@
 [package]
 name = "yas-guest"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 description = "Guest SDK for YAS Wasmi extensions"
 license.workspace = true

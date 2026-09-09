@@ -1,6 +1,6 @@
 [package]
 name = "yas-ssh"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 description = "Embedded SSH client for yas"
 license.workspace = true

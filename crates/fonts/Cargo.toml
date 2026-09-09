@@ -1,6 +1,6 @@
 [package]
 name = "yas-fonts"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 description = "Font discovery and serving for yas"
 license.workspace = true

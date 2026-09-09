@@ -1,6 +1,6 @@
 [package]
 name = "yas-webserver"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 description = "Embedded web server for yas"
 license.workspace = true

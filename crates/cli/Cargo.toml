@@ -1,6 +1,6 @@
 [package]
 name = "yas-cli"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 description = "yas terminal client"
 license.workspace = true
