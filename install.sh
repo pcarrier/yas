@@ -9,7 +9,7 @@
 # Either binary prints its exact terms with `yas --license`.
 set -eu
 
-RELEASES="https://github.com/pcarrier/yas/releases/latest/download"
+RELEASES="https://github.com/yas-run/yas/releases/latest/download"
 pick_prefix() {
   case ":$PATH:" in
     *":$HOME/.local/bin:"*) echo "$HOME/.local" ;;

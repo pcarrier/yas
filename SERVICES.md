@@ -13,7 +13,7 @@ serves:
 Requests to `/` receive the landing page only when `Accept` includes `text/html`.
 All others receive the PowerShell installer for PowerShell user agents, or the
 shell installer otherwise. The scripts download stable-name assets directly
-from the latest [GitHub release](https://github.com/pcarrier/yas/releases/latest).
+from the latest [GitHub release](https://github.com/yas-run/yas/releases/latest).
 `/ext/<asset>` redirects to the same release.
 
 Signaling messages are Ed25519-verified. Redis stores expiring presence and

@@ -30,7 +30,7 @@ description = "Alacritty terminal library with YAS emoji presentation width fixe
 homepage = "https://alacritty.org"
 readme = "README.md"
 license = "Apache-2.0"
-repository = "https://github.com/pcarrier/yas"
+repository = "https://github.com/yas-run/yas"
 resolver = "2"
 
 [features]

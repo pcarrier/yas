@@ -2,7 +2,7 @@
 # Usage: irm https://yas.run/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 
-$Releases = "https://github.com/pcarrier/yas/releases/latest/download"
+$Releases = "https://github.com/yas-run/yas/releases/latest/download"
 $InstallDir = if ($env:YAS_INSTALL_DIR) { $env:YAS_INSTALL_DIR } else { "$env:LOCALAPPDATA\yas\bin" }
 $YASExe = Join-Path $InstallDir "yas.exe"
 

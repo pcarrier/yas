@@ -33,11 +33,11 @@
   "author": "Indent <oss@indent.com> (https://indent.com)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pcarrier/yas.git",
+    "url": "git+https://github.com/yas-run/yas.git",
     "directory": "js/react"
   },
   "bugs": {
-    "url": "https://github.com/pcarrier/yas/issues"
+    "url": "https://github.com/yas-run/yas/issues"
   },
   "keywords": [
     "terminal",

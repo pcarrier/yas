@@ -567,7 +567,7 @@ async fn release_asset(Path(file): Path<String>) -> Response {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     Redirect::temporary(&format!(
-        "https://github.com/pcarrier/yas/releases/latest/download/{file}"
+        "https://github.com/yas-run/yas/releases/latest/download/{file}"
     ))
     .into_response()
 }

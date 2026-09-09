@@ -11,7 +11,7 @@ pub fn license_text() -> String {
     let mut text = String::new();
     text.push_str(
         "yas — MIT License, copyright (c) 2026 Indent Team\n\
-         Full text: https://github.com/pcarrier/yas/blob/main/LICENSE\n",
+         Full text: https://github.com/yas-run/yas/blob/main/LICENSE\n",
     );
     #[cfg(all(target_os = "linux", feature = "x264"))]
     text.push_str(
@@ -19,7 +19,7 @@ pub fn license_text() -> String {
          licensed under the GNU General Public License, version 2 or later.\n\
          As a combined work, this binary as a whole is distributed under the\n\
          terms of the GPL-2.0-or-later.  Complete corresponding source:\n\
-         https://github.com/pcarrier/yas (x264: https://code.videolan.org/videolan/x264)\n",
+         https://github.com/yas-run/yas (x264: https://code.videolan.org/videolan/x264)\n",
     );
     #[cfg(all(target_os = "linux", feature = "openh264"))]
     text.push_str(

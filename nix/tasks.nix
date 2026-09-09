@@ -89,8 +89,8 @@ let
         "homepage": "https://yas.run",
         "license": "MIT",
         "author": "Indent <oss@indent.com> (https://indent.com)",
-        "repository": {"type":"git","url":"git+https://github.com/pcarrier/yas.git","directory":"crates/browser"},
-        "bugs": {"url":"https://github.com/pcarrier/yas/issues"}
+        "repository": {"type":"git","url":"git+https://github.com/yas-run/yas.git","directory":"crates/browser"},
+        "bugs": {"url":"https://github.com/yas-run/yas/issues"}
       }
       PKGJSON
             echo "Package contents:"
@@ -328,7 +328,7 @@ let
         local version=$2
         local code
         code=$(curl -s -o /dev/null -w '%{http_code}' \
-          -A 'yas-release/1 (https://github.com/pcarrier/yas)' \
+          -A 'yas-release/1 (https://github.com/yas-run/yas)' \
           "https://crates.io/api/v1/crates/$crate/$version")
         [ "$code" = "200" ]
       }

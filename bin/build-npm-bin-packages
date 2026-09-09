@@ -37,8 +37,8 @@ out_dir="$(cd "$out_dir" && pwd)"
 
 HOMEPAGE="https://yas.run"
 AUTHOR="Indent <oss@indent.com> (https://indent.com)"
-REPO_URL="git+https://github.com/pcarrier/yas.git"
-BUGS_URL="https://github.com/pcarrier/yas/issues"
+REPO_URL="git+https://github.com/yas-run/yas.git"
+BUGS_URL="https://github.com/yas-run/yas/issues"
 LICENSE="MIT"
 GPL_LICENSE="GPL-2.0-or-later"
 
@@ -335,7 +335,7 @@ There is no \`yas\` CLI shim here, so this package can be installed next to
 \`curl -sf https://yas.run | YAS_GPL=1 sh\`.
 
 This binary includes libx264 and is therefore covered by GPL-2.0-or-later.
-Complete corresponding source: <https://github.com/pcarrier/yas>
+Complete corresponding source: <https://github.com/yas-run/yas>
 (x264: <https://code.videolan.org/videolan/x264>). \`yas --license\` prints the
 exact terms.
 MD

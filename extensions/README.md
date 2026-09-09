@@ -93,7 +93,7 @@ yas @doctor
 
 # one exact object, forever
 yas ext run --persist --restart always systemd \
-  https://github.com/pcarrier/yas/releases/download/v0.1.0/systemd.wasm#2672...
+  https://github.com/yas-run/yas/releases/download/v0.1.0/systemd.wasm#2672...
 ```
 
 With a pin the client asks the server first and downloads only if the server
