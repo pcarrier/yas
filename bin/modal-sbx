@@ -9,6 +9,7 @@
 """Provision a temporary Modal-hosted YAS edge and print its browser URL."""
 
 import argparse
+import asyncio
 import contextlib
 import os
 import secrets
@@ -21,6 +22,7 @@ import modal
 
 PORT = 3264
 TIMEOUT = 24 * 60 * 60
+STARTUP_TIMEOUT = 5 * 60
 CPU_CORES = 8.0
 MEMORY_MIB = 16 * 1024
 # YAS prefers AV1 NVENC; T4's Turing encoder cannot encode AV1.
@@ -31,6 +33,13 @@ EXTENSIONS = (
     ("xdg-desktop", "xdg-desktop.wasm"),
 )
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def build_yas() -> Path:
@@ -77,12 +86,33 @@ def install_extensions(sandbox: modal.Sandbox) -> None:
             )
 
 
+def wait_until_ready(sandbox: modal.Sandbox, timeout: int) -> None:
+    async def wait() -> None:
+        try:
+            async with asyncio.timeout(timeout):
+                await sandbox.wait_until_ready.aio(timeout=timeout)
+        except (TimeoutError, modal.exception.TimeoutError) as error:
+            raise RuntimeError(
+                f"Modal sandbox {sandbox.object_id} did not become ready "
+                f"within {timeout} seconds; check {sandbox.get_dashboard_url()}"
+            ) from error
+
+    asyncio.run(wait())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--region",
         metavar="REGION",
         help="Modal region in which to provision the Sandbox (default: automatic)",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=positive_int,
+        default=STARTUP_TIMEOUT,
+        metavar="SECONDS",
+        help=f"maximum time to wait for scheduling and readiness (default: {STARTUP_TIMEOUT})",
     )
     args = parser.parse_args()
 
@@ -144,7 +174,7 @@ def main() -> None:
     print(f"Modal sandbox {sandbox.object_id} starting", file=sys.stderr)
 
     try:
-        sandbox.wait_until_ready()
+        wait_until_ready(sandbox, args.startup_timeout)
         install_extensions(sandbox)
         edge_url = sandbox.tunnels()[PORT].url.rstrip("/")
         print(f"{edge_url}/#psk={quote(passphrase, safe='')}")
