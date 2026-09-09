@@ -800,6 +800,7 @@ async fn matching_result(
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn diagnostics_while_events_are_live(
     client: &mut tokio::io::DuplexStream,
     codec: &FrameCodec,
@@ -836,6 +837,7 @@ async fn diagnostics_while_events_are_live(
         .expect("SESSION_INFO carries server diagnostics")
 }
 
+#[cfg(target_os = "linux")]
 async fn assert_family_admitted(
     client: &mut tokio::io::DuplexStream,
     codec: &FrameCodec,
@@ -857,6 +859,7 @@ async fn assert_family_admitted(
     diagnostics.aggregate_receive_buffered
 }
 
+#[cfg(target_os = "linux")]
 async fn assert_owner_released(
     client: &mut tokio::io::DuplexStream,
     codec: &FrameCodec,

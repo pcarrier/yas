@@ -40642,6 +40642,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     async fn next_selection_result_collecting_state(
         client: &mut DuplexStream,
         codec: &FrameCodec,
@@ -40706,6 +40707,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     async fn next_selection_delta(
         client: &mut DuplexStream,
         codec: &FrameCodec,
@@ -52462,31 +52464,19 @@ mod tests {
                 cached_body = Some(replay.body);
             }
         }
-        let (backend_id, initial_child) = {
+        let backend_id = {
             let shared = state.session.lock().await;
             let backend_id = shared
                 .terminal_backend(created.terminal_handle)
                 .expect("created opaque Terminal handle resolves");
             assert_eq!(shared.ptys.get(&backend_id).unwrap().tag, "muster.resource");
             #[cfg(target_os = "linux")]
-            let child = (
+            assert_session_environment(
                 shared.ptys.get(&backend_id).unwrap().handle.child_pid,
-                shared
-                    .compositor
-                    .as_ref()
-                    .unwrap()
-                    .handle
-                    .socket_name
-                    .clone(),
+                &shared.compositor.as_ref().unwrap().handle.socket_name,
             );
-            #[cfg(not(target_os = "linux"))]
-            let child = ();
-            (backend_id, child)
+            backend_id
         };
-        #[cfg(not(target_os = "linux"))]
-        let _ = initial_child;
-        #[cfg(target_os = "linux")]
-        assert_session_environment(initial_child.0, &initial_child.1);
         assert_ne!(created.terminal_handle, u64::from(backend_id) + 1);
 
         write_request(
