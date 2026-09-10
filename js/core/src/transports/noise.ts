@@ -3,6 +3,7 @@ import type {
   YasTransport,
   YasTransportEventMap,
   YasTransportMessage,
+  YasTransportOptions,
 } from "../types";
 import { YAS_EVENT_HEADER_BYTES } from "../yas/generated";
 import {
@@ -68,6 +69,12 @@ export abstract class UplinkEvents implements YasTransport {
   abstract close(): void;
 }
 
+class TruncatedStream extends Error {
+  constructor() {
+    super("uplink stream truncated");
+  }
+}
+
 class ByteQueue {
   private chunks: Bytes[] = [];
   private offset = 0;
@@ -87,12 +94,11 @@ class ByteQueue {
   }
   async read(size: number): Promise<Bytes> {
     while (this.length < size) {
-      if (this.ended) throw new Error("uplink stream truncated");
+      if (this.ended) throw new TruncatedStream();
       await new Promise<void>((resolve) => {
         this.wake = resolve;
       });
     }
-    if (this.ended) throw new Error("uplink stream ended");
     const bytes = new Uint8Array(size);
     let written = 0;
     while (written < size) {
@@ -109,12 +115,15 @@ class ByteQueue {
     }
     return bytes;
   }
-  close(): void {
+  end(): void {
     this.ended = true;
-    this.chunks = [];
-    this.length = this.offset = 0;
     this.wake?.();
     this.wake = null;
+  }
+  close(): void {
+    this.chunks = [];
+    this.length = this.offset = 0;
+    this.end();
   }
 }
 export function frameNoise(bytes: Bytes): Bytes {
@@ -123,8 +132,7 @@ export function frameNoise(bytes: Bytes): Bytes {
   return concat(prefix, bytes);
 }
 
-export interface YasNoiseTransportOptions {
-  connectTimeoutMs?: number;
+export interface YasNoiseTransportOptions extends YasTransportOptions {
   /** The carrier's datagrams must include the relay's 16-byte routing token. */
   datagrams?: boolean;
 }
@@ -145,8 +153,14 @@ export class YasNoiseTransport extends UplinkEvents {
   private datagramSends = 0;
   private datagramReads = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private retry: ReturnType<typeof setTimeout> | null = null;
+  private finishTimer: ReturnType<typeof setTimeout> | null = null;
+  private delay: number;
   private disposed = false;
+  private suspended = false;
   private closing = false;
+  private carrierEnded = false;
+  private stoppingCarrier = false;
 
   constructor(
     private readonly carrier: YasTransport,
@@ -155,6 +169,7 @@ export class YasNoiseTransport extends UplinkEvents {
     private readonly options: YasNoiseTransportOptions = {},
   ) {
     super();
+    this.delay = options.reconnectDelay ?? 500;
     this.seed = decodeKey(identity);
     this.server = publicKey(server);
     carrier.addEventListener("message", this.onMessage);
@@ -169,6 +184,9 @@ export class YasNoiseTransport extends UplinkEvents {
   }
   connect(): void {
     if (!this.disposed && !this.closing) {
+      this.suspended = false;
+      this.clearRetry();
+      if (this.queue) return;
       this.carrier.connect();
       if (this.carrier.status === "connected" && !this.queue)
         this.onStatus("connected");
@@ -177,7 +195,9 @@ export class YasNoiseTransport extends UplinkEvents {
   reconnect(): void {
     if (this.disposed) return;
     this.reset();
-    this.closing = false;
+    this.suspended = false;
+    this.clearRetry();
+    this.delay = this.options.reconnectDelay ?? 500;
     this.authRejected = false;
     this.lastError = null;
     if (this.carrier.reconnect) this.carrier.reconnect();
@@ -186,6 +206,8 @@ export class YasNoiseTransport extends UplinkEvents {
   }
   suspend(): void {
     if (this.disposed) return;
+    this.suspended = true;
+    this.clearRetry();
     this.reset();
     this.stopCarrier();
     this.setStatus("disconnected");
@@ -194,6 +216,7 @@ export class YasNoiseTransport extends UplinkEvents {
     if (
       this.status !== "connected" ||
       this.closing ||
+      this.carrierEnded ||
       this.disposed ||
       data.length === 0
     )
@@ -227,14 +250,20 @@ export class YasNoiseTransport extends UplinkEvents {
       !route ||
       data.length > this.maximum ||
       this.datagramSends >= DATAGRAM_IN_FLIGHT ||
-      this.closing
+      this.closing ||
+      this.carrierEnded
     )
       return;
     this.datagramSends++;
     void crypto
       .seal(data.slice())
       .then((packet) => {
-        if (packet && generation === this.generation && !this.closing)
+        if (
+          packet &&
+          generation === this.generation &&
+          !this.closing &&
+          !this.carrierEnded
+        )
           this.carrier.sendDatagram?.(concat(route, packet));
       })
       .catch(() => {})
@@ -246,17 +275,23 @@ export class YasNoiseTransport extends UplinkEvents {
     if (this.disposed) return;
     this.disposed = true;
     this.seed.fill(0);
+    this.clearRetry();
+    if (!this.closing) this.finish();
+    this.setStatus("closed");
+  }
+  /** Finish this session without disposing the reusable transport or identity. */
+  private finish(): void {
     this.closing = true;
     this.datagrams?.close();
     this.maximum = 0;
-    this.setStatus("closed");
     const cipher = this.sendCipher,
       generation = this.generation;
     const finish = async () => {
       try {
-        if (cipher && generation === this.generation) {
+        if (cipher && generation === this.generation && !this.carrierEnded) {
           const record = frameNoise(await cipher.encrypt(new Uint8Array([1])));
-          if (generation === this.generation) this.carrier.send(record);
+          if (generation === this.generation && !this.carrierEnded)
+            this.carrier.send(record);
         }
       } catch {
         /* An aborted carrier may not accept FIN. */
@@ -264,23 +299,57 @@ export class YasNoiseTransport extends UplinkEvents {
     };
     let cleaned = false;
     const cleanup = () => {
-      if (cleaned) return;
+      if (cleaned || generation !== this.generation) return;
       cleaned = true;
       this.reset();
-      this.carrier.close();
-      this.carrier.removeEventListener("message", this.onMessage);
-      this.carrier.removeEventListener("datagram", this.onDatagram);
-      this.carrier.removeEventListener("statuschange", this.onStatus);
+      if (this.disposed) {
+        this.carrier.close();
+        this.carrier.removeEventListener("message", this.onMessage);
+        this.carrier.removeEventListener("datagram", this.onDatagram);
+        this.carrier.removeEventListener("statuschange", this.onStatus);
+      } else {
+        this.stopCarrier();
+        this.lastError = null;
+        this.authRejected = false;
+        this.setStatus("disconnected");
+        this.scheduleRetry();
+      }
     };
-    const timeout = setTimeout(cleanup, 1000);
-    void this.writeQueue.then(finish).finally(() => {
-      clearTimeout(timeout);
-      cleanup();
-    });
+    this.finishTimer = setTimeout(cleanup, 1000);
+    void this.writeQueue.then(finish).finally(cleanup);
   }
   private stopCarrier(): void {
-    if (this.carrier.suspend) this.carrier.suspend();
-    else this.carrier.close();
+    this.stoppingCarrier = true;
+    try {
+      if (this.carrier.suspend) this.carrier.suspend();
+      else this.carrier.close();
+    } finally {
+      this.stoppingCarrier = false;
+    }
+  }
+  private clearRetry(): void {
+    if (this.retry !== null) clearTimeout(this.retry);
+    this.retry = null;
+  }
+  private scheduleRetry(): void {
+    if (
+      this.disposed ||
+      this.suspended ||
+      this.closing ||
+      this.queue ||
+      this.authRejected ||
+      this.retry !== null ||
+      this.options.reconnect === false
+    )
+      return;
+    this.retry = setTimeout(() => {
+      this.retry = null;
+      this.connect();
+    }, this.delay);
+    this.delay = Math.min(
+      this.options.maxReconnectDelay ?? 10000,
+      this.delay * (this.options.reconnectBackoff ?? 1.5),
+    );
   }
   private reset(): void {
     this.generation++;
@@ -293,8 +362,12 @@ export class YasNoiseTransport extends UplinkEvents {
     this.maximum = 0;
     this.queuedBytes = this.datagramReads = this.datagramSends = 0;
     this.writeQueue = Promise.resolve();
+    this.closing = false;
+    this.carrierEnded = false;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
+    if (this.finishTimer !== null) clearTimeout(this.finishTimer);
+    this.finishTimer = null;
   }
   private fail(
     message: string,
@@ -306,6 +379,7 @@ export class YasNoiseTransport extends UplinkEvents {
     this.reset();
     this.stopCarrier();
     this.setStatus("error");
+    this.scheduleRetry();
   }
   private onMessage = (bytes: YasTransportMessage): void => {
     try {
@@ -323,6 +397,7 @@ export class YasNoiseTransport extends UplinkEvents {
       !crypto ||
       !route ||
       this.closing ||
+      this.carrierEnded ||
       this.datagramReads >= DATAGRAM_IN_FLIGHT ||
       packet.length < 40 ||
       packet.length > this.maximum + 40 ||
@@ -333,7 +408,12 @@ export class YasNoiseTransport extends UplinkEvents {
     void crypto
       .open(packet.slice(16))
       .then((plaintext) => {
-        if (plaintext && generation === this.generation && !this.closing)
+        if (
+          plaintext &&
+          generation === this.generation &&
+          !this.closing &&
+          !this.carrierEnded
+        )
           this.emit("datagram", plaintext);
       })
       .finally(() => {
@@ -341,9 +421,14 @@ export class YasNoiseTransport extends UplinkEvents {
       });
   };
   private onStatus = (status: ConnectionStatus): void => {
-    if (this.disposed || this.closing) return;
+    if (this.disposed || this.suspended || this.stoppingCarrier) return;
+    if (this.closing) {
+      if (status !== "connected") this.carrierEnded = true;
+      return;
+    }
     if (status === "connected") {
       if (this.queue) return;
+      this.clearRetry();
       const queue = new ByteQueue();
       this.queue = queue;
       const generation = ++this.generation;
@@ -352,25 +437,38 @@ export class YasNoiseTransport extends UplinkEvents {
         if (generation === this.generation)
           this.fail("uplink authentication timed out", false);
       }, this.options.connectTimeoutMs ?? 10000);
-      void this.run(queue, generation).catch(() => {
+      void this.run(queue, generation).catch((error: unknown) => {
         if (generation === this.generation)
           this.fail(
-            this.status === "authenticating"
-              ? "uplink end-to-end authentication failed (requires WebCrypto X25519)"
-              : "uplink stream integrity failure",
-            this.status === "authenticating",
+            error instanceof TruncatedStream
+              ? error.message
+              : this.status === "authenticating"
+                ? "uplink end-to-end authentication failed (requires WebCrypto X25519)"
+                : "uplink stream integrity failure",
+            this.status === "authenticating" &&
+              !(error instanceof TruncatedStream),
           );
       });
     } else {
       if (this.queue) {
-        this.lastError = "uplink carrier disconnected";
-        this.reset();
+        // Stop carrier retries while authenticating all bytes already received.
+        // EOF only rejects a read once that queue has been exhausted.
+        this.carrierEnded = true;
+        this.queue.end();
+        this.stopCarrier();
+        return;
       }
       if (this.carrier.authRejected) {
         this.authRejected = true;
         this.lastError = "uplink routing token rejected";
       }
       this.setStatus(status === "authenticating" ? "connecting" : status);
+      if (
+        status === "disconnected" ||
+        status === "closed" ||
+        status === "error"
+      )
+        this.scheduleRetry();
     }
   };
   private async record(
@@ -388,13 +486,14 @@ export class YasNoiseTransport extends UplinkEvents {
     const cipher = this.sendCipher;
     if (!cipher) throw new Error("Noise handshake incomplete");
     for (let offset = 0; offset < bytes.length; offset += MAX_PLAINTEXT) {
+      if (generation !== this.generation || this.carrierEnded) return;
       const record = await cipher.encrypt(
         concat(
           new Uint8Array([0]),
           bytes.subarray(offset, offset + MAX_PLAINTEXT),
         ),
       );
-      if (generation !== this.generation) return;
+      if (generation !== this.generation || this.carrierEnded) return;
       this.carrier.send(frameNoise(record));
     }
   }
@@ -403,6 +502,7 @@ export class YasNoiseTransport extends UplinkEvents {
     const handshake = await NoiseInitiator.create(identity, this.server);
     const first = await handshake.first();
     if (generation !== this.generation) return;
+    if (this.carrierEnded) throw new TruncatedStream();
     this.carrier.send(frameNoise(first));
     const { send, receive, payload } = await handshake.finish(
       await this.record(queue, 48, 48),
@@ -453,6 +553,7 @@ export class YasNoiseTransport extends UplinkEvents {
     this.timer = null;
     this.authRejected = false;
     this.lastError = null;
+    this.delay = this.options.reconnectDelay ?? 500;
     this.setStatus("connected");
     while (generation === this.generation && !this.closing) {
       const plaintext = await receive.decrypt(
@@ -460,7 +561,7 @@ export class YasNoiseTransport extends UplinkEvents {
       );
       if (generation !== this.generation || this.closing) return;
       if (plaintext[0] === 1 && plaintext.length === 1) {
-        this.close();
+        this.finish();
         return;
       }
       if (plaintext[0] !== 0 || plaintext.length < 2)

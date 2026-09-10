@@ -339,6 +339,14 @@ or send it to the relay. Import/storage UI belongs to the embedding application.
 The existing YAS UI's home-server Relay routes continue to use the home server
 as the trusted client endpoint.
 
+The Noise wrapper owns reconnect backoff, including routing failures and stalled
+handshakes. It drains and authenticates received records before reporting carrier
+EOF or starting a new session. A remote FIN ends that session without disposing
+the transport or its identity; both automatic and explicit reconnection remain
+available. Set `reconnect: false` to disable automatic retries. `suspend()` cancels
+retries until resumed, while `close()` permanently disposes the transport and
+erases its retained identity. Explicit authentication rejection stops retries.
+
 For a custom carrier, use
 `new YasNoiseTransport(carrier, privateKey, serverPublicKey)`. Its carrier must
 expose an opaque reliable byte stream and signal `connected` only after relay
@@ -346,6 +354,9 @@ routing succeeds. Optional carrier datagrams contain the 16-byte routing token
 followed by encrypted packets. Advertise their complete physical maximum via
 `maxDatagramSize`. The wrapper advertises only authenticated plaintext capacity
 and requires the native composite selector on the producer.
+For reusable connections, the carrier should implement `suspend()` to stop the
+current connection without disposing it, and leave automatic retries to the
+wrapper.
 
 ## Migration from inner TLS
 

@@ -70,29 +70,24 @@ export class YasUplinkTransport extends YasNoiseTransport {
   }
 }
 
-/** Routing-only carrier. This class never sees the client's identity or pin. */
+/** Routing-only carrier. Noise owns retries, including routing failures, so a
+ * fresh carrier cannot overtake decryption of the previous session's tail. */
 class UplinkWebSocketCarrier extends UplinkEvents {
   private ws: WebSocket | null = null;
   private attempt: AbortController | null = null;
-  private retry: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
-  private suspended = false;
-  private delay: number;
   constructor(
     private readonly attach: string,
     private readonly token: string,
     private readonly options: YasTransportOptions,
   ) {
     super();
-    this.delay = options.reconnectDelay ?? 500;
   }
   get bufferedAmount(): number {
     return this.ws?.bufferedAmount ?? 0;
   }
   connect(): void {
     if (this.disposed || this.attempt || this.ws) return;
-    this.suspended = false;
-    this.clearRetry();
     const attempt = new AbortController();
     this.attempt = attempt;
     this.setStatus("connecting");
@@ -111,14 +106,11 @@ class UplinkWebSocketCarrier extends UplinkEvents {
     this.connect();
   }
   suspend(): void {
-    this.suspended = true;
-    this.clearRetry();
     this.cleanup();
     this.setStatus("disconnected");
   }
   close(): void {
     this.disposed = true;
-    this.clearRetry();
     this.cleanup();
     this.setStatus("closed");
   }
@@ -132,10 +124,6 @@ class UplinkWebSocketCarrier extends UplinkEvents {
       ws.close();
     }
   }
-  private clearRetry(): void {
-    if (this.retry !== null) clearTimeout(this.retry);
-    this.retry = null;
-  }
   private failed(attempt: AbortController, rejected = false): void {
     if (this.attempt !== attempt) return;
     this.lastError = rejected
@@ -144,21 +132,6 @@ class UplinkWebSocketCarrier extends UplinkEvents {
     this.authRejected = rejected;
     this.cleanup();
     this.setStatus(rejected ? "error" : "disconnected");
-    if (
-      this.disposed ||
-      this.suspended ||
-      rejected ||
-      this.options.reconnect === false
-    )
-      return;
-    this.retry = setTimeout(() => {
-      this.retry = null;
-      this.connect();
-    }, this.delay);
-    this.delay = Math.min(
-      this.options.maxReconnectDelay ?? 10000,
-      this.delay * (this.options.reconnectBackoff ?? 1.5),
-    );
   }
   private async open(attempt: AbortController): Promise<void> {
     const timeout = setTimeout(
@@ -255,7 +228,6 @@ class UplinkWebSocketCarrier extends UplinkEvents {
       ws.onerror = () => this.failed(attempt);
       this.authRejected = false;
       this.lastError = null;
-      this.delay = this.options.reconnectDelay ?? 500;
       this.setStatus("connected");
     } catch {
       this.failed(attempt, this.authRejected);

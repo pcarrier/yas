@@ -74,24 +74,31 @@ class StdioCarrier extends UplinkEvents {
   capture: Uint8Array[] = [];
   tamper = false;
   exit: Promise<number | null> = Promise.resolve(null);
-  constructor(private allowed: string) {
+  constructor(
+    private allowed: string,
+    private replyAndClose = false,
+  ) {
     super();
   }
   connect(): void {
     if (this.child) return;
-    const child = spawn(binary, [], {
-      env: {
-        ...process.env,
-        YAS_UPLINK_IDENTITY: PRIVATE,
-        YAS_UPLINK_TEST_CLIENT: this.allowed,
+    const child = spawn(
+      binary,
+      this.replyAndClose ? ["--reply-and-close"] : [],
+      {
+        env: {
+          ...process.env,
+          YAS_UPLINK_IDENTITY: PRIVATE,
+          YAS_UPLINK_TEST_CLIENT: this.allowed,
+        },
+        stdio: "pipe",
       },
-      stdio: "pipe",
-    });
+    );
     this.child = child;
     child.stdin.on("error", () => {});
     child.stderr.resume();
     this.exit = new Promise((resolve) =>
-      child.once("exit", (code) => {
+      child.once("close", (code) => {
         this.child = null;
         this.setStatus("disconnected");
         resolve(code);
@@ -126,9 +133,57 @@ class StdioCarrier extends UplinkEvents {
 const active: YasNoiseTransport[] = [];
 afterEach(() => {
   for (const transport of active.splice(0)) transport.close();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.stubGlobal("crypto", webcrypto);
 });
+
+function mockUplinkWorker(create: () => StdioCarrier | null) {
+  const fetch = vi.fn(
+    async () =>
+      new Response(JSON.stringify({ ws: "wss://worker.invalid/opaque" })),
+  );
+  const workers: StdioCarrier[] = [];
+  const sockets: MockWebSocket[] = [];
+  const tokens: unknown[] = [];
+  class MockWebSocket {
+    binaryType = "blob";
+    bufferedAmount = 0;
+    onopen: (() => void) | null = null;
+    onmessage: ((event: { data: unknown }) => void) | null = null;
+    onclose: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    readonly carrier = create();
+    constructor(address: string) {
+      expect(address).toBe("wss://worker.invalid/opaque");
+      sockets.push(this);
+      if (this.carrier) workers.push(this.carrier);
+      this.carrier?.addEventListener("message", (message) => {
+        const bytes =
+          message instanceof Uint8Array ? message : new Uint8Array(message);
+        this.onmessage?.({ data: bytes.slice().buffer });
+      });
+      this.carrier?.addEventListener("statuschange", (status) => {
+        if (status === "disconnected") this.onclose?.();
+      });
+      queueMicrotask(() => this.onopen?.());
+    }
+    send(data: unknown): void {
+      if (typeof data === "string") {
+        tokens.push(data);
+        this.carrier?.connect();
+        queueMicrotask(() => this.onmessage?.({ data: "ok" }));
+      } else this.carrier?.send(data as Uint8Array);
+    }
+    close(): void {
+      this.carrier?.close();
+    }
+  }
+  vi.stubGlobal("fetch", fetch);
+  vi.stubGlobal("WebSocket", MockWebSocket);
+  return { fetch, workers, sockets, tokens };
+}
 
 class SilentCarrier extends UplinkEvents {
   sent: Uint8Array[] = [];
@@ -180,51 +235,240 @@ it("times out stalled handshakes and cancels pending crypto on close", async () 
   expect(canceled.sent).toHaveLength(0);
 });
 
+it("backs off after Noise timeouts and cancels pending retries on suspend", async () => {
+  vi.useFakeTimers();
+  const { fetch } = mockUplinkWorker(() => null);
+  const transport = new YasUplinkTransport(url, PRIVATE, {
+    connectTimeoutMs: 20,
+    reconnectDelay: 10,
+    reconnectBackoff: 2,
+  });
+  active.push(transport);
+  transport.connect();
+  await vi.advanceTimersByTimeAsync(20);
+  expect(transport.status).toBe("error");
+  expect(transport.authRejected).toBe(false);
+  expect(transport.lastError).toMatch(/timed out/);
+  expect(fetch).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(10);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(39);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(fetch).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(20);
+  transport.suspend();
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(fetch).toHaveBeenCalledTimes(3);
+  expect(transport.status).toBe("disconnected");
+});
+
+it.each(["disabled", "closed", "rejected"] as const)(
+  "does not retry when %s",
+  async (mode) => {
+    vi.useFakeTimers();
+    const { fetch } = mockUplinkWorker(() => null);
+    if (mode === "rejected")
+      fetch.mockImplementation(
+        async () => new Response("denied", { status: 403 }),
+      );
+    const transport = new YasUplinkTransport(url, PRIVATE, {
+      connectTimeoutMs: 20,
+      reconnectDelay: 10,
+      reconnect: mode !== "disabled",
+    });
+    active.push(transport);
+    transport.connect();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(transport.status).toBe("error");
+    if (mode === "closed") transport.close();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(transport.authRejected).toBe(mode === "rejected");
+  },
+);
+
 describe.skipIf(!existsSync(binary))("browser WebCrypto to native Snow", () => {
+  it("discards old decryption completions after an explicit reconnect", async () => {
+    const client = await generateUplinkKeyPair();
+    const { workers } = mockUplinkWorker(
+      () => new StdioCarrier(client.publicKey),
+    );
+    const transport = new YasUplinkTransport(url, client.privateKey, {
+      reconnect: false,
+    });
+    active.push(transport);
+    const received: Uint8Array[] = [];
+    transport.addEventListener("message", (data) =>
+      received.push(new Uint8Array(data)),
+    );
+    transport.connect();
+    await vi.waitFor(() => expect(transport.status).toBe("connected"));
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const decrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
+      const result = await decrypt(...args);
+      entered.resolve();
+      await resume.promise;
+      return result;
+    });
+    try {
+      transport.send(new TextEncoder().encode("old session"));
+      await entered.promise;
+      transport.reconnect();
+      await vi.waitFor(() => expect(workers).toHaveLength(2));
+    } finally {
+      resume.resolve();
+    }
+    await vi.waitFor(() => expect(transport.status).toBe("connected"));
+    expect(received).toHaveLength(0);
+    const payload = new TextEncoder().encode("new session");
+    transport.send(payload);
+    await vi.waitFor(() =>
+      expect(Buffer.concat(received)).toEqual(Buffer.from(payload)),
+    );
+  });
+
+  it.each([false, true])(
+    "drains data and FIN before EOF or retry (reconnect=%s)",
+    async (reconnect) => {
+      const client = await generateUplinkKeyPair();
+      const { fetch, workers } = mockUplinkWorker(
+        () => new StdioCarrier(client.publicKey, true),
+      );
+      const transport = new YasUplinkTransport(url, client.privateKey, {
+        reconnect,
+        reconnectDelay: 1,
+      });
+      active.push(transport);
+      const received: Uint8Array[] = [];
+      const states: string[] = [];
+      transport.addEventListener("message", (data) =>
+        received.push(new Uint8Array(data)),
+      );
+      transport.addEventListener("statuschange", (status) =>
+        states.push(status),
+      );
+      transport.connect();
+      await vi.waitFor(() => expect(transport.status).toBe("connected"));
+
+      // Hold a real decryption completion until the native producer has sent FIN
+      // and closed the carrier. No timing assumption about WebCrypto's speed.
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const decrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+      vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
+        const result = await decrypt(...args);
+        entered.resolve();
+        await resume.promise;
+        return result;
+      });
+      const payload = new TextEncoder().encode("final command result");
+      try {
+        transport.send(payload);
+        await entered.promise;
+        expect(await workers[0]!.exit).toBe(0);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(received).toHaveLength(0);
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(transport.status).toBe("connected");
+      } finally {
+        resume.resolve();
+      }
+      await vi.waitFor(() =>
+        expect(Buffer.concat(received)).toEqual(Buffer.from(payload)),
+      );
+      expect(states).toContain("disconnected");
+      expect(states).not.toContain("error");
+      expect(transport.lastError).toBeNull();
+      if (reconnect) {
+        await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+        await vi.waitFor(() => expect(transport.status).toBe("connected"));
+        expect(workers[0]!.capture[0]).not.toEqual(workers[1]!.capture[0]);
+      } else expect(transport.status).toBe("disconnected");
+    },
+  );
+
+  it("can reconnect manually after a clean remote FIN", async () => {
+    const client = await generateUplinkKeyPair();
+    const { workers } = mockUplinkWorker(
+      () => new StdioCarrier(client.publicKey, true),
+    );
+    const transport = new YasUplinkTransport(url, client.privateKey, {
+      reconnect: false,
+    });
+    active.push(transport);
+    const received: Uint8Array[] = [];
+    transport.addEventListener("message", (data) =>
+      received.push(new Uint8Array(data)),
+    );
+    transport.connect();
+    const payload = new TextEncoder().encode("reply then FIN");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await vi.waitFor(() => expect(transport.status).toBe("connected"));
+      transport.send(payload);
+      await vi.waitFor(() =>
+        expect(
+          transport.status,
+          transport.lastError ?? "no transport error",
+        ).toBe("disconnected"),
+      );
+      expect(await workers[attempt]!.exit).toBe(0);
+      expect(transport.lastError).toBeNull();
+      if (attempt === 0) transport.reconnect();
+    }
+    expect(Buffer.concat(received)).toEqual(Buffer.concat([payload, payload]));
+    expect(workers[0]!.capture[0]).not.toEqual(workers[1]!.capture[0]);
+  });
+
+  it("rejects EOF in a partial record without claiming authentication rejection", async () => {
+    const client = await generateUplinkKeyPair();
+    const { sockets, workers } = mockUplinkWorker(
+      () => new StdioCarrier(client.publicKey),
+    );
+    const transport = new YasUplinkTransport(url, client.privateKey, {
+      reconnect: false,
+    });
+    active.push(transport);
+    const received = vi.fn();
+    transport.addEventListener("message", received);
+    transport.connect();
+    await vi.waitFor(() => expect(transport.status).toBe("connected"));
+    sockets[0]!.onmessage?.({ data: new Uint8Array([0, 18, 0]).buffer });
+    sockets[0]!.onclose?.();
+    await vi.waitFor(() => expect(transport.status).toBe("error"));
+    expect(transport.lastError).toMatch(/truncated/);
+    expect(transport.authRejected).toBe(false);
+    expect(received).not.toHaveBeenCalled();
+    await workers[0]!.exit;
+  });
+
+  it("recovers automatically when only the first Noise handshake stalls", async () => {
+    const client = await generateUplinkKeyPair();
+    let attempt = 0;
+    const { fetch } = mockUplinkWorker(() =>
+      attempt++ === 0 ? null : new StdioCarrier(client.publicKey),
+    );
+    const transport = new YasUplinkTransport(url, client.privateKey, {
+      connectTimeoutMs: 200,
+      reconnectDelay: 1,
+    });
+    active.push(transport);
+    transport.connect();
+    await vi.waitFor(() => expect(transport.status).toBe("connected"), {
+      timeout: 2000,
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(transport.authRejected).toBe(false);
+    expect(transport.lastError).toBeNull();
+  });
+
   it("routes a browser WebSocket attachment to native Noise and reconnects with fresh sessions", async () => {
     const client = await generateUplinkKeyPair();
-    const fetch = vi
-      .fn()
-      .mockImplementation(
-        async () =>
-          new Response(JSON.stringify({ ws: "wss://worker.invalid/opaque" })),
-      );
-    const workers: StdioCarrier[] = [];
-    const tokens: unknown[] = [];
-    class MockWebSocket {
-      binaryType = "blob";
-      bufferedAmount = 0;
-      onopen: (() => void) | null = null;
-      onmessage: ((event: { data: unknown }) => void) | null = null;
-      onclose: (() => void) | null = null;
-      onerror: (() => void) | null = null;
-      readonly carrier = new StdioCarrier(client.publicKey);
-      constructor(address: string) {
-        expect(address).toBe("wss://worker.invalid/opaque");
-        workers.push(this.carrier);
-        this.carrier.addEventListener("message", (message) => {
-          const bytes =
-            message instanceof Uint8Array ? message : new Uint8Array(message);
-          this.onmessage?.({ data: bytes.slice().buffer });
-        });
-        this.carrier.addEventListener("statuschange", (status) => {
-          if (status === "disconnected") this.onclose?.();
-        });
-        queueMicrotask(() => this.onopen?.());
-      }
-      send(data: unknown): void {
-        if (typeof data === "string") {
-          tokens.push(data);
-          this.carrier.connect();
-          queueMicrotask(() => this.onmessage?.({ data: "ok" }));
-        } else this.carrier.send(data as Uint8Array);
-      }
-      close(): void {
-        this.carrier.close();
-      }
-    }
-    vi.stubGlobal("fetch", fetch);
-    vi.stubGlobal("WebSocket", MockWebSocket);
+    const { fetch, workers, tokens } = mockUplinkWorker(
+      () => new StdioCarrier(client.publicKey),
+    );
     const transport = new YasUplinkTransport(url, client.privateKey, {
       reconnect: false,
     });

@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Output};
 
 const PRIVATE: &str = "3iAcr2-GUIpQfQsOaabe-eD6uK8O53exaB9pKnVfotI";
 const PUBLIC: &str = "XRb2vVZJepyosoYqoXX24-lMYpkj9SekAq8ViT7RC1Q";
@@ -16,10 +16,19 @@ fn cli() -> Command {
     command
 }
 
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "YAS exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn keygen_prints_matching_compact_keys_without_a_file_argument() {
     let output = cli().arg("uplink-keygen").output().unwrap();
-    assert!(output.status.success());
+    assert_success(&output);
     let keys: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let private = keys["private_key"].as_str().unwrap();
     let public = keys["public_key"].as_str().unwrap();
@@ -43,7 +52,7 @@ fn environment_identity_is_accepted_and_hidden_from_help_and_errors() {
             .args([command, "--help"])
             .output()
             .unwrap();
-        assert!(help.status.success());
+        assert_success(&help);
         for output in [&help.stdout, &help.stderr] {
             let text = String::from_utf8_lossy(output);
             assert!(!text.contains(PRIVATE));
@@ -61,7 +70,11 @@ fn environment_identity_is_accepted_and_hidden_from_help_and_errors() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("YAS_UPLINK_TOKEN is not set"));
+    assert!(
+        stderr.contains("YAS_UPLINK_TOKEN is not set"),
+        "{}: {stderr}",
+        output.status
+    );
     assert!(!stderr.contains(PRIVATE));
     assert!(!String::from_utf8_lossy(&output.stdout).contains(PRIVATE));
 }
@@ -69,7 +82,7 @@ fn environment_identity_is_accepted_and_hidden_from_help_and_errors() {
 #[test]
 fn private_output_can_be_loaded_directly_to_derive_its_public_key() {
     let generated = cli().args(["uplink-keygen", "--private"]).output().unwrap();
-    assert!(generated.status.success());
+    assert_success(&generated);
     assert!(generated.stderr.is_empty());
     let output = String::from_utf8(generated.stdout).unwrap();
     let private = output.trim_end_matches('\n');
@@ -81,7 +94,7 @@ fn private_output_can_be_loaded_directly_to_derive_its_public_key() {
         .arg("uplink-public-key")
         .output()
         .unwrap();
-    assert!(derived.status.success());
+    assert_success(&derived);
     assert!(derived.stderr.is_empty());
     let expected = yas_uplink::Identity::from_base64(private)
         .unwrap()
@@ -99,7 +112,7 @@ fn public_key_requires_an_existing_valid_environment_identity() {
         .arg("uplink-public-key")
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert_success(&output);
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         format!("{PUBLIC}\n")
@@ -115,7 +128,11 @@ fn public_key_requires_an_existing_valid_environment_identity() {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("YAS_UPLINK_IDENTITY"));
+        assert!(
+            error.contains("YAS_UPLINK_IDENTITY"),
+            "{}: {error}",
+            output.status
+        );
         assert!(!error.contains("invalid-private-key-secret"));
     }
 }
@@ -137,7 +154,7 @@ fn url_encodes_the_client_token_and_derives_the_server_pin_locally() {
             command.args(["--client-token", TOKEN]);
         }
         let output = command.output().unwrap();
-        assert!(output.status.success());
+        assert_success(&output);
         assert!(output.stderr.is_empty());
         let output = String::from_utf8(output.stdout).unwrap();
         assert_eq!(output.lines().count(), 1);
@@ -184,7 +201,7 @@ fn url_rejects_invalid_inputs_without_printing_credentials() {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("control URL"));
+        assert!(error.contains("control URL"), "{}: {error}", output.status);
         assert!(!error.contains(secret));
         assert!(!error.contains(PRIVATE));
     }
@@ -217,6 +234,10 @@ fn url_rejects_invalid_inputs_without_printing_credentials() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("YAS_UPLINK_IDENTITY"));
+    assert!(
+        error.contains("YAS_UPLINK_IDENTITY"),
+        "{}: {error}",
+        output.status
+    );
     assert!(!error.contains(secret));
 }
