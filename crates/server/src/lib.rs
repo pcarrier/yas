@@ -662,8 +662,44 @@ enum PtyInput {
     /// the reader's loop re-scans them, so this event must not try to
     /// process them itself.
     SyncBoundary { before: Vec<u8> },
-    /// The PTY fd hit EOF or an error — the child likely exited.
+    /// The reader reached EOF, an I/O error, or its requested drain cutoff.
+    /// Every preceding byte has already been sent on this channel.
     Eof,
+}
+
+/// Exit requests are handled by the reader, which sends EOF only after its
+/// current chunk and the output pending in the OS have crossed the byte channel.
+struct PtyReaderHandle {
+    finish: Arc<AtomicBool>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl PtyReaderHandle {
+    fn spawn(id: u16, read: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> Self {
+        let finish = Arc::new(AtomicBool::new(false));
+        let request = finish.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("pty-reader-{id}"))
+            .spawn(move || read(request))
+            .expect("failed to spawn pty-reader thread");
+        Self {
+            finish,
+            _thread: thread,
+        }
+    }
+
+    fn request_finish(&self) {
+        self.finish.store(true, Ordering::Release);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            // Wake a reader blocked in ReadFile. The supervisor retries until
+            // EOF, covering a request racing the start of that blocking call.
+            unsafe {
+                windows_sys::Win32::System::IO::CancelSynchronousIo(self._thread.as_raw_handle());
+            }
+        }
+    }
 }
 
 /// Shared, level-triggered cancellation for one logical connection.
@@ -970,7 +1006,7 @@ struct Pty {
     ready_frames: VecDeque<FrameState>,
     /// Receives raw byte chunks from the PTY reader task without mutex contention.
     byte_rx: mpsc::Receiver<PtyInput>,
-    reader_handle: std::thread::JoinHandle<()>,
+    reader_handle: PtyReaderHandle,
     /// Cached (echo, icanon) from tcgetattr; refreshed every ~250ms.
     lflag_cache: (bool, bool),
     lflag_last: Instant,
@@ -991,7 +1027,7 @@ struct Pty {
     /// Set once the deadline has fired and SIGTERM has gone out; when it
     /// passes, the group gets SIGKILL.
     stop_deadline: Option<Instant>,
-    /// Fallback deadline armed when the direct child exits. Reader EOF finalizes sooner.
+    /// When to request a finite reader drain after the direct child exits.
     exit_drain_deadline: Option<Instant>,
     /// Attributed cause, moved onto the Terminal Exited event by `cleanup_pty_internal`.
     exit_reason: u8,
@@ -7944,7 +7980,11 @@ fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
             pty.deadline
                 .into_iter()
                 .chain(pty.stop_deadline)
-                .chain(pty.exit_drain_deadline)
+                .chain(
+                    pty.exit_drain_deadline.filter(|_| {
+                        cfg!(windows) || !pty.reader_handle.finish.load(Ordering::Acquire)
+                    }),
+                )
                 .min()
         })
         .min()
@@ -8068,44 +8108,33 @@ async fn enforce_deadlines(state: &AppState) {
 
 /// One supervisor pass: arm a bounded fallback when the direct child exits.
 ///
-/// Ordered reader EOF normally finalizes first. A descendant can keep the slave open, so the
-/// deadline forces one unpaced drain before cleanup instead of waiting forever.
+/// Ordered reader EOF is the only completion barrier. If a descendant keeps
+/// the slave open, request a finite reader-side drain after the grace period.
 async fn supervise(state: &AppState) {
     let pass_started = Instant::now();
     yas_event!(state.events, EventType::Supervisor, vec![1]);
     let now = Instant::now();
-    let fallback_due = {
+    {
         let mut sess = state.session.lock().await;
         for pty in sess.ptys.values_mut().filter(|pty| !pty.exited) {
             if pty.exit_drain_deadline.is_none() && pty::poll_child_exited(&pty.handle) {
                 pty.exit_drain_deadline = Some(now + PTY_EXIT_DRAIN_GRACE);
+                // Delivery credit must not prevent the model from reaching EOF.
+                pty.ready_frames.clear();
+                pty.mark_dirty();
+                state.delivery_notify.notify_one();
+            }
+            if pty
+                .exit_drain_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                pty.reader_handle.request_finish();
+                #[cfg(windows)]
+                {
+                    pty.exit_drain_deadline = Some(now + PTY_EXIT_DRAIN_GRACE);
+                }
             }
         }
-        sess.ptys.values().any(|pty| {
-            !pty.exited
-                && pty
-                    .exit_drain_deadline
-                    .is_some_and(|deadline| now >= deadline)
-        })
-    };
-    if fallback_due {
-        tick(state).await;
-    }
-    let ready: Vec<(u16, u64)> = {
-        let sess = state.session.lock().await;
-        sess.ptys
-            .iter()
-            .filter(|(_, pty)| {
-                !pty.exited
-                    && pty
-                        .exit_drain_deadline
-                        .is_some_and(|deadline| now >= deadline)
-            })
-            .map(|(&id, pty)| (id, pty.generation))
-            .collect()
-    };
-    for (id, generation) in ready {
-        cleanup_pty_internal(id, Some(generation), state).await;
     }
     // After the exit scan, never before it: `reap_zombies` waits a child
     // without marking its terminal exited, so between that wait and the next
@@ -8276,6 +8305,8 @@ async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppS
             return;
         }
         state.pty_fds.write().unwrap().remove(&pty_id);
+        // Any queued presentation predates the fully drained model.
+        pty.ready_frames.clear();
         pty.exited = true;
         pty.exited_at = Some(Instant::now());
         pty.deadline = None;
@@ -12123,7 +12154,8 @@ async fn tick(state: &AppState) -> TickOutcome {
     // 1. When at least one client is subscribed to a PTY and its
     //    `ready_frames` queue is full, stop draining that PTY.
     //    Sync-bracketed frames are never silently dropped; the producer
-    //    is slowed instead.
+    //    is slowed instead. Once the child exits, coalesce presentations
+    //    and keep parsing until ordered EOF, regardless of client credit.
     // 2. The per-PTY and per-session parse budgets, for output that never
     //    emits a sync boundary (so brake 1 never engages — `ready_frames`
     //    only fills on SyncBoundary) and for PTYs with no subscriber at all.
@@ -12157,7 +12189,10 @@ async fn tick(state: &AppState) -> TickOutcome {
         let has_subscriber = ptys_with_subscribers.contains(&id);
         let mut budget = PTY_PARSE_BUDGET_PER_TICK;
         loop {
-            if has_subscriber && pty.ready_frames.len() >= READY_FRAME_QUEUE_CAP {
+            if has_subscriber
+                && pty.exit_drain_deadline.is_none()
+                && pty.ready_frames.len() >= READY_FRAME_QUEUE_CAP
+            {
                 break;
             }
             if budget == 0 || session_budget == 0 {
@@ -12211,7 +12246,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         });
                         pty.mark_output_dirty(now, output_coalesce_cap);
                     }
-                    if !pty.driver.synced_output() {
+                    if pty.exit_drain_deadline.is_none() && !pty.driver.synced_output() {
                         yas_event!(
                             state.events,
                             EventType::PtySnapshot,
@@ -13248,6 +13283,132 @@ mod tests {
             surface_touch_ids: HashMap::new(),
         };
         (client, rx)
+    }
+
+    #[cfg(unix)]
+    async fn assert_sync_output_drained(keep_slave_open: bool) {
+        let service = process::Server::new(false, true);
+        let state = process_transport::test_state(service.clone());
+        let suffix = if keep_slave_open { "sleep 30 &" } else { "" };
+        let command = format!(
+            "i=0; while [ $i -lt 20 ]; do printf '\\033[?2026hframe-%02d\\r\\n\\033[?2026l' $i; i=$((i+1)); done; printf 'FINAL-MARKER\\r\\n'; read answer; {suffix} exit 0"
+        );
+        let terminal = pty::spawn_pty(
+            "/bin/sh",
+            "",
+            32,
+            80,
+            1,
+            "",
+            pty::ChildSpec {
+                command: Some(&command),
+                ..Default::default()
+            },
+            None,
+            100,
+            state.clone(),
+            None,
+        )
+        .unwrap();
+        {
+            let mut sess = state.session.lock().await;
+            sess.ptys.insert(1, terminal);
+            let mut client = test_client();
+            // A subscribed viewer with no delivery credit: the first four
+            // synchronized frames fill the presentation queue indefinitely.
+            client.subscriptions.insert(1);
+            sess.clients.insert(1, client);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tick(&state).await;
+                if state.session.lock().await.ptys[&1].ready_frames.len() == READY_FRAME_QUEUE_CAP {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("synchronized presentation queue filled");
+        {
+            let sess = state.session.lock().await;
+            let terminal = &sess.ptys[&1];
+            let text = terminal.driver.seq_text(0, 0, None, 10000).text;
+            assert!(text.contains("frame-03"));
+            assert!(!text.contains("frame-04"));
+            pty::pty_write_all(terminal.handle.master_fd, b"go\n");
+        }
+        // Let the child exit without allowing delivery to free a frame slot.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                supervise(&state).await;
+                if state.session.lock().await.ptys[&1]
+                    .exit_drain_deadline
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("direct child exited");
+        tokio::time::sleep(PTY_EXIT_DRAIN_GRACE + Duration::from_millis(10)).await;
+        supervise(&state).await;
+        {
+            let sess = state.session.lock().await;
+            let terminal = &sess.ptys[&1];
+            if terminal.exited {
+                assert!(
+                    terminal
+                        .driver
+                        .seq_text(0, 0, None, 10000)
+                        .text
+                        .contains("FINAL-MARKER"),
+                    "exit was published before the output was drained"
+                );
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tick(&state).await;
+                if state.session.lock().await.ptys[&1].exited {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("PTY drained despite blocked presentation");
+        let sess = state.session.lock().await;
+        let terminal = &sess.ptys[&1];
+        assert_eq!(terminal.exit_status, 0);
+        let text = terminal.driver.seq_text(0, 0, None, 10000).text;
+        for i in 0..20 {
+            assert!(
+                text.contains(&format!("frame-{i:02}")),
+                "missing frame {i}: {text}"
+            );
+        }
+        assert!(text.contains("FINAL-MARKER"), "{text}");
+        assert!(
+            terminal.ready_frames.is_empty(),
+            "stale frames must not become FINAL_STATE"
+        );
+        drop(sess);
+        service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_output_exit_drains_past_full_frame_queue() {
+        assert_sync_output_drained(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_output_exit_drains_with_descendant_holding_slave() {
+        assert_sync_output_drained(true).await;
     }
 
     fn test_client() -> ClientState {

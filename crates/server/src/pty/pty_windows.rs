@@ -1,7 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_OPERATION_ABORTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
@@ -11,7 +14,7 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
     GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
@@ -256,26 +259,61 @@ pub fn respond_to_queries(
 pub(crate) struct SendHandle(pub(crate) HANDLE);
 unsafe impl Send for SendHandle {}
 
-pub(crate) fn pty_reader(handle: SendHandle, tx: mpsc::Sender<PtyInput>, notify: Arc<Notify>) {
+pub(crate) fn pty_reader(
+    handle: SendHandle,
+    tx: mpsc::Sender<PtyInput>,
+    notify: Arc<Notify>,
+    finish: Arc<AtomicBool>,
+) {
     let handle = handle.0;
     let mut buf = vec![0u8; 64 * 1024];
     let mut sync_scan_tail = Vec::new();
+    let mut drain_remaining = None;
 
     loop {
+        if drain_remaining.is_none() && finish.load(Ordering::Acquire) {
+            // Snapshot a finite remainder after forwarding the current chunk.
+            let mut available = 0;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            drain_remaining = Some(if ok == 0 { 0 } else { available });
+        }
+        if drain_remaining == Some(0) {
+            let _ = tx.blocking_send(PtyInput::Eof);
+            notify.notify_one();
+            return;
+        }
+        let limit = drain_remaining
+            .unwrap_or(buf.len() as u32)
+            .min(buf.len() as u32);
         let mut bytes_read: u32 = 0;
         let ok = unsafe {
             ReadFile(
                 handle,
                 buf.as_mut_ptr(),
-                buf.len() as u32,
+                limit,
                 &mut bytes_read,
                 std::ptr::null_mut(),
             )
         };
+        if ok == 0 && unsafe { GetLastError() } == ERROR_OPERATION_ABORTED {
+            continue;
+        }
         if ok == 0 || bytes_read == 0 {
             let _ = tx.blocking_send(PtyInput::Eof);
             notify.notify_one();
             return;
+        }
+        if let Some(remaining) = &mut drain_remaining {
+            *remaining -= bytes_read;
         }
         let data = buf[..bytes_read as usize].to_vec();
         let mut remaining = data;
@@ -625,10 +663,9 @@ pub fn spawn_pty(
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_output = SendHandle(handle.output);
     let notify = state.delivery_notify.clone();
-    let reader_handle = std::thread::Builder::new()
-        .name(format!("pty-reader-{id}"))
-        .spawn(move || pty_reader(reader_output, byte_tx, notify))
-        .expect("failed to spawn pty-reader thread");
+    let reader_handle = crate::PtyReaderHandle::spawn(id, move |finish| {
+        pty_reader(reader_output, byte_tx, notify, finish)
+    });
     let lflag_cache = pty_lflag(&handle);
 
     Some(crate::Pty {
@@ -674,11 +711,7 @@ pub fn respawn_child(
     spec: ChildSpec<'_>,
     state: AppState,
     _session_env: Option<&crate::app_env::SessionEnv>,
-) -> Option<(
-    PtyHandle,
-    std::thread::JoinHandle<()>,
-    mpsc::Receiver<PtyInput>,
-)> {
+) -> Option<(PtyHandle, crate::PtyReaderHandle, mpsc::Receiver<PtyInput>)> {
     let command = spec.command;
     let dir = spec.dir;
     let (input_read, input_write) = create_pipe_pair()?;
@@ -807,9 +840,8 @@ pub fn respawn_child(
     let (byte_tx, byte_rx) = mpsc::channel(PTY_CHANNEL_CAPACITY);
     let reader_output = SendHandle(handle.output);
     let notify = state.delivery_notify.clone();
-    let reader_handle = std::thread::Builder::new()
-        .name(format!("pty-reader-{pty_id}"))
-        .spawn(move || pty_reader(reader_output, byte_tx, notify))
-        .expect("failed to spawn pty-reader thread");
+    let reader_handle = crate::PtyReaderHandle::spawn(pty_id, move |finish| {
+        pty_reader(reader_output, byte_tx, notify, finish)
+    });
     Some((handle, reader_handle, byte_rx))
 }

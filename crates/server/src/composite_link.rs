@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -21,7 +21,7 @@ pub(crate) struct DatagramLink {
     outbound: yas_composite_transport::DatagramSender,
     activation: watch::Sender<Option<Arc<super::yas::CreditBudget>>>,
     _outbound_counters: Arc<yas_composite_transport::QueueCounters>,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     inbound_budget_drops: Arc<AtomicU64>,
 }
 
@@ -45,9 +45,9 @@ impl DatagramLink {
             watch::channel::<Option<Arc<super::yas::CreditBudget>>>(None);
         let (outbound, mut outbound_rx, outbound_counters) =
             yas_composite_transport::bounded_datagrams(DATAGRAM_QUEUE, max_datagram);
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         let inbound_budget_drops = Arc::new(AtomicU64::new(0));
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         let reader_budget_drops = Arc::clone(&inbound_budget_drops);
 
         let reader_cancel = cancellation.clone();
@@ -81,7 +81,7 @@ impl DatagramLink {
                     _ = reader_cancel.cancelled() => break,
                 };
                 let Some(credit) = budget.try_lease_exact(frame.len() as u64) else {
-                    #[cfg(test)]
+                    #[cfg(all(test, target_os = "linux"))]
                     reader_budget_drops.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
@@ -121,7 +121,7 @@ impl DatagramLink {
             outbound,
             activation,
             _outbound_counters: outbound_counters,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             inbound_budget_drops,
         }
     }
@@ -150,7 +150,7 @@ impl DatagramLink {
         self.outbound.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn inbound_budget_drop_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.inbound_budget_drops)
     }
