@@ -8,6 +8,7 @@ members = [
     "crates/git",
     "crates/lsp",
     "crates/composite-transport",
+    "crates/uplink",
     "crates/terminal-model",
     "crates/alacritty-driver",
     "crates/server",
@@ -47,6 +48,7 @@ yas-fssync = { version = "0.1.4", path = "crates/fssync" }
 yas-git = { version = "0.1.4", path = "crates/git" }
 yas-lsp = { version = "0.1.4", path = "crates/lsp" }
 yas-composite-transport = { version = "0.1.4", path = "crates/composite-transport" }
+yas-uplink = { version = "0.1.4", path = "crates/uplink" }
 yas-terminal-model = { version = "0.1.4", path = "crates/terminal-model" }
 yas-terminal-driver = { version = "0.1.4", path = "crates/alacritty-driver" }
 yas-fonts = { version = "0.1.4", path = "crates/fonts" }

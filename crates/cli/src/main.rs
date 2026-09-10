@@ -929,10 +929,48 @@ async fn async_main() {
                 });
             yas_server::run_hosted(config, hosted).await;
         }
-        Command::Uplink { url } => {
-            if let Err(e) = uplink::cmd_uplink(url).await {
+        Command::Uplink {
+            url,
+            identity,
+            allow_client,
+        } => {
+            if let Err(e) = uplink::cmd_uplink(url, identity, allow_client).await {
                 eprintln!("yas: {e}");
                 std::process::exit(1);
+            }
+        }
+        Command::UplinkKeygen { private } => match yas_uplink::Identity::generate() {
+            Ok((seed, public)) => {
+                if private {
+                    println!("{}", seed.as_str());
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "private_key": seed.as_str(), "public_key": public.to_string(),
+                        })
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("yas: {error}");
+                std::process::exit(1);
+            }
+        },
+        Command::UplinkPublicKey => match uplink::public_key_from_env() {
+            Ok(public) => println!("{public}"),
+            Err(error) => {
+                eprintln!("yas: {error}");
+                std::process::exit(1);
+            }
+        },
+        Command::UplinkUrl { url, client_token } => {
+            match uplink::connection_url(&url, &client_token) {
+                Ok(url) => println!("{url}"),
+                Err(error) => {
+                    eprintln!("yas: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         Command::Share { quiet, verbose } => {

@@ -236,7 +236,7 @@ fn normalize_yas_uri(uri: &str) -> Option<String> {
             yas_webserver::config::yas_socket_for_name(name)
         ));
     }
-    ["socket:", "tcp:", "ssh:", "ws://", "wss://"]
+    ["socket:", "tcp:", "ssh:", "ws://", "wss://", "uplink:"]
         .iter()
         .any(|scheme| uri.starts_with(scheme))
         .then(|| uri.to_owned())
@@ -464,6 +464,8 @@ fn transport_hint(uri: &str) -> TransportHint {
         TransportHint::Local
     } else if uri.starts_with("ssh:") {
         TransportHint::Ssh
+    } else if uri.starts_with("uplink:") {
+        TransportHint::Uplink
     } else if uri.starts_with("tcp:") || uri.starts_with("ws://") || uri.starts_with("wss://") {
         TransportHint::Tcp
     } else {
@@ -505,6 +507,29 @@ impl fmt::Display for RelayCatalogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uplink_routes_publish_without_exposing_credentials() {
+        let uri = format!(
+            "uplink:https://relay.example#token=routing-secret&server={}&identity=3iAcr2-GUIpQfQsOaabe-eD6uK8O53exaB9pKnVfotI",
+            "zd5N9JFta-3KOvvXwQshnMRKNHVIiUEJSuaKMO56Uxk"
+        );
+        let catalogue = RelayRouteCatalog::new();
+        reconcile_remotes(&catalogue, &format!("work = {uri}\n"));
+        let snapshot = catalogue.snapshot();
+        assert_eq!(snapshot.routes.len(), 1);
+        let route = &snapshot.routes[0];
+        assert_eq!(route.transport_hint, TransportHint::Uplink);
+        assert_eq!(
+            catalogue
+                .resolve(route.route_handle, route.generation)
+                .unwrap(),
+            uri
+        );
+        let public = format!("{route:?}");
+        assert!(!public.contains("routing-secret"));
+        assert!(!public.contains("3iAcr2-GUIpQfQsOaabe-eD6uK8O53exaB9pKnVfotI"));
+    }
 
     #[test]
     fn replacement_invalidates_the_observed_generation() {

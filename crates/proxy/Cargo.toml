@@ -24,6 +24,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "r
 serde_json = "1"
 yas-webrtc-forwarder = { workspace = true }
 yas-composite-transport = { workspace = true }
+yas-uplink = { workspace = true }
 yas-webserver = { workspace = true }
 yas-ssh = { workspace = true }
 yas-wire = { workspace = true }

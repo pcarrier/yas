@@ -148,6 +148,52 @@ anything non-ASCII.
 
 ## Remotes
 
+For a relay that must not have YAS control, create an Ed25519 identity once on
+each endpoint, then exchange the public keys through a trusted channel:
+
+```bash
+export YAS_UPLINK_IDENTITY="$(yas uplink-keygen --private)"
+yas uplink-public-key
+```
+
+Keep the private key in your secret configuration for later starts. With no
+flag, `yas uplink-keygen` prints both `private_key` and `public_key` as JSON.
+Run the producer with its own identity in the environment:
+
+```bash
+export YAS_UPLINK_TOKEN=CONTROL_TOKEN
+yas uplink https://relay.example --allow-client CLIENT_PUBLIC_KEY
+```
+
+`--allow-client` is repeatable; `YAS_UPLINK_CLIENT_KEYS` accepts comma-separated
+public keys. Generate a connection URL on the producer using a consumer token
+issued by the relay service:
+
+```bash
+export YAS_UPLINK_CLIENT_TOKEN=CLIENT_TOKEN
+yas uplink-url https://relay.example
+```
+
+`--client-token TOKEN` overrides `YAS_UPLINK_CLIENT_TOKEN`. The command derives
+the server public key locally and encodes the token; its URL never contains a
+private key. Transfer it through a trusted channel. On the consumer, with its
+own identity still in `YAS_UPLINK_IDENTITY`:
+
+```bash
+yas remote add sandbox 'UPLINK_URL_FROM_PRODUCER'
+yas --on sandbox terminal list
+```
+
+Both keys encode 32 raw bytes in unpadded base64url; the private key is the
+Ed25519 seed. Environment input keeps it out of process arguments. Explicit
+`--identity PRIVATE_KEY` (producer) and `identity=PRIVATE_KEY` in the URI
+(consumer) override the environment. The CLI passes its current environment
+key to an existing proxy through local IPC; a home server uses its own
+environment for Relay routes. Private keys never go to the relay.
+Inner TLS 1.3 uses mutual Ed25519 authentication and ephemeral X25519; legacy
+bearer-only URIs and plaintext uplinks are rejected. Apply key changes by
+restarting the uplink with the new identity/allowlist.
+
 ```bash
 yas --on ssh:dev-server terminal list     # SSH (auto-installs yas)
 yas --on share:mypassphrase terminal list # WebRTC shared terminal

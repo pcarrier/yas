@@ -85,6 +85,7 @@ restartable; PTYs survive their restart.
 | `yas-edge`             | `crates/edge/`             | lib           | Authenticated fixed-home YAS WebSocket/WebTransport edge and web application host                                |
 | `yas-ssh`              | `crates/ssh/`              | lib           | Embedded SSH client (russh): ssh-agent auth, `~/.ssh/config`, `direct-streamlocal` channels                      |
 | `yas-proxy`            | `crates/proxy/`            | lib           | Native connection pool for socket, TCP, SSH, WebSocket, WebTransport, and WebRTC upstreams                       |
+| `yas-uplink`           | `crates/uplink/`           | lib           | End-to-end TLS 1.3 with pinned Ed25519 identities, X25519 key agreement, and authenticated datagrams             |
 | `yas` (CLI)            | `crates/cli/`              | bin           | Browser client, agent subcommands, SSH/proxy/share transports, `remote` management, `server`/`share` subcommands |
 | `yas-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib           | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels                                    |
 | `yas-fonts`            | `crates/fonts/`            | lib           | Server font catalogue, metadata, TTC extraction, embedding policy, and content hashing                           |
@@ -94,6 +95,13 @@ restartable; PTYs survive their restart.
 | `yas-sd-notify`        | `crates/sd-notify/`        | lib           | Tiny pure-`libc` `sd_notify(3)` for daemon readiness; no `libsystemd` dependency                                 |
 
 Each Rust crate is a single `lib.rs` or `main.rs`. Larger crates (`yas-server`, `yas-compositor`, `yas-cli`, `yas-webrtc-forwarder`) use a small number of sibling files in the same directory.
+
+The uplink producer in `yas-cli` and consumer in `yas-proxy` share `yas-uplink`.
+The relay carries opaque inner TLS records. The producer authenticates a
+locally allowlisted client key before opening local IPC; the consumer pins
+the producer key independently of the control plane. Native datagrams use
+directional TLS exporter keys and a replay window. Browser routes use the
+home server's connector and its environment identity or explicit route key. See [uplink](docs/uplink.md).
 
 ### Dependency graph
 

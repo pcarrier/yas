@@ -407,7 +407,7 @@ pub enum Command {
     ///   yas remote add rabbit ssh:rabbit
     ///   yas remote add prod ssh:alice@prod.example.com
     ///   yas remote add lab share:mysecret
-    ///   yas remote add sandbox 'uplink:https://relay.example#<token>'
+    ///   yas remote add sandbox 'uplink:https://relay.example#token=TOKEN&server=PUBLIC_KEY' # uses YAS_UPLINK_IDENTITY
     ///   yas remote list
     ///   yas remote remove rabbit
     ///   yas --on rabbit terminal list
@@ -448,12 +448,48 @@ pub enum Command {
         verbose: bool,
     },
 
-    /// Expose the local yas server through a relay
+    /// Expose the local YAS server through an end-to-end encrypted relay
     ///
     /// Requires YAS_UPLINK_TOKEN for the control endpoint.
     Uplink {
         /// Control endpoint URL (e.g. https://relay.example)
         url: String,
+
+        /// Ed25519 private seed as unpadded base64url (43 characters)
+        #[arg(long, env = "YAS_UPLINK_IDENTITY", hide_env_values = true)]
+        identity: String,
+
+        /// Authorized client public key as unpadded base64url (43 characters; repeatable)
+        #[arg(
+            long,
+            env = "YAS_UPLINK_CLIENT_KEYS",
+            value_delimiter = ',',
+            required = true
+        )]
+        allow_client: Vec<String>,
+    },
+
+    /// Print an Ed25519 key pair as JSON (private_key and public_key, base64url)
+    UplinkKeygen {
+        /// Print only the private seed, for capture in YAS_UPLINK_IDENTITY
+        #[arg(long)]
+        private: bool,
+    },
+
+    /// Print the public key derived from YAS_UPLINK_IDENTITY
+    UplinkPublicKey,
+
+    /// Print a consumer URL using the producer's YAS_UPLINK_IDENTITY
+    ///
+    /// Run on the producer. Derives its public key locally; the URL contains
+    /// the consumer routing token and server public key, never a private key.
+    UplinkUrl {
+        /// Control endpoint URL (e.g. https://relay.example)
+        url: String,
+
+        /// Consumer routing token supplied by the relay service
+        #[arg(long, env = "YAS_UPLINK_CLIENT_TOKEN", hide_env_values = true)]
+        client_token: String,
     },
 
     /// Forward local ports to the server's network (TCP and UDP)

@@ -8038,6 +8038,7 @@ dependencies = [
  "mimalloc",
  "rand 0.10.1",
  "ratatui",
+ "rcgen",
  "regex",
  "reqwest",
  "ring",
@@ -8057,6 +8058,7 @@ dependencies = [
  "yas-proxy",
  "yas-server",
  "yas-ssh",
+ "yas-uplink",
  "yas-webrtc-forwarder",
  "yas-webserver",
  "yas-wire",
@@ -8196,6 +8198,7 @@ dependencies = [
  "web-transport-quinn",
  "yas-composite-transport",
  "yas-ssh",
+ "yas-uplink",
  "yas-webrtc-forwarder",
  "yas-webserver",
  "yas-wire",
@@ -8290,6 +8293,18 @@ name = "yas-terminal-model"
 version = "0.1.4"
 dependencies = [
  "unicode-width",
+]
+
+[[package]]
+name = "yas-uplink"
+version = "0.1.4"
+dependencies = [
+ "base64",
+ "ring",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "zeroize",
 ]
 
 [[package]]
