@@ -106,7 +106,7 @@ brew services start yas
 
 A service running `yas uplink https://relay.example` needs
 `YAS_UPLINK_TOKEN` for control-plane routing, `YAS_UPLINK_IDENTITY` containing
-its Ed25519 private seed as 43-character unpadded base64url, and `YAS_UPLINK_CLIENT_KEYS` containing
+its X25519 private key as 43-character unpadded base64url, and `YAS_UPLINK_CLIENT_KEYS` containing
 the comma-separated public keys allowed to reach its YAS socket. Create the
 identity once with `yas uplink-keygen --private`. Supply the private key through
 the service environment to keep it out of process arguments. With that key in

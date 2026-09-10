@@ -8,8 +8,7 @@ mutual authentication before it can reach the local server socket. This document
 specifies the protocol between the uplink and its control endpoint and
 relay. It leaves the relay side abstract: a WebTransport server that opens
 one bidirectional stream per consumer and
-forwards opaque bytes can act as a relay. The inner stream carries TLS records,
-not a plaintext YAS preface.
+forwards opaque bytes can act as a relay. The inner stream carries Noise records.
 
 ## Roles
 
@@ -22,8 +21,8 @@ not a plaintext YAS preface.
 
 ## End-to-end trust and setup
 
-The consumer pins the producer's Ed25519 public key. The producer loads its
-own Ed25519 private key and an explicit allowlist of client public keys.
+The consumer pins the producer's X25519 public key. The producer loads its
+own X25519 private key and an explicit allowlist of client public keys.
 Exchange public keys through a trusted channel, independently of the relay
 and control plane. Neither endpoint accepts keys from allocation responses.
 There is no trust-on-first-use, bearer-only admission, or plaintext fallback.
@@ -35,7 +34,7 @@ export YAS_UPLINK_IDENTITY="$(yas uplink-keygen --private)"
 yas uplink-public-key
 ```
 
-`uplink-keygen --private` prints only the private seed, suitable for shell
+`uplink-keygen --private` prints only the private key, suitable for shell
 capture. `uplink-public-key` derives the public key from `YAS_UPLINK_IDENTITY`.
 Keep the generated private key in your secret configuration and reload it on
 later starts; generating a replacement changes the public key others must trust.
@@ -43,7 +42,7 @@ One client identity can be authorized on multiple YAS servers.
 
 For scripts that need both values, `yas uplink-keygen` still prints JSON with
 `private_key` and `public_key`. Both are exactly 43 characters of canonical,
-unpadded base64url: the private value encodes a 32-byte Ed25519 seed, and the
+unpadded base64url: the private value encodes a 32-byte X25519 private key, and the
 public value encodes the 32-byte public key.
 There is no key file or external DER wrapper. Padding, standard-base64 `+`/`/`,
 noncanonical trailing bits, and wrong lengths are rejected.
@@ -86,29 +85,56 @@ impersonate an allowed client. A compromised control plane can redirect the
 outer transport, but the independent producer pin still rejects impersonation.
 The consumer software and its host must remain trusted.
 
-## Inner TLS protocol
+## Inner Noise protocol (version 2)
 
-Every consumer stream starts with TLS 1.3, using RFC 7250 raw public keys
-encoded as RFC 8410 Ed25519 SubjectPublicKeyInfo. Both sides require Ed25519
-CertificateVerify signatures. The only key exchange group is ephemeral
-X25519, and the cipher suite is TLS_CHACHA20_POLY1305_SHA256. No X.509 CA,
-DNS name, certificate expiry, or outer TLS certificate confers inner trust.
-ALPN is exactly `yas-uplink/1`; resumption, tickets, and early data are disabled.
-Rustls handles the TLS handshake, transcript signatures, key schedule, records,
-and key updates.
+Every consumer stream uses `Noise_IK_25519_AESGCM_SHA256` with the exact
+11-byte prologue `YAS-UPLINK\x02`. X25519 supplies static identity and fresh
+ephemeral key agreement; AES-256-GCM encrypts messages; SHA-256 and HKDF-SHA256
+bind the transcript and derive keys. There is no algorithm negotiation,
+resumption, or early application data. The consumer is the Noise initiator,
+with the producer's static public key pinned before connecting.
 
-After verifying the client's proof of possession, the producer sends the
-11 encrypted bytes `YAS-UPLINK\x01` and flushes. The consumer checks this
-confirmation before releasing the connection to YAS: TLS 1.3's handshake
-alone does not give the client a final acknowledgment of client authentication.
-The producer then accepts an encrypted YAS preface or composite-main selector.
-It opens no local socket before authentication and selector validation succeed.
+All handshake and transport messages have a two-byte **big-endian** ciphertext
+length prefix. The first IK message has 96 bytes and the response 48 bytes;
+both have empty handshake payloads. Snow implements native Noise. The browser
+uses WebCrypto and is checked against the same upstream Cacophony vectors and
+a live native endpoint. Outer HTTPS, WSS, and WebTransport retain their TLS;
+outer certificates and bearer tokens grant no inner authority.
 
-Authentication has a 10-second timeout and at most 64 pending streams per
-relay session. Authenticated selector parsing has a further 5-second timeout.
-Invalid keys, signatures, versions, ALPN, and legacy plaintext streams close
-without reaching local IPC. Clean TLS close-notify propagates as a half-close;
-a TLS integrity error terminates the bridge and its optional sideband.
+Transport plaintext is a one-byte record type followed by content:
+
+| Type | Content       | Meaning                      |
+| ---- | ------------- | ---------------------------- |
+| `0`  | 1–16384 bytes | Reliable stream data         |
+| `1`  | Empty         | Authenticated write-side FIN |
+
+Each ciphertext has a 16-byte authentication tag. Ciphertext lengths outside
+17–16401 bytes, unknown record types, and empty data records are rejected.
+Each direction uses Noise's independent key and implicit 64-bit counter.
+After every `2^20` transport messages (including confirmation and FIN), that
+direction performs the standard Noise `Rekey` operation. Counters do not reset;
+nonce exhaustion closes the stream. This bounds AES-GCM usage per key.
+
+After IK, the consumer sends `YAS-UPLINK\x02` inside a data record. The producer
+checks this fresh-session proof **before opening any local socket**: IK's
+first message can be replayed, but this confirmation depends on the producer's
+fresh ephemeral key. The producer then generates 64 random datagram root-key
+bytes and returns `YAS-UPLINK\x02` followed by those bytes in an encrypted data
+record. The consumer verifies it before releasing the connection to YAS.
+The first 32 root-key bytes are client-to-producer; the rest are the reverse.
+The public Noise handshake hash is never used as secret key material.
+
+The producer next validates the encrypted YAS preface or composite-main
+selector, then connects to local IPC. Authentication has a 10-second timeout
+and at most 64 pending streams per relay session. Selector parsing has a
+further 5-second timeout. Keys, transcript tampering, missing confirmation,
+wrong versions, and legacy plaintext/TLS streams fail closed.
+
+Authenticated FIN propagates as a half-close, allowing the reverse direction
+to finish. Carrier EOF without FIN is a truncation error. Integrity errors
+terminate both bridge directions and their optional datagrams. Buffers and
+browser asynchronous queues are bounded; saturation fails the reliable lane
+rather than silently dropping reliable bytes.
 
 ## Control endpoint
 
@@ -180,7 +206,7 @@ The client disables HTTP redirects. `/attach` waits for the uplink and returns:
 ```
 
 The client connects to this WSS worker using the existing bearer-token/`ok`
-exchange, then starts inner TLS over its binary byte stream. WebSocket messages
+exchange, then starts Noise over its binary byte stream. WebSocket messages
 are opaque chunks of at most 64 KiB; their boundaries have no inner meaning.
 The built-in consumer sends chunks of at most 16 KiB. Worker allocation
 and bearer authentication provide routing only. The pinned server and allowed
@@ -201,7 +227,7 @@ possession of one without an allowed private key does not grant YAS access.
 
 Both producers and consumers must upgrade and configure keys. Old
 `uplink:https://relay.example#CLIENT_TOKEN` URIs and unencrypted consumer
-streams are intentionally rejected. Relays must forward inner TLS unchanged.
+streams are intentionally rejected. Relays must forward Noise bytes unchanged.
 
 ## Relay session
 
@@ -211,39 +237,58 @@ are a **10s keepalive** and a **30s idle timeout**, so a dead relay is
 noticed within 30 seconds without any application-level pings.
 
 The uplink never opens streams. The relay opens **one bidirectional stream
-per consumer**. After inner TLS authentication, the uplink bridges decrypted
+per consumer**. After Noise authentication, the uplink bridges decrypted
 bytes to a fresh local YAS socket. Direct streams carry the normal YAS preface
-and length-prefixed frames, unparsed and unreframed inside TLS.
+and length-prefixed frames, unparsed and unreframed inside Noise.
 
 ### Encrypted native datagrams
 
-A WebTransport consumer can send a composite-main selector **inside inner
-TLS**. Its random 16-byte route token identifies the optional datagram lane.
-Selectors outside TLS are rejected. The consumer must implement this inner
-protocol; the built-in `uplink:` connector uses the reliable WebSocket lane.
+A consumer with an unreliable carrier sends a composite-main selector **inside
+Noise**. Its random nonzero 16-byte route token identifies the optional datagram
+lane. The native and direct browser `uplink:` connectors use the reliable WSS
+lane. Browser embedders can wrap an opaque carrier exposing routed datagrams
+with `YasNoiseTransport`; it sends the selector and encrypts datagrams itself.
 
-Both endpoints export 64 bytes from the established TLS connection with label
-`EXPORTER-YAS-UPLINK-v1-datagrams` and an empty context. Bytes 0–31 are the
-client-to-producer ChaCha20-Poly1305 key; bytes 32–63 are the reverse key.
-Keys are unique to the inner session and independent of relay TLS keys.
 Each routed packet is:
 
 ```text
-route token (16 bytes) | sequence (8 bytes, big-endian) | ciphertext | tag (16 bytes)
+route token (16 bytes) | counter (8 bytes, big-endian) | ciphertext | tag (16 bytes)
 ```
 
-The nonce is four zero bytes followed by the sequence. AAD is the token
-followed by the sequence. Each direction starts its counter at zero, increments
-it per packet, and refuses to wrap. Receivers authenticate before updating a
-128-packet replay window, permit reordering within that window, and discard
-forgeries, duplicates, and older packets. A token change, direction reflection,
-or packet from another session fails authentication.
+The independent datagram root keys are delivered in the authenticated Noise
+confirmation. For each direction, derive the AES-256-GCM key as:
 
-The advertised plaintext datagram maximum must leave room for the 16-byte
-routing token and 24-byte encryption overhead within the physical path MTU.
-Routes remain bounded and lossy. Invalid datagrams are dropped without closing
-the reliable stream; there is no unencrypted or reliable-lane fallback for
-failed ciphertext authentication.
+```text
+epoch = floor(counter / 2^20)
+key = HKDF-SHA256(root, salt=route_token,
+                 info="YAS-UPLINK-v2-datagram" || direction_u8 || epoch_u64_be,
+                 length=32)
+```
+
+Direction is 0 for client-to-producer and 1 for producer-to-client. The nonce
+is four zero bytes followed by the counter. AAD is the route token followed
+by the counter. Keys are separate from reliable Noise record keys. Each
+sender starts at zero, increments before encryption, and refuses to wrap.
+A reconnect establishes fresh roots. Loss cannot desynchronize rotation:
+the counter identifies the correct epoch without a key-update datagram.
+
+Receivers authenticate before updating a 128-packet replay window or cached
+epoch key. They permit reordering across epochs within that window and discard
+forgeries, duplicates, and older packets. Browser receivers recheck the window
+after asynchronous decryption so concurrent duplicates cannot both pass.
+The browser caps in-flight datagram crypto operations at 64 per direction.
+Route changes, direction reflection, and cross-session packets fail authentication.
+
+The advertised plaintext maximum subtracts the 16-byte routing token and
+24-byte encryption overhead from the physical datagram MTU. Routes remain
+bounded and lossy. Invalid packets are dropped without closing the reliable
+stream or falling back to plaintext or reliable delivery. Packet loss never
+prevents decrypting the next packet.
+
+Audio codecs still require media-level ordering, playback deadlines, and loss
+handling. The native browser Media output handler currently expects ordered
+frames; this transport does not change its delivery policy or automatically
+move audio onto unreliable datagrams.
 
 ### Closure
 
@@ -266,3 +311,48 @@ close its consumer connection when the corresponding stream closes.
 Relay URLs stay valid for as long as their embedded credential does; the
 uplink treats each pool response as single-use and re-queries rather than
 caching it.
+
+## Browser embedding
+
+Serve the browser client from an origin trusted independently of the relay.
+A relay that can replace client JavaScript can steal or use its keys. The
+control endpoint must allow that trusted origin through CORS, including the
+Authorization header; redirects are rejected. Browser WebCrypto must support
+X25519, AES-GCM, SHA-256, HMAC, and HKDF. No TLS or crypto WASM is needed.
+
+```ts
+import {
+  generateUplinkKeyPair,
+  YasUplinkTransport,
+} from "@yas-run/core/transports";
+
+const keys = await generateUplinkKeyPair(); // Generate once and retain securely.
+// Authorize keys.publicKey on the producer, then load its pinned connection URL.
+const transport = new YasUplinkTransport(connectionUrl, keys.privateKey);
+// Pass transport to YasConnection, or register listeners before connect().
+```
+
+`uplinkPublicKey(privateKey)` derives the public key. `YasWorkspace` also
+accepts `{ type: "uplink", url: connectionUrl, identity: keys.privateKey }`.
+The library retains the identity in memory and does not save it in localStorage
+or send it to the relay. Import/storage UI belongs to the embedding application.
+The existing YAS UI's home-server Relay routes continue to use the home server
+as the trusted client endpoint.
+
+For a custom carrier, use
+`new YasNoiseTransport(carrier, privateKey, serverPublicKey)`. Its carrier must
+expose an opaque reliable byte stream and signal `connected` only after relay
+routing succeeds. Optional carrier datagrams contain the 16-byte routing token
+followed by encrypted packets. Advertise their complete physical maximum via
+`maxDatagramSize`. The wrapper advertises only authenticated plaintext capacity
+and requires the native composite selector on the producer.
+
+## Migration from inner TLS
+
+This version intentionally changes the wire protocol and identity algorithm.
+Generate X25519 identities, update producer allowlists, and redistribute pinned
+connection URLs. Ed25519 public pins are not interchangeable with X25519 pins,
+even though both encodings have 43 characters. There is no silent protocol
+fallback. Flags, environment variable names, and URI fragment field names stay
+the same; private keys still work through `YAS_UPLINK_IDENTITY` without appearing
+in process arguments. Both endpoints must upgrade together.

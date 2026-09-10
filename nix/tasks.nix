@@ -1046,6 +1046,11 @@ in
         fs.writeFileSync(path, JSON.stringify(pkg));
       '
 
+      # Exercise browser WebCrypto against a real native Noise endpoint.
+      cargo build -p yas-uplink --example uplink-interop
+      uplink_target_dir="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+      export YAS_UPLINK_INTEROP_BIN="$uplink_target_dir/debug/examples/uplink-interop"
+
       echo "=== JS typecheck ==="
       (cd js && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm run typecheck)
       echo ""

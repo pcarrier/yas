@@ -822,7 +822,7 @@ async fn connect_uplink(rest: &str) -> Result<UpstreamConn, String> {
     {
         return Err("uplink: worker URL must be WSS without userinfo or a fragment".into());
     }
-    // The worker carries opaque TLS records, not standalone yas.v1 messages.
+    // The worker carries opaque Noise records, not standalone yas.v1 messages.
     // Suppress worker-controlled URLs and error text, which may contain tokens.
     let conn = connect_ws_mode(worker.as_str(), Some(&target.token), WsMode::Bytes)
         .await
@@ -1236,7 +1236,7 @@ impl AsyncRead for WsFrameReader {
     }
 }
 
-/// Opaque stream chunks for inner TLS. Never interpret ciphertext as YAS
+/// Opaque stream chunks for inner Noise. Never interpret ciphertext as YAS
 /// lengths or remove/add framing bytes. Bound each outgoing message.
 struct WsByteWriter {
     inner: WsSink,
@@ -1272,7 +1272,7 @@ impl AsyncWrite for WsByteWriter {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        // Inner TLS carries the half-close. Closing the WebSocket here would
+        // Inner Noise carries the half-close. Closing the WebSocket here would
         // prevent the other direction from delivering its final response.
         self.inner
             .poll_flush_unpin(cx)
@@ -2162,7 +2162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uplink_tls_survives_websocket_rechunking_and_half_close() {
+    async fn uplink_noise_survives_websocket_rechunking_and_half_close() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let (server_key, server_public) = yas_uplink::Identity::generate().unwrap();
             let (client_key, client_public) = yas_uplink::Identity::generate().unwrap();
@@ -2266,7 +2266,7 @@ mod tests {
             );
         })
         .await
-        .expect("uplink TLS over WebSocket stalled");
+        .expect("uplink Noise over WebSocket stalled");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::process::Command;
 
 const PRIVATE: &str = "3iAcr2-GUIpQfQsOaabe-eD6uK8O53exaB9pKnVfotI";
-const PUBLIC: &str = "zd5N9JFta-3KOvvXwQshnMRKNHVIiUEJSuaKMO56Uxk";
+const PUBLIC: &str = "XRb2vVZJepyosoYqoXX24-lMYpkj9SekAq8ViT7RC1Q";
 
 fn cli() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_yas"));

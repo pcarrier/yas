@@ -501,16 +501,16 @@ replacement.
 
 ### Upstream URI formats
 
-| Scheme    | Example                                                      | Auth                                              |
-| --------- | ------------------------------------------------------------ | ------------------------------------------------- |
-| `socket:` | `socket:/run/yas/server.sock`                                | none (trusted local)                              |
-| `tcp:`    | `tcp:host:3264`                                              | none                                              |
-| `ws://`   | `ws://host:3264/edge#secret`                                 | edge WS auth                                      |
-| `wss://`  | `wss://host:3264/edge#secret`                                | edge WS auth + TLS                                |
-| `wt://`   | `wt://host:4433/?certHash=<sha256-hex>#secret`               | WebTransport auth + TLS roots or pin              |
-| `share:`  | `share:passphrase?hub=wss://yas.run`                         | WebRTC signaling credential                       |
-| `ssh:`    | `ssh:user@host/name`                                         | SSH host key and user authentication              |
-| `uplink:` | `uplink:https://relay.example#token=TOKEN&server=PUBLIC_KEY` | End-to-end pinned Ed25519 keys and TLS 1.3/X25519 |
+| Scheme    | Example                                                      | Auth                                          |
+| --------- | ------------------------------------------------------------ | --------------------------------------------- |
+| `socket:` | `socket:/run/yas/server.sock`                                | none (trusted local)                          |
+| `tcp:`    | `tcp:host:3264`                                              | none                                          |
+| `ws://`   | `ws://host:3264/edge#secret`                                 | edge WS auth                                  |
+| `wss://`  | `wss://host:3264/edge#secret`                                | edge WS auth + TLS                            |
+| `wt://`   | `wt://host:4433/?certHash=<sha256-hex>#secret`               | WebTransport auth + TLS roots or pin          |
+| `share:`  | `share:passphrase?hub=wss://yas.run`                         | WebRTC signaling credential                   |
+| `ssh:`    | `ssh:user@host/name`                                         | SSH host key and user authentication          |
+| `uplink:` | `uplink:https://relay.example#token=TOKEN&server=PUBLIC_KEY` | End-to-end Noise IK, X25519 pins, and AES-GCM |
 
 Credentials remain in the process-private target key so a retained transport
 can reconnect without separate state. They are not included in routine proxy
@@ -522,9 +522,12 @@ pin, and optionally an explicit base64url private seed. The default private
 identity comes from `YAS_UPLINK_IDENTITY`; the CLI forwards it to an existing
 proxy over authenticated local IPC. Only the token is sent to the control plane
 and worker. The worker's byte stream
-carries inner TLS; no local YAS socket opens before mutual authentication.
+carries Noise records; no local YAS socket opens before mutual authentication
+and fresh-session confirmation.
 The built-in consumer uses the reliable lane. Composite consumers must also
-encrypt native datagrams using TLS exporter keys. See [uplink](uplink.md).
+encrypt native datagrams using keys exchanged inside Noise. Browsers can use
+`YasUplinkTransport` directly with WebCrypto; `YasNoiseTransport` wraps custom
+opaque carriers, including routed datagrams. See [uplink](uplink.md).
 
 ---
 

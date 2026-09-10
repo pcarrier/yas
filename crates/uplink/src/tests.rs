@@ -38,9 +38,9 @@ fn base64_keys_round_trip_and_reject_noncanonical_or_wrong_lengths() {
 
 #[test]
 fn raw_seed_derives_the_expected_public_key() {
-    // Disposable example pair also verifies raw-seed -> PKCS#8 -> rustls import.
+    // Disposable X25519 example; the old Ed25519 public pin must change.
     let private = "3iAcr2-GUIpQfQsOaabe-eD6uK8O53exaB9pKnVfotI";
-    let public = "zd5N9JFta-3KOvvXwQshnMRKNHVIiUEJSuaKMO56Uxk";
+    let public = "XRb2vVZJepyosoYqoXX24-lMYpkj9SekAq8ViT7RC1Q";
     let identity = Identity::from_base64(private).unwrap();
     assert_eq!(identity.public_key().to_string(), public);
     let old_pkcs8 = "MC4CAQAwBQYDK2VwBCIEIN4gHK9vhlCKUH0LDmmm3vng+rivDud3sWgfaSp1X6LS";
@@ -48,7 +48,7 @@ fn raw_seed_derives_the_expected_public_key() {
 }
 
 #[tokio::test]
-async fn mutual_authentication_and_exporter_agreement() {
+async fn mutual_authentication_and_datagram_key_agreement() {
     let server = identity();
     let client = identity();
     let (a, b) = tokio::io::duplex(64 * 1024);
@@ -57,37 +57,8 @@ async fn mutual_authentication_and_exporter_agreement() {
         accept(b, server.server_config(vec![client.public_key()]).unwrap()),
     );
     let (mut client, mut server) = (client.unwrap(), server.unwrap());
-    assert_eq!(
-        client.get_ref().1.protocol_version(),
-        Some(rustls::ProtocolVersion::TLSv1_3)
-    );
-    assert_eq!(
-        client
-            .get_ref()
-            .1
-            .negotiated_key_exchange_group()
-            .unwrap()
-            .name(),
-        rustls::NamedGroup::X25519
-    );
-    let c = client
-        .get_ref()
-        .1
-        .export_keying_material(
-            DatagramKeyMaterial::new([0; 64]),
-            DATAGRAM_EXPORTER_LABEL,
-            Some(&[]),
-        )
-        .unwrap();
-    let s = server
-        .get_ref()
-        .1
-        .export_keying_material(
-            DatagramKeyMaterial::new([0; 64]),
-            DATAGRAM_EXPORTER_LABEL,
-            Some(&[]),
-        )
-        .unwrap();
+    let c = client.datagram_key_material();
+    let s = server.datagram_key_material();
     assert_eq!(c, s);
     let (mut send, _) = datagram_pair(c, [5; 16], true);
     let (_, mut receive) = datagram_pair(s, [5; 16], false);
@@ -128,22 +99,6 @@ async fn unauthorized_client_wrong_server_and_forged_identity_fail() {
         assert!(c.is_err());
         assert!(s.is_err());
     }
-    // Knowing an allowed public key is insufficient: the handshake signature
-    // must be made by its private key, not by the relay's own signing key.
-    let forged = Identity {
-        key: Arc::new(rustls::sign::CertifiedKey::new(
-            vec![client.public_key().spki().into()],
-            attacker.key.key.clone(),
-        )),
-        public: client.public_key(),
-    };
-    let (a, b) = tokio::io::duplex(64 * 1024);
-    let (c, s) = tokio::join!(
-        connect(a, forged.client_config(server.public_key()).unwrap()),
-        accept(b, server_config)
-    );
-    assert!(c.is_err());
-    assert!(s.is_err());
 }
 
 #[tokio::test(start_paused = true)]
@@ -162,28 +117,24 @@ async fn plaintext_and_stalled_handshakes_fail_closed() {
 }
 
 #[tokio::test]
-async fn client_authentication_and_alpn_are_mandatory() {
+async fn protocol_version_and_context_are_authenticated() {
     let server = identity();
     let client = identity();
-    let server_config = server.server_config(vec![client.public_key()]).unwrap();
-    let mut anonymous = rustls::ClientConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])
+    let config = server.server_config(vec![client.public_key()]).unwrap();
+    let mut wrong_context = snow::Builder::new(NOISE_PROTOCOL.parse().unwrap())
+        .prologue(b"YAS-UPLINK\x01")
         .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedKeys(vec![server.public_key()])))
-        .with_no_client_auth();
-    anonymous.alpn_protocols = vec![ALPN.to_vec()];
-    let mut missing_alpn = client.client_config(server.public_key()).unwrap();
-    Arc::get_mut(&mut missing_alpn)
+        .local_private_key(client.private.as_ref())
         .unwrap()
-        .alpn_protocols
-        .clear();
-    for config in [Arc::new(anonymous), missing_alpn] {
-        let (a, b) = tokio::io::duplex(64 * 1024);
-        let (c, s) = tokio::join!(connect(a, config), accept(b, server_config.clone()));
-        assert!(c.is_err());
-        assert!(s.is_err());
-    }
+        .remote_public_key(&server.public_key().0)
+        .unwrap()
+        .build_initiator()
+        .unwrap();
+    let mut message = [0; 96];
+    let length = wrong_context.write_message(&[], &mut message).unwrap();
+    let (mut a, b) = tokio::io::duplex(4096);
+    write_handshake(&mut a, &message[..length]).await.unwrap();
+    assert!(accept(b, config).await.is_err());
 }
 
 async fn forward(
@@ -256,4 +207,116 @@ async fn hostile_relay_cannot_read_modify_or_replay_records() {
     a.write_all(&replay).await.unwrap();
     a.shutdown().await.unwrap();
     assert!(accept(b, server_config).await.is_err());
+}
+
+#[tokio::test]
+async fn unauthenticated_eof_is_an_error_and_poisons_both_directions() {
+    let server = identity();
+    let client = identity();
+    let (a, b) = tokio::io::duplex(4096);
+    let (c, s) = tokio::join!(
+        connect(a, client.client_config(server.public_key()).unwrap()),
+        accept(b, server.server_config(vec![client.public_key()]).unwrap())
+    );
+    let mut s = s.unwrap();
+    drop(c.unwrap());
+    assert_eq!(
+        s.read(&mut [0; 1]).await.unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert!(s.write_all(b"must fail").await.is_err());
+}
+
+pub(crate) fn hex(value: &str) -> Vec<u8> {
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn cacophony_interoperability_vector() {
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("../test-vectors/noise-ik.json")).unwrap();
+    let bytes = |key: &str| hex(vector[key].as_str().unwrap());
+    let (is, ie, rs, re, pin, prologue) = (
+        bytes("init_static"),
+        bytes("init_ephemeral"),
+        bytes("resp_static"),
+        bytes("resp_ephemeral"),
+        bytes("init_remote_static"),
+        bytes("init_prologue"),
+    );
+    let mut initiator = snow::Builder::new(NOISE_PROTOCOL.parse().unwrap())
+        .local_private_key(&is)
+        .unwrap()
+        .remote_public_key(&pin)
+        .unwrap()
+        .prologue(&prologue)
+        .unwrap()
+        .fixed_ephemeral_key_for_testing_only(&ie)
+        .build_initiator()
+        .unwrap();
+    let mut responder = snow::Builder::new(NOISE_PROTOCOL.parse().unwrap())
+        .local_private_key(&rs)
+        .unwrap()
+        .prologue(&prologue)
+        .unwrap()
+        .fixed_ephemeral_key_for_testing_only(&re)
+        .build_responder()
+        .unwrap();
+    let messages = vector["messages"].as_array().unwrap();
+    let mut out = [0; 256];
+    let mut plain = [0; 256];
+    for (index, message) in messages.iter().take(2).enumerate() {
+        let payload = hex(message["payload"].as_str().unwrap());
+        let expected = hex(message["ciphertext"].as_str().unwrap());
+        let (sender, receiver) = if index == 0 {
+            (&mut initiator, &mut responder)
+        } else {
+            (&mut responder, &mut initiator)
+        };
+        let len = sender.write_message(&payload, &mut out).unwrap();
+        assert_eq!(out[..len], expected);
+        let len = receiver.read_message(&out[..len], &mut plain).unwrap();
+        assert_eq!(plain[..len], payload);
+    }
+    assert_eq!(initiator.get_handshake_hash(), bytes("handshake_hash"));
+    let mut initiator = initiator.into_transport_mode().unwrap();
+    let mut responder = responder.into_transport_mode().unwrap();
+    for (index, message) in messages.iter().skip(2).enumerate() {
+        let payload = hex(message["payload"].as_str().unwrap());
+        let expected = hex(message["ciphertext"].as_str().unwrap());
+        let (sender, receiver) = if index % 2 == 0 {
+            (&mut initiator, &mut responder)
+        } else {
+            (&mut responder, &mut initiator)
+        };
+        let len = sender.write_message(&payload, &mut out).unwrap();
+        assert_eq!(out[..len], expected);
+        let len = receiver.read_message(&out[..len], &mut plain).unwrap();
+        assert_eq!(plain[..len], payload);
+    }
+}
+
+#[tokio::test]
+async fn low_order_and_noncanonical_public_keys_are_rejected() {
+    let mut one = [0; 32];
+    one[0] = 1;
+    let mut prime = [255; 32];
+    prime[0] = 237;
+    prime[31] = 127;
+    for bad in [[0; 32], one, prime, [255; 32]] {
+        assert!(URL_SAFE_NO_PAD.encode(bad).parse::<PublicKey>().is_err());
+        for length in [48, 96] {
+            let (mut writer, mut reader) = tokio::io::duplex(1024);
+            let mut message = vec![0; length];
+            message[..32].copy_from_slice(&bad);
+            write_handshake(&mut writer, &message).await.unwrap();
+            assert!(read_handshake(&mut reader, length).await.is_err());
+        }
+    }
 }

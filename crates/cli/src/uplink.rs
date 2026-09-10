@@ -3,7 +3,7 @@
 //! Authenticates to an HTTPS control endpoint with `YAS_UPLINK_TOKEN`,
 //! receives a pool of WebTransport relays,
 //! establishes a session with one, authenticates each consumer using pinned
-//! Ed25519 keys over inner TLS 1.3, then bridges decrypted streams to local YAS.
+//! X25519 keys over Noise IK, then bridges decrypted streams to local YAS.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -117,7 +117,7 @@ async fn run_loop(
     url: &str,
     token: &str,
     current: Arc<Mutex<Option<wt::Session>>>,
-    crypto: Arc<rustls::ServerConfig>,
+    crypto: Arc<yas_uplink::ServerConfig>,
 ) -> Result<(), String> {
     let http = reqwest::Client::builder()
         .https_only(true)
@@ -330,7 +330,7 @@ enum SessionEnd {
 async fn run_session(
     relay: &Relay,
     current: &Arc<Mutex<Option<wt::Session>>>,
-    crypto: Arc<rustls::ServerConfig>,
+    crypto: Arc<yas_uplink::ServerConfig>,
 ) -> SessionEnd {
     let client = match build_client(relay.cert_hash.as_deref()) {
         Ok(client) => client,
@@ -374,13 +374,13 @@ async fn run_session(
 
 /// Bridge one relay-initiated stream to one local yas server connection.
 /// Authentication precedes both ingress classification and local IPC. The
-/// relay sees only TLS records; plaintext selectors cannot bypass admission.
+/// relay sees only Noise records; plaintext selectors cannot bypass admission.
 async fn bridge(
     session: wt::Session,
     routes: DatagramRoutes,
     send: wt::SendStream,
     recv: wt::RecvStream,
-    crypto: Arc<rustls::ServerConfig>,
+    crypto: Arc<yas_uplink::ServerConfig>,
     permit: tokio::sync::OwnedSemaphorePermit,
     local_socket: String,
 ) {
@@ -391,14 +391,7 @@ async fn bridge(
     };
     // Bind each sideband's keys to its authenticated main stream. The random
     // route token remains authenticated as AEAD AAD on every datagram.
-    let material = match relay.get_ref().1.export_keying_material(
-        yas_uplink::DatagramKeyMaterial::new([0u8; 64]),
-        yas_uplink::DATAGRAM_EXPORTER_LABEL,
-        Some(&[]),
-    ) {
-        Ok(material) => material,
-        Err(_) => return,
-    };
+    let material = relay.datagram_key_material();
     let ingress = tokio::time::timeout(
         Duration::from_secs(5),
         yas_composite_transport::classify(relay),
@@ -775,7 +768,7 @@ mod tests {
                 let mut stream = tokio::io::join(recv, send);
                 if case == 0 {
                     // A relay can synthesize protocol bytes, but those bytes
-                    // must never open a local socket before inner TLS.
+                    // must never open a local socket before Noise authentication.
                     stream
                         .write_all(yas_wire::PREFACE.as_slice())
                         .await
@@ -840,15 +833,7 @@ mod tests {
 
                 let token = [0x35; 16];
                 let maximum = 512;
-                let material = stream
-                    .get_ref()
-                    .1
-                    .export_keying_material(
-                        yas_uplink::DatagramKeyMaterial::new([0; 64]),
-                        yas_uplink::DATAGRAM_EXPORTER_LABEL,
-                        Some(&[]),
-                    )
-                    .unwrap();
+                let material = stream.datagram_key_material();
                 let (mut sender, mut receiver) = yas_uplink::datagram_pair(material, token, true);
                 yas_composite_transport::write_offer(
                     &mut stream,

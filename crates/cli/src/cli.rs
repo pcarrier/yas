@@ -455,7 +455,7 @@ pub enum Command {
         /// Control endpoint URL (e.g. https://relay.example)
         url: String,
 
-        /// Ed25519 private seed as unpadded base64url (43 characters)
+        /// X25519 private key as unpadded base64url (43 characters)
         #[arg(long, env = "YAS_UPLINK_IDENTITY", hide_env_values = true)]
         identity: String,
 
@@ -469,9 +469,9 @@ pub enum Command {
         allow_client: Vec<String>,
     },
 
-    /// Print an Ed25519 key pair as JSON (private_key and public_key, base64url)
+    /// Print an X25519 key pair as JSON (private_key and public_key, base64url)
     UplinkKeygen {
-        /// Print only the private seed, for capture in YAS_UPLINK_IDENTITY
+        /// Print only the private key, for capture in YAS_UPLINK_IDENTITY
         #[arg(long)]
         private: bool,
     },

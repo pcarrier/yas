@@ -107,6 +107,11 @@ TypeScript (JS workspace — core, react, solid, UI, and web):
 cd js && pnpm install && pnpm test
 ```
 
+The full test runner also builds `yas-uplink`'s `uplink-interop` example and
+runs the browser WebCrypto tests against that native endpoint. For a focused
+run, build it with `cargo build -p yas-uplink --example uplink-interop`, then
+run the core tests. `YAS_UPLINK_INTEROP_BIN` overrides its executable path.
+
 Or individual packages:
 
 ```bash

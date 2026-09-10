@@ -148,7 +148,7 @@ anything non-ASCII.
 
 ## Remotes
 
-For a relay that must not have YAS control, create an Ed25519 identity once on
+For a relay that must not have YAS control, create an X25519 identity once on
 each endpoint, then exchange the public keys through a trusted channel:
 
 ```bash
@@ -185,12 +185,12 @@ yas --on sandbox terminal list
 ```
 
 Both keys encode 32 raw bytes in unpadded base64url; the private key is the
-Ed25519 seed. Environment input keeps it out of process arguments. Explicit
+X25519 private key. Environment input keeps it out of process arguments. Explicit
 `--identity PRIVATE_KEY` (producer) and `identity=PRIVATE_KEY` in the URI
 (consumer) override the environment. The CLI passes its current environment
 key to an existing proxy through local IPC; a home server uses its own
 environment for Relay routes. Private keys never go to the relay.
-Inner TLS 1.3 uses mutual Ed25519 authentication and ephemeral X25519; legacy
+Noise IK uses pinned X25519 identities, ephemeral X25519, and AES-256-GCM; legacy
 bearer-only URIs and plaintext uplinks are rejected. Apply key changes by
 restarting the uplink with the new identity/allowlist.
 
