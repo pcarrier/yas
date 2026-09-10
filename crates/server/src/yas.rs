@@ -52464,6 +52464,8 @@ mod tests {
                 cached_body = Some(replay.body);
             }
         }
+        #[cfg(target_os = "linux")]
+        let initial_child;
         let backend_id = {
             let shared = state.session.lock().await;
             let backend_id = shared
@@ -52471,10 +52473,19 @@ mod tests {
                 .expect("created opaque Terminal handle resolves");
             assert_eq!(shared.ptys.get(&backend_id).unwrap().tag, "muster.resource");
             #[cfg(target_os = "linux")]
-            assert_session_environment(
-                shared.ptys.get(&backend_id).unwrap().handle.child_pid,
-                &shared.compositor.as_ref().unwrap().handle.socket_name,
-            );
+            {
+                initial_child = (
+                    shared.ptys.get(&backend_id).unwrap().handle.child_pid,
+                    shared
+                        .compositor
+                        .as_ref()
+                        .unwrap()
+                        .handle
+                        .socket_name
+                        .clone(),
+                );
+                assert_session_environment(initial_child.0, &initial_child.1);
+            }
             backend_id
         };
         assert_ne!(created.terminal_handle, u64::from(backend_id) + 1);
