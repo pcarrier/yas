@@ -15527,6 +15527,7 @@ impl Session {
                             .write_all(&early_data)
                             .await
                             .map_err(|_| Status::Io)?;
+                        writer.flush().await.map_err(|_| Status::Io)?;
                     }
                     Ok::<_, Status>((reader, writer))
                 }) => {
@@ -30043,7 +30044,12 @@ fn spawn_relay_tasks(
                 Some(RelayInput::Data(bytes)) => {
                     let len = bytes.len() as u64;
                     let written = tokio::select! {
-                        result = writer.write_all(&bytes) => result.is_ok(),
+                        // Buffered TLS/WebSocket writers need a flush before the
+                        // peer can answer this batch (including its YAS HELLO).
+                        result = async {
+                            writer.write_all(&bytes).await?;
+                            writer.flush().await
+                        } => result.is_ok(),
                         _ = writer_connection.cancelled() => return,
                         _ = writer_transfer.cancelled() => return,
                     };
@@ -54150,7 +54156,8 @@ mod tests {
                     let (reader, writer) = tokio::io::split(stream);
                     Ok((
                         Box::new(reader) as RelayRead,
-                        Box::new(writer) as RelayWrite,
+                        // TLS/WSS uplinks buffer writes until flush.
+                        Box::new(tokio::io::BufWriter::new(writer)) as RelayWrite,
                     ))
                 }
             })
@@ -54240,7 +54247,10 @@ mod tests {
         assert!(active.aggregate_receive_buffered > 0);
         assert!(active.aggregate_receive_buffered <= active.aggregate_receive_limit);
         let mut received_early = vec![0; early_data.len()];
-        upstream_peer.read_exact(&mut received_early).await.unwrap();
+        timeout(TEST_TIMEOUT, upstream_peer.read_exact(&mut received_early))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(received_early, early_data);
 
         write_sensitive_transfer_event(
@@ -54255,7 +54265,10 @@ mod tests {
         )
         .await;
         let mut nested = vec![0; b"nested request".len()];
-        upstream_peer.read_exact(&mut nested).await.unwrap();
+        timeout(TEST_TIMEOUT, upstream_peer.read_exact(&mut nested))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&nested, b"nested request");
         let credit_frame = next_frame(&mut client, &codec).await;
         let credit = Credit::decode(&credit_frame.payload).unwrap();

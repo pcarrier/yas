@@ -119,11 +119,7 @@ async fn run_loop(
     current: Arc<Mutex<Option<wt::Session>>>,
     crypto: Arc<yas_uplink::ServerConfig>,
 ) -> Result<(), String> {
-    let http = reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?;
+    let http = yas_proxy::uplink_http_client()?;
     let mut backoff = INITIAL_BACKOFF;
 
     loop {

@@ -12,6 +12,7 @@
   webDist,
   rustToolchain,
   testDbusSessionConfig,
+  uplinkE2eFixture,
 }:
 let
   # Helper to set up WASM browser pkg for JS builds.
@@ -829,6 +830,7 @@ in
       mkdir -p target/debug
       ln -sf "${yas}/bin/yas" target/debug/yas
 
+      export YAS_UPLINK_E2E_FIXTURE="${uplinkE2eFixture}/bin/uplink-e2e-fixture"
       echo "=== Running Playwright ==="
       if [ -x e2e/node_modules/.bin/playwright ]; then
         (cd e2e && \

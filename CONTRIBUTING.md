@@ -125,6 +125,34 @@ E2E (Playwright, requires built binaries):
 ./bin/e2e
 ```
 
+Uplink E2E (included in `./bin/tests` on Unix):
+
+```bash
+direnv exec . cargo test -p yas-cli --test uplink_e2e
+```
+
+This starts an isolated YAS server, an HTTPS control endpoint, a WSS/WebTransport
+relay, and the producer and consumer CLIs. It checks remote execution, stdout,
+stderr, exit status, encrypted relay traffic, and rejection of unauthorized
+clients, incorrect server pins, and invalid routing tokens. It uses a temporary
+CA and does not require a deployed relay or modify system certificate trust.
+
+Browser uplink E2E:
+
+```bash
+./bin/e2e --config playwright.uplink.config.ts
+```
+
+The regular `./bin/e2e` suite includes this spec. It drives Chromium through
+Edge and a home server's Relay connection to an uplink remote, opens that
+remote's terminal, and verifies browser input executes there. The isolated
+fixture uses the same encrypted relay as the CLI E2E. This covers the supported
+browser-through-Edge flow, not a direct browser uplink transport.
+
+For local runs using an already built UI and CLI, build the fixture with
+`direnv exec . cargo build -p yas-cli --example uplink-e2e-fixture`, then run
+`direnv exec . e2e/node_modules/.bin/playwright test --config e2e/playwright.uplink.config.ts`.
+
 CI (`ci.yml`) runs `./bin/lint`, `./bin/tests`, `./bin/e2e`, and `./bin/coverage`. These delegate to `nix run .#<task>`, etc.
 
 ## Packaging

@@ -367,3 +367,22 @@ even though both encodings have 43 characters. There is no silent protocol
 fallback. Flags, environment variable names, and URI fragment field names stay
 the same; private keys still work through `YAS_UPLINK_IDENTITY` without appearing
 in process arguments. Both endpoints must upgrade together.
+
+## Testing and private certificate authorities
+
+`direnv exec . cargo test -p yas-cli --test uplink_e2e` exercises the complete
+CLI path through a local HTTPS control endpoint and WSS/WebTransport relay to
+an isolated YAS server. CI includes this test in the Rust workspace test suite.
+
+For private relay infrastructure, `SSL_CERT_FILE` and `SSL_CERT_DIR` select
+outer TLS trust roots consistently for HTTPS, WSS, and WebTransport (unless a
+WebTransport certificate pin is supplied). Explicit CA overrides replace system
+roots; they do not disable certificate or hostname verification. Inner Noise still
+requires the independently exchanged X25519 identities.
+
+`./bin/e2e --config playwright.uplink.config.ts` runs the browser path in
+Chromium: browser → Edge → home-server Relay → encrypted uplink → remote YAS
+server. It verifies a terminal command typed in the browser creates a file on
+the remote, and checks that the relay never observes the command in plaintext.
+The regular Playwright CI suite includes it. This UI test covers the Edge path;
+the direct `YasUplinkTransport` SDK uses its own browser connection.

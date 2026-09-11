@@ -456,13 +456,19 @@ pub enum Command {
         url: String,
 
         /// X25519 private key as unpadded base64url (43 characters)
-        #[arg(long, env = "YAS_UPLINK_IDENTITY", hide_env_values = true)]
+        #[arg(
+            long,
+            env = "YAS_UPLINK_IDENTITY",
+            hide_env_values = true,
+            allow_hyphen_values = true
+        )]
         identity: String,
 
         /// Authorized client public key as unpadded base64url (43 characters; repeatable)
         #[arg(
             long,
             env = "YAS_UPLINK_CLIENT_KEYS",
+            allow_hyphen_values = true,
             value_delimiter = ',',
             required = true
         )]

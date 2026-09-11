@@ -782,6 +782,31 @@ fn parse_uplink_uri(rest: &str) -> Result<UplinkTarget, String> {
     })
 }
 
+/// HTTPS control client with the same explicit CA override semantics as the
+/// WSS and WebTransport legs. Reqwest's platform verifier otherwise ignores
+/// SSL_CERT_FILE/SSL_CERT_DIR on macOS.
+pub fn uplink_http_client() -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none());
+    if std::env::var_os("SSL_CERT_FILE").is_some() || std::env::var_os("SSL_CERT_DIR").is_some() {
+        let roots = rustls_native_certs::load_native_certs();
+        if roots.certs.is_empty() {
+            return Err("uplink: explicit CA configuration contains no certificates".into());
+        }
+        let certs = roots
+            .certs
+            .iter()
+            .map(|cert| reqwest::Certificate::from_der(cert.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "uplink: invalid CA certificate")?;
+        builder = builder.tls_certs_only(certs);
+    }
+    builder
+        .build()
+        .map_err(|_| "uplink: HTTP client setup failed".into())
+}
+
 /// Resolve an `uplink:` remote: ask the control plane where the
 /// session's worker is (`GET /attach`, which blocks server-side until the
 /// uplink is connected), then attach over WebSocket with the token as the
@@ -789,11 +814,7 @@ fn parse_uplink_uri(rest: &str) -> Result<UplinkTarget, String> {
 async fn connect_uplink(rest: &str) -> Result<UpstreamConn, String> {
     let target = parse_uplink_uri(rest)?;
     let crypto = target.identity.client_config(target.server)?;
-    let resp = reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "uplink: HTTP client setup failed")?
+    let resp = uplink_http_client()?
         .get(target.control)
         .header("authorization", format!("Bearer {}", target.token))
         .header("accept", "application/json")

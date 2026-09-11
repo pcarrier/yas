@@ -241,3 +241,23 @@ fn url_rejects_invalid_inputs_without_printing_credentials() {
     );
     assert!(!error.contains(secret));
 }
+
+#[test]
+fn explicit_private_key_may_start_with_a_hyphen() {
+    let private = format!("-{}", "A".repeat(42));
+    let output = cli()
+        .args([
+            "uplink",
+            "https://relay.invalid",
+            "--identity",
+            &private,
+            "--allow-client",
+            PUBLIC,
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("YAS_UPLINK_TOKEN is not set"), "{error}");
+    assert!(!error.contains(&private));
+}
