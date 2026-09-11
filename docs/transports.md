@@ -306,6 +306,16 @@ Browser reliable writes are split at the negotiated SCTP message limit
 message. Message boundaries do not delimit YAS frames. Native reliable writes
 use 64 KiB chunks to fit within str0m's 128 KiB aggregate send buffer.
 
+The producer reserves up to 16 MiB per reliable channel for incoming messages
+waiting to reach the server, including the chunk currently being written.
+Each message reserves its byte length, with a 1 KiB minimum to bound queue
+overhead. Small ACK, pointer, and resize bursts therefore share the byte
+allowance instead of exhausting a 16-message queue. Empty messages consume
+no reservation. Messages larger than 1 MiB are rejected before copying.
+`YAS_WEBRTC_VERBOSE=1` reports the peer and channel, closure reason, incoming
+message size, and reserved budget, distinguishing exhaustion from a closed
+local writer.
+
 ### Optional datagram channel
 
 Peers that support native datagrams open a second DataChannel labeled
@@ -344,9 +354,20 @@ The forwarder gathers three candidate types:
 
 TURN allocations are refreshed every 4 minutes. TURN permissions are re-established on the same interval.
 
+TCP/TLS relay framing retains partial message headers and bodies across
+cancelled reads. Outbound sends, permission requests, and refresh timers may
+interrupt a read without discarding bytes already consumed from the stream.
+
 ### Lifecycle
 
 WebRTC peer connections are decoupled from the signaling WebSocket. An `established` flag per peer prevents tearing down active data channel sessions on WebSocket reconnect — only peers still in the signaling phase are aborted on reconnect.
+
+Producer presence can briefly survive a server restart. The browser offers to
+each advertised producer session, including sessions announced during SDP
+creation, and replays gathered ICE candidates to later arrivals. The first
+authenticated answer selects the producer; answers and candidates from other
+sessions are then ignored. A stale presence entry cannot hide the live server
+behind repeated connection timeouts.
 
 ### Entry points
 

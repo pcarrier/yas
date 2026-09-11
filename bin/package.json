@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "tensorlake": "0.5.132"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "test": "node --test tensorlake/*.test.*",
+    "typecheck": "tsc --noEmit"
+  }
+}

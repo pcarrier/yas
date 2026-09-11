@@ -2001,7 +2001,9 @@ export class YasMediaClient {
   readonly catalog: YasMediaCatalog;
   private readonly transfers;
   private portalListeners = new Set<(request: YasMediaPortalRequest) => void>();
-  private frameListeners = new Set<(frame: YasMediaFrame) => void>();
+  private frameListeners = new Set<
+    (frame: YasMediaFrame, datagram: boolean) => void
+  >();
   private ackListeners = new Set<(ack: YasMediaFrameAck) => void>();
   private statusListeners = new Set<(status: YasMediaStreamStatus) => void>();
   private terminalStreams = new Set<bigint>();
@@ -2026,13 +2028,13 @@ export class YasMediaClient {
       connection.onEvent(
         g.YAS_FAMILY_MEDIA,
         g.YAS_MEDIA_FRAME,
-        ({ payload }) => {
+        ({ payload, datagram }) => {
           const value = decodeMediaFrame(payload);
           // Optional datagrams are allowed to arrive after the authoritative
           // reliable final status. Resource handles are boot-monotonic, so a
           // terminal stream can never become active again in this connection.
           if (this.terminalStreams.has(value.streamHandle)) return;
-          for (const listener of this.frameListeners) listener(value);
+          for (const listener of this.frameListeners) listener(value, datagram);
         },
       ),
       connection.onEvent(
@@ -2070,7 +2072,9 @@ export class YasMediaClient {
     return () => this.portalListeners.delete(listener);
   }
 
-  onFrame(listener: (frame: YasMediaFrame) => void): () => void {
+  onFrame(
+    listener: (frame: YasMediaFrame, datagram: boolean) => void,
+  ): () => void {
     this.frameListeners.add(listener);
     return () => this.frameListeners.delete(listener);
   }

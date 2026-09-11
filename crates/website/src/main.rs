@@ -32,7 +32,7 @@ const MAX_PAYLOAD_BYTES: usize = 65_536;
 const REDIS_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_TTL_SECONDS: u64 = 600;
 const MESSAGE_TEMPLATE: &str =
-    "Terminals at https://yas.run/s#psk={secret}\nRead-only: https://yas.run/s#psk={ro_secret}";
+    "YAS at https://yas.run/s#psk={secret}\nRead-only: https://yas.run/s#psk={ro_secret}";
 
 static INSTALL_SH_ETAG: LazyLock<String> = LazyLock::new(|| content_etag(INSTALL_SH.as_bytes()));
 static INSTALL_PS1_ETAG: LazyLock<String> = LazyLock::new(|| content_etag(INSTALL_PS1.as_bytes()));

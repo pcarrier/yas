@@ -76,10 +76,6 @@ function effectiveCodecSupport(mask: number): number {
 /** Radius of a mirrored touch contact, in logical pixels — about a fingertip. */
 const REMOTE_CONTACT_RADIUS = 14;
 
-/** A hide published this long after host motion is an application idle hide.
- * Fullscreen video uses that pattern; pointer-lock applications hide promptly. */
-const CURSOR_IDLE_HIDE_MIN_MS = 1_000;
-
 const REMOTE_CURSOR_ARROW =
   "M 0.75 0.75 L 0.75 20 L 6 14.75 L 10.5 23 L 14 21 L 9.5 13 L 17 13 Z";
 const REMOTE_CURSOR_HAND =
@@ -1308,11 +1304,6 @@ export class YasSurfaceCanvas {
     kind: "named",
     name: "default",
   };
-  /** Host motion and a subsequent quiet hide distinguish fullscreen-video
-   * auto-hide from a deliberate pointer-lock/game cursor. */
-  private lastHostPointerMotionAt = Number.NEGATIVE_INFINITY;
-  private idleHiddenCursorWakePending = false;
-
   private surface: YasSurface | undefined;
   private disposed = false;
 
@@ -2517,10 +2508,6 @@ export class YasSurfaceCanvas {
           ? { kind: "hidden" }
           : { kind: "named", name: shape });
       this.remoteCursor = cursor;
-      this.idleHiddenCursorWakePending =
-        cursor.kind === "hidden" &&
-        performance.now() - this.lastHostPointerMotionAt >=
-          CURSOR_IDLE_HIDE_MIN_MS;
       this.canvas.style.cursor = shape;
       this.updateRemotePointerOverlay();
     });
@@ -2794,7 +2781,6 @@ export class YasSurfaceCanvas {
     this.unsubscribeAll();
     this.remoteInput = null;
     this.remoteCursor = { kind: "named", name: "default" };
-    this.idleHiddenCursorWakePending = false;
     this.updateRemotePointerOverlay();
     this._hasPresentedFirstFrame = false;
     if (!this.disposed) this.subscribe();
@@ -3185,7 +3171,6 @@ export class YasSurfaceCanvas {
     if (routedGrabMouseEvents.has(e)) return;
     if (type === SURFACE_POINTER_MOVE) {
       this.wakeHiddenHostCursor();
-      this.lastHostPointerMotionAt = performance.now();
     }
     // Read the selection first: focusing the canvas below collapses it, so
     // by the time the button is on the wire there is nothing left to send.
@@ -3308,22 +3293,20 @@ export class YasSurfaceCanvas {
    *
    * This deliberately changes only the host canvas CSS. The remote cursor
    * state remains hidden, so co-viewer overlays and Wayland focus are
-   * untouched. A fresh hide remains authoritative unless it followed a quiet
-   * interval: fullscreen video auto-hides that way and expects the next motion
-   * to reveal the cursor, while pointer-lock applications hide promptly. HMR,
-   * reconnects, and viewer handoffs retire ownership, so their first motion can
-   * also recover in every application.
+   * untouched. While this canvas owns pointer focus, every application cursor
+   * update remains authoritative, including video idle hides. HMR, reconnects,
+   * and viewer handoffs retire ownership, so their first motion can recover a
+   * cached cursor while waiting for a fresh application update.
    */
   private wakeHiddenHostCursor(): void {
     const canvas = this.canvas;
     if (
       !canvas ||
       this.remoteCursor.kind !== "hidden" ||
-      (this.pointerFocusClaim !== null && !this.idleHiddenCursorWakePending)
+      this.pointerFocusClaim !== null
     )
       return;
     canvas.style.cursor = "default";
-    this.idleHiddenCursorWakePending = false;
   }
 
   /** Another viewer took the shared Wayland pointer.  Retire only this

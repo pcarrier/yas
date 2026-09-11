@@ -76,7 +76,7 @@ pub fn default_local_ip() -> Option<std::net::IpAddr> {
     default_local_ips().into_iter().next()
 }
 const DEFAULT_MESSAGE_TEMPLATE: &str =
-    "Terminals at https://yas.run/s#psk={secret}\nRead-only: https://yas.run/s#psk={ro_secret}";
+    "YAS at https://yas.run/s#psk={secret}\nRead-only: https://yas.run/s#psk={ro_secret}";
 
 pub fn normalize_hub(raw: &str) -> String {
     let trimmed = raw.trim_end_matches('/');

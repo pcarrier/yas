@@ -1649,21 +1649,24 @@ describe("YasSurfaceCanvas scroll", () => {
     surface.dispose();
   });
 
-  it("restores an idle-hidden fullscreen-video cursor on the next motion", () => {
+  it("keeps an idle-hidden video cursor hidden until the application restores it", () => {
     const { surface, canvas, setCursor } = attachScrolling({
       appId: "brave-browser",
     });
     canvas.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
 
-    // Fullscreen video hides only after the host pointer has been still. The
-    // guest sometimes misses the corresponding reveal, so motion must wake the
-    // host cursor even though this canvas still owns Wayland pointer focus.
+    // A quiet interval does not transfer cursor ownership to the viewer.
+    // Motion must not flash a default arrow while the app still requests none.
     vi.advanceTimersByTime(5_000);
     setCursor("none", { kind: "hidden" });
     expect(canvas.style.cursor).toBe("none");
 
-    canvas.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
-
+    for (let i = 0; i < 5; i++) {
+      canvas.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
+      expect(canvas.style.cursor).toBe("none");
+      vi.advanceTimersByTime(100);
+    }
+    setCursor("default", { kind: "named", name: "default" });
     expect(canvas.style.cursor).toBe("default");
     surface.dispose();
   });

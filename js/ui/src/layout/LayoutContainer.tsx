@@ -97,7 +97,7 @@ import {
 import type { Theme } from "../theme";
 import { mergeStyle, themeFor, ui, uiScale, z } from "../theme";
 import { t, tp } from "../i18n";
-import { prefixChordLabel } from "../keyPrefix";
+import { armPrefix, prefixChordLabel } from "../keyPrefix";
 import { registerPrefixAction } from "../keyPrefix";
 import type { SurfaceTouchMode, SurfaceZoomMode } from "../storage";
 import {
@@ -3940,8 +3940,7 @@ export function EmptyPane(props: {
       <Show when={props.showHint !== false}>
         <TapButton
           type="button"
-          aria-label={t("workspace.newTerminal")}
-          onClick={() => props.onCreateInPane?.(props.paneId)}
+          onClick={armPrefix}
           style={{
             border: "none",
             padding: 0,

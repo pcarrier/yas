@@ -13408,6 +13408,12 @@ impl Session {
                     {
                         eprintln!("[audio] failed to publish remote playout latency: {error}");
                     }
+                    drop(shared);
+                    if changed {
+                        // Schedule expiry even if the viewer immediately stops
+                        // producing video, input, and further timing reports.
+                        state.delivery_notify.notify_one();
+                    }
                     Ok(())
                 }
                 _ => Err(()),
@@ -25801,7 +25807,6 @@ impl Session {
             let state = self.services.app_state.as_ref().ok_or(())?;
             let mut shared = state.session.lock().await;
             if let Some(compositor) = shared.compositor.as_mut() {
-                let previous_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 compositor.audio_broadcast.unsubscribe_native(owner);
                 let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
                 let max_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
@@ -25811,9 +25816,10 @@ impl Session {
                     } else {
                         i32::from(max_kbps) * 1_000
                     });
-                    if max_delay != previous_delay {
-                        let _ = pipeline.set_playout_delay_ns(max_delay);
-                    }
+                    // Publish even when the remaining current maximum is
+                    // zero: the removed report may have expired before the
+                    // maintenance tick cleared its advertised latency.
+                    let _ = pipeline.set_playout_delay_ns(max_delay);
                 }
             }
             Ok(())
@@ -27824,7 +27830,6 @@ impl Session {
                 }
             }
             if let Some(compositor) = shared.compositor.as_mut() {
-                let previous_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 compositor.audio_broadcast.unsubscribe_native(owner);
                 let max_delay = compositor.audio_broadcast.max_native_playout_delay_ns();
                 let max_kbps = compositor.audio_broadcast.max_native_bitrate_kbps();
@@ -27834,9 +27839,10 @@ impl Session {
                     } else {
                         i32::from(max_kbps) * 1_000
                     });
-                    if max_delay != previous_delay {
-                        let _ = pipeline.set_playout_delay_ns(max_delay);
-                    }
+                    // Publish even when the remaining current maximum is
+                    // zero: the removed report may have expired before the
+                    // maintenance tick cleared its advertised latency.
+                    let _ = pipeline.set_playout_delay_ns(max_delay);
                 }
                 compositor.media_input.disconnect(owner);
                 compositor.native_media_input_events.remove(&owner);

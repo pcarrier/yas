@@ -12381,6 +12381,24 @@ async fn tick(state: &AppState) -> TickOutcome {
     // off-tick fan-out.  The has_listener flag is now managed by the
     // subscribe/unsubscribe API on `AudioBroadcast`.
 
+    // A connected viewer can stop sending A/V measurements (background tab,
+    // paused video, or a stalled audio context). Retire its correction without
+    // requiring the audio subscription or transport to close.
+    #[cfg(target_os = "linux")]
+    if let Some(cs) = sess.compositor.as_ref() {
+        let (changed_latency, expiry) = cs.audio_broadcast.expire_native_playout_delays(now);
+        if let Some(delay_ns) = changed_latency
+            && let Some(pipeline) = cs.audio_pipeline.as_ref()
+            && let Err(error) = pipeline.set_playout_delay_ns(delay_ns)
+            && state.config.verbose
+        {
+            eprintln!("[audio] failed to expire remote playout latency: {error}");
+        }
+        if let Some(expiry) = expiry {
+            next_deadline = Some(next_deadline.map_or(expiry, |due| due.min(expiry)));
+        }
+    }
+
     // -- Audio pipeline auto-restart ----------------------------------------
     // If the pipeline died (encoder crashed, PipeWire gone, capture stream dropped),
     // drop it, wait for a cooldown, and respawn.  This avoids permanent

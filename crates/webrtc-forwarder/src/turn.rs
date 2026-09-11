@@ -554,49 +554,71 @@ async fn udp_relay_task(
 
 // --- TURN allocation (TCP/TLS) ---
 
-enum TcpStream {
+enum TcpIo {
     Plain(tokio::net::TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
 
+/// A TURN message can span TCP/TLS reads. Keep every consumed byte outside
+/// the read future: relay sends and refresh timers cancel that future in
+/// `select!`, and permission/refresh transactions use the same decoder.
+struct TcpStream {
+    io: TcpIo,
+    message: Vec<u8>,
+    filled: usize,
+}
+
 impl TcpStream {
+    fn new(io: TcpIo) -> Self {
+        Self {
+            io,
+            message: vec![0; 4],
+            filled: 0,
+        }
+    }
+
     async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        match self {
-            Self::Plain(s) => s.write_all(buf).await,
-            Self::Tls(s) => s.write_all(buf).await,
+        match &mut self.io {
+            TcpIo::Plain(s) => s.write_all(buf).await,
+            TcpIo::Tls(s) => s.write_all(buf).await,
         }
     }
 
     async fn read_stun_message(&mut self) -> std::io::Result<Vec<u8>> {
-        let mut header = [0u8; 4];
-        self.read_exact(&mut header).await?;
-        let first_two = u16::from_be_bytes([header[0], header[1]]);
-        if first_two & 0xC000 == 0x4000 {
-            let data_len = u16::from_be_bytes([header[2], header[3]]) as usize;
-            let padded = (data_len + 3) & !3;
-            let mut data = vec![0u8; 4 + padded];
-            data[..4].copy_from_slice(&header);
-            self.read_exact(&mut data[4..]).await?;
-            Ok(data)
-        } else {
-            let msg_len = u16::from_be_bytes([header[2], header[3]]) as usize;
-            let mut msg = vec![0u8; 20 + msg_len];
-            msg[..4].copy_from_slice(&header);
-            self.read_exact(&mut msg[4..]).await?;
-            Ok(msg)
-        }
-    }
-
-    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
-        match self {
-            Self::Plain(s) => {
-                tokio::io::AsyncReadExt::read_exact(s, buf).await?;
-                Ok(())
+        loop {
+            let remaining = &mut self.message[self.filled..];
+            // `read` is cancellation safe. Commit its count without an await
+            // before yielding again so a cancelled message read can resume.
+            let count = match &mut self.io {
+                TcpIo::Plain(s) => tokio::io::AsyncReadExt::read(s, remaining).await?,
+                TcpIo::Tls(s) => tokio::io::AsyncReadExt::read(s, remaining).await?,
+            };
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "TURN stream closed during message read",
+                ));
             }
-            Self::Tls(s) => {
-                tokio::io::AsyncReadExt::read_exact(s, buf).await?;
-                Ok(())
+            self.filled += count;
+            if self.filled < self.message.len() {
+                continue;
             }
+            if self.message.len() == 4 {
+                let first_two = u16::from_be_bytes([self.message[0], self.message[1]]);
+                let length = u16::from_be_bytes([self.message[2], self.message[3]]) as usize;
+                let total = if first_two & 0xC000 == 0x4000 {
+                    4 + ((length + 3) & !3)
+                } else {
+                    20 + length
+                };
+                // The wire's u16 length bounds allocation to 65,555 bytes.
+                self.message.resize(total, 0);
+                if self.filled < total {
+                    continue;
+                }
+            }
+            self.filled = 0;
+            return Ok(std::mem::replace(&mut self.message, vec![0; 4]));
         }
     }
 }
@@ -897,15 +919,16 @@ impl TurnRelay {
         credential: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let tcp = tokio::net::TcpStream::connect(server_addr).await?;
-        let mut stream = if tls {
+        let io = if tls {
             let connector = tokio_rustls::TlsConnector::from(cached_tls_config());
             let server_name = rustls::pki_types::ServerName::try_from(hostname.to_owned())?;
             let tls_stream = connector.connect(server_name, tcp).await?;
-            TcpStream::Tls(Box::new(tls_stream))
+            TcpIo::Tls(Box::new(tls_stream))
         } else {
-            TcpStream::Plain(tcp)
+            TcpIo::Plain(tcp)
         };
 
+        let mut stream = TcpStream::new(io);
         let (relay_addr, nonce, realm, key) =
             tcp_allocate(&mut stream, server_addr, username, credential).await?;
 
@@ -946,6 +969,51 @@ mod tests {
         writer.attr(ATTR_XOR_PEER_ADDRESS, &xor_addr_encode(peer, &tid));
         writer.attr(ATTR_DATA, payload);
         writer.build()
+    }
+
+    #[tokio::test]
+    async fn tcp_message_read_survives_cancellation_at_every_boundary() {
+        let peer = "198.51.100.7:49152".parse().unwrap();
+        let messages = [
+            data_indication(peer, b"audio-packet"),
+            StunWriter::new(REFRESH_RESPONSE).build(),
+            vec![0x40, 0x01, 0, 5, 1, 2, 3, 4, 5, 0, 0, 0],
+            vec![0x40, 0x01, 0, 0],
+        ];
+        let second = data_indication(peer, b"next-packet");
+        for first in messages {
+            for split in 1..first.len() {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (mut remote, _) = listener.accept().await.unwrap();
+                remote.set_nodelay(true).unwrap();
+                remote.write_all(&first[..split]).await.unwrap();
+                client.readable().await.unwrap();
+                let mut stream = TcpStream::new(TcpIo::Plain(client));
+                // The read consumes the available prefix, then a competing send
+                // or timer branch cancels it while it waits for the remainder.
+                tokio::select! {
+                    biased;
+                    result = stream.read_stun_message() => panic!("partial message completed: {result:?}"),
+                    _ = std::future::ready(()) => {}
+                }
+                remote.write_all(&first[split..]).await.unwrap();
+                remote.write_all(&second).await.unwrap();
+                remote.shutdown().await.unwrap();
+                assert_eq!(
+                    stream.read_stun_message().await.unwrap(),
+                    first,
+                    "split at {split}"
+                );
+                assert_eq!(
+                    stream.read_stun_message().await.unwrap(),
+                    second,
+                    "next message after split at {split}"
+                );
+            }
+        }
     }
 
     #[test]

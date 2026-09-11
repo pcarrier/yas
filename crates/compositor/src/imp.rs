@@ -2071,18 +2071,6 @@ struct ActiveTouch {
     down_serial: u32,
 }
 
-/// A granted pointer lock and the Wayland objects it constrains.
-///
-/// Cursor hiding is otherwise indistinguishable from a web video player's
-/// idle auto-hide.  Keeping the association lets ordinary absolute motion
-/// wake an idle-hidden cursor without overriding the deliberate hidden cursor
-/// of a pointer-lock application.
-struct LockedPointerState {
-    resource: ZwpLockedPointerV1,
-    surface_id: ObjectId,
-    pointer_id: ObjectId,
-}
-
 /// The target side of a [`ClientDragState`]: one entered surface.
 struct ClientDragTarget {
     device: WlDataDevice,
@@ -2639,10 +2627,6 @@ struct Compositor {
 
     // -- Relative pointer --
     relative_pointers: Vec<ZwpRelativePointerV1>,
-    /// Granted pointer constraints, including their target surface and
-    /// wl_pointer.  Dead resources are pruned with the other seat objects.
-    locked_pointers: Vec<LockedPointerState>,
-
     /// Per-client multiplier for the smooth `wl_pointer.axis` value, keyed
     /// by client so the `/proc` lookup behind it happens once rather than
     /// once per scroll frame.  See [`Compositor::smooth_axis_scale`].
@@ -5158,8 +5142,6 @@ impl Compositor {
         self.data_devices.retain(|d| d.is_alive());
         self.primary_devices.retain(|d| d.is_alive());
         self.relative_pointers.retain(|p| p.is_alive());
-        self.locked_pointers
-            .retain(|locked| locked.resource.is_alive());
         self.text_inputs.retain(|ti| ti.resource.is_alive());
         self.shm_pools.retain(|_, p| p.resource.is_alive());
         self.dmabuf_params.retain(|_, p| p.resource.is_alive());
@@ -5485,20 +5467,6 @@ impl Compositor {
         )
     }
 
-    /// Whether the pointer currently over `surface` has an active lock for
-    /// the same toplevel.  Pointer lock is the one case where motion must not
-    /// recover a hidden cursor.
-    fn pointer_is_locked_on(&self, surface: &WlSurface) -> bool {
-        let root_id = self.find_toplevel_root(&surface.id()).0;
-        self.locked_pointers.iter().any(|locked| {
-            locked.resource.is_alive()
-                && self.pointers.iter().any(|pointer| {
-                    pointer.id() == locked.pointer_id && same_client(pointer, surface)
-                })
-                && self.find_toplevel_root(&locked.surface_id).0 == root_id
-        })
-    }
-
     /// Hit-test and dispatch one pointer motion in composited-frame
     /// coordinates. The browser motion path and scroll retargeting share this
     /// so they cannot disagree about scale, crop, popup, or subsurface rules.
@@ -5540,19 +5508,10 @@ impl Compositor {
                 .filter(|p| same_client(*p, &wl_surface))
                 .count();
 
-            // Chromium video controls can leave their old `cursor: none`
-            // selected after absolute motion resumes. Merely publishing a
-            // synthetic default to viewers strands the client on its previous
-            // cursor decision, so later hover shapes can remain the boring
-            // arrow. Re-enter instead: the fresh serial makes Chromium state
-            // the cursor actually under this point. A real pointer lock keeps
-            // its intentional hidden cursor and uninterrupted focus.
-            if self.pointer_entered_id.as_ref() == Some(&proto_id)
-                && matches!(self.last_cursor.get(&surface_id), Some(CursorImage::Hidden))
-                && !self.pointer_is_locked_on(&wl_surface)
-            {
-                self.leave_pointer_focus(&proto_id);
-            }
+            // Cursor visibility belongs to the client. Motion within the
+            // same surface must not synthesize leave/enter to reveal a hidden
+            // cursor: video players can immediately hide it again, flashing
+            // the default arrow on every input round trip.
             if let Some(change) = focus_transition(
                 self.pointer_entered_id.as_ref(),
                 &proto_id,
@@ -11380,7 +11339,7 @@ impl GlobalDispatch<ZwpPointerConstraintsV1, ()> for Compositor {
 
 impl Dispatch<ZwpPointerConstraintsV1, ()> for Compositor {
     fn request(
-        state: &mut Self,
+        _: &mut Self,
         _: &Client,
         _: &ZwpPointerConstraintsV1,
         request: <ZwpPointerConstraintsV1 as Resource>::Request,
@@ -11392,17 +11351,12 @@ impl Dispatch<ZwpPointerConstraintsV1, ()> for Compositor {
         match request {
             Request::LockPointer {
                 id,
-                surface,
-                pointer,
+                surface: _,
+                pointer: _,
                 region: _,
                 lifetime: _,
             } => {
                 let lp = data_init.init(id, ());
-                state.locked_pointers.push(LockedPointerState {
-                    resource: lp.clone(),
-                    surface_id: surface.id(),
-                    pointer_id: pointer.id(),
-                });
                 // Immediately grant the lock (headless — no physical pointer to contest).
                 lp.locked();
             }
@@ -11424,21 +11378,15 @@ impl Dispatch<ZwpPointerConstraintsV1, ()> for Compositor {
 
 impl Dispatch<ZwpLockedPointerV1, ()> for Compositor {
     fn request(
-        state: &mut Self,
+        _: &mut Self,
         _: &Client,
-        resource: &ZwpLockedPointerV1,
-        request: <ZwpLockedPointerV1 as Resource>::Request,
+        _: &ZwpLockedPointerV1,
+        _: <ZwpLockedPointerV1 as Resource>::Request,
         _: &(),
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
-        use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_locked_pointer_v1::Request;
-        if matches!(request, Request::Destroy) {
-            state
-                .locked_pointers
-                .retain(|locked| locked.resource.id() != resource.id());
-        }
-        // SetCursorPositionHint and SetRegion are no-ops for headless.
+        // SetCursorPositionHint, SetRegion, and Destroy are no-ops for headless.
     }
 }
 
@@ -12614,7 +12562,6 @@ fn run_compositor(
         primary_source: None,
         external_primary: None,
         relative_pointers: Vec::new(),
-        locked_pointers: Vec::new(),
         axis_scale: HashMap::new(),
         text_inputs: Vec::new(),
         next_activation_token: 1,

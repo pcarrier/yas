@@ -105,6 +105,7 @@ const MEDIA_FRAME_FRAGMENT_MAX = 64;
 const MEDIA_AUDIO_FRAGMENT_MAX = 16;
 const MEDIA_AUDIO_RETAINED_MAX = 16 * 1024 * 1024;
 const MEDIA_OUTPUT_CREDIT = 64;
+const MEDIA_OUTPUT_CREDIT_REFRESH_MS = 500;
 
 interface NativeInputStream {
   kind: "microphone" | "camera";
@@ -190,6 +191,8 @@ export class YasNativeDesktopClientLifecycle {
   private cameraGeneration = 0;
   private audioOutput: NativeAudioOutput | null = null;
   private audioOutputGeneration = 0;
+  private audioCreditTimer: ReturnType<typeof setInterval> | null = null;
+  private lastAudioAckAt = 0;
   private pendingAudioOperation: (() => void | Promise<void>) | null = null;
   private audioOutputDrain: Promise<void> | null = null;
   private desiredAudioBitrate: number | null = null;
@@ -322,10 +325,17 @@ export class YasNativeDesktopClientLifecycle {
           this.report(error),
         );
       });
-      this.removeFrame = this.media.onFrame((frame) => {
+      this.removeFrame = this.media.onFrame((frame, datagram) => {
         try {
-          this.handleMediaFrame(frame);
+          this.handleMediaFrame(frame, datagram);
         } catch (error) {
+          if (datagram) {
+            // Malformed optional packets are loss. Let the session count the
+            // dropped datagram without ending the audio subscription.
+            this.audioOutput?.reassembly?.lease.release();
+            if (this.audioOutput) this.audioOutput.reassembly = null;
+            throw error;
+          }
           this.report(error);
           this.sendAudioUnsubscribe();
         }
@@ -487,17 +497,30 @@ export class YasNativeDesktopClientLifecycle {
       };
       this.lastPlayoutReportAt = 0;
       this.lastPlayoutDelayNs = null;
-      this.media!.sendFrameAck({
-        streamHandle: result.streamHandle,
-        consumedSequence: 0n,
-        queueDepth: 0,
-        desiredCreditFrames: MEDIA_OUTPUT_CREDIT,
-      });
+      this.sendAudioCredit();
+      this.audioCreditTimer = setInterval(() => {
+        if (this.disposed || !this.audioOutput) return;
+        if (
+          monotonicNow() - this.lastAudioAckAt <
+          MEDIA_OUTPUT_CREDIT_REFRESH_MS
+        )
+          return;
+        try {
+          // FRAME_ACK is reliable and grants an absolute credit window. If
+          // the entire datagram window is lost, no frame callback can grant
+          // more credit; renew the latest consumed sequence while idle.
+          this.sendAudioCredit();
+        } catch (error) {
+          this.stopAudioCreditTimer();
+          this.report(error);
+        }
+      }, MEDIA_OUTPUT_CREDIT_REFRESH_MS);
       this.options.audioPlayer.setSubscribed(true);
     });
   }
 
   sendAudioUnsubscribe(): void {
+    this.stopAudioCreditTimer();
     this.desiredAudioBitrate = null;
     this.audioOutputGeneration++;
     this.queueAudio(() => this.closeAudioOutput());
@@ -1427,11 +1450,30 @@ export class YasNativeDesktopClientLifecycle {
       this.sendAudioUnsubscribe();
   }
 
-  private handleMediaFrame(frame: YasMediaFrame): void {
+  private handleMediaFrame(frame: YasMediaFrame, datagram = false): void {
     const output = this.audioOutput;
     if (!output || frame.streamHandle !== output.streamHandle) return;
     if (frame.codecVersion !== g.YAS_MEDIA_CODEC_OPUS)
       throw new YasProtocolError("Media audio output changed codec");
+    // Unordered audio can be duplicated, reordered, or lose a fragment.
+    // A reliable fallback can also arrive behind a newer optional frame.
+    const discardable =
+      datagram || !!(frame.flags & g.YAS_MEDIA_FRAME_DISCARDABLE);
+    if (discardable) {
+      if (frame.sequence <= output.consumedSequence) return;
+      const pending = output.reassembly;
+      if (pending && frame.sequence < pending.sequence) return;
+      if (pending && frame.sequence > pending.sequence) {
+        pending.lease.release();
+        output.reassembly = null;
+      }
+      if (frame.fragmentIndex !== 0 && !output.reassembly) return;
+      if (
+        output.reassembly &&
+        frame.fragmentIndex < output.reassembly.nextFragment
+      )
+        return;
+    }
     if (frame.fragmentIndex === 0) {
       if (
         output.reassembly ||
@@ -1499,12 +1541,7 @@ export class YasNativeDesktopClientLifecycle {
           output.sampleRate;
       }
       output.consumedSequence = pending.sequence;
-      this.media!.sendFrameAck({
-        streamHandle: output.streamHandle,
-        consumedSequence: output.consumedSequence,
-        queueDepth: 0,
-        desiredCreditFrames: MEDIA_OUTPUT_CREDIT,
-      });
+      this.sendAudioCredit();
     } finally {
       pending.lease.release();
     }
@@ -1565,7 +1602,25 @@ export class YasNativeDesktopClientLifecycle {
       });
   }
 
+  private sendAudioCredit(): void {
+    const output = this.audioOutput;
+    if (!output || !this.media) return;
+    this.media.sendFrameAck({
+      streamHandle: output.streamHandle,
+      consumedSequence: output.consumedSequence,
+      queueDepth: 0,
+      desiredCreditFrames: MEDIA_OUTPUT_CREDIT,
+    });
+    this.lastAudioAckAt = monotonicNow();
+  }
+
+  private stopAudioCreditTimer(): void {
+    if (this.audioCreditTimer != null) clearInterval(this.audioCreditTimer);
+    this.audioCreditTimer = null;
+  }
+
   private async closeAudioOutput(): Promise<void> {
+    this.stopAudioCreditTimer();
     const output = this.audioOutput;
     this.audioOutput = null;
     this.lastPlayoutReportAt = 0;

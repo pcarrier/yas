@@ -55,6 +55,26 @@ const RING_CAPACITY: usize = 10;
 /// full 200 ms ring put every fresh subscribe ~140 ms in the hole.
 const CATCHUP_FRAMES: usize = 4;
 
+/// Clients refresh unchanged playout reports at least every two seconds.
+/// A viewer that stops presenting video must not pin the shared sink forever.
+const PLAYOUT_REPORT_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+struct PlayoutDelay {
+    ns: u64,
+    reported_at: Instant,
+}
+
+impl PlayoutDelay {
+    fn current_ns(self, now: Instant) -> u64 {
+        if now.saturating_duration_since(self.reported_at) < PLAYOUT_REPORT_TTL {
+            self.ns
+        } else {
+            0
+        }
+    }
+}
+
 /// Minimum interval between sub-process heal attempts.
 const HEAL_COOLDOWN: Duration = Duration::from_secs(1);
 /// Maximum sub-process restarts in a burst window before giving up.
@@ -88,7 +108,7 @@ pub struct AudioBroadcast {
     /// Client-measured audible-audio latency beyond visible-video latency,
     /// keyed by backend owner. The shared graph publishes the maximum so an
     /// application remains synchronized for every active listener.
-    native_playout_delays_ns: std::sync::Mutex<HashMap<u64, u64>>,
+    native_playout_delays_ns: std::sync::Mutex<HashMap<u64, PlayoutDelay>>,
     /// Recent frames for catch-up on new subscribers.  Kept in sync with
     /// delivery: every frame delivered to subscribers is first appended
     /// here, so a late-subscribing client gets the same tail.
@@ -125,7 +145,13 @@ impl AudioBroadcast {
             .lock()
             .unwrap()
             .insert(id, bitrate_kbps);
-        self.native_playout_delays_ns.lock().unwrap().insert(id, 0);
+        self.native_playout_delays_ns.lock().unwrap().insert(
+            id,
+            PlayoutDelay {
+                ns: 0,
+                reported_at: Instant::now(),
+            },
+        );
         self.has_listener.store(true, Ordering::Release);
     }
 
@@ -152,22 +178,55 @@ impl AudioBroadcast {
     /// Update one active viewer's measured extra audio latency and return the
     /// maximum that the shared PipeWire graph must advertise.
     pub fn set_native_playout_delay_ns(&self, id: u64, delay_ns: u64) -> Option<(bool, u64)> {
+        self.set_native_playout_delay_at(id, delay_ns, Instant::now())
+    }
+
+    fn set_native_playout_delay_at(
+        &self,
+        id: u64,
+        delay_ns: u64,
+        now: Instant,
+    ) -> Option<(bool, u64)> {
         let mut delays = self.native_playout_delays_ns.lock().unwrap();
-        let previous_max = delays.values().copied().max().unwrap_or(0);
-        let delay = delays.get_mut(&id)?;
-        *delay = delay_ns;
-        let maximum = delays.values().copied().max().unwrap_or(0);
+        let previous_max = delays.values().map(|delay| delay.ns).max().unwrap_or(0);
+        *delays.get_mut(&id)? = PlayoutDelay {
+            ns: delay_ns,
+            reported_at: now,
+        };
+        for delay in delays.values_mut() {
+            delay.ns = delay.current_ns(now);
+        }
+        let maximum = delays.values().map(|delay| delay.ns).max().unwrap_or(0);
         Some((maximum != previous_max, maximum))
     }
 
     pub fn max_native_playout_delay_ns(&self) -> u64 {
+        let now = Instant::now();
         self.native_playout_delays_ns
             .lock()
             .unwrap()
             .values()
-            .copied()
+            .map(|delay| delay.current_ns(now))
             .max()
             .unwrap_or(0)
+    }
+
+    /// Clear reports whose viewer stopped updating, retaining the subscription
+    /// so its next report is accepted. Return a changed graph latency and the
+    /// next expiry deadline; the server must wake even if every viewer is idle.
+    pub fn expire_native_playout_delays(&self, now: Instant) -> (Option<u64>, Option<Instant>) {
+        let mut delays = self.native_playout_delays_ns.lock().unwrap();
+        let previous_max = delays.values().map(|delay| delay.ns).max().unwrap_or(0);
+        for delay in delays.values_mut() {
+            delay.ns = delay.current_ns(now);
+        }
+        let maximum = delays.values().map(|delay| delay.ns).max().unwrap_or(0);
+        let deadline = delays
+            .values()
+            .filter(|delay| delay.ns > 0)
+            .map(|delay| delay.reported_at + PLAYOUT_REPORT_TTL)
+            .min();
+        ((maximum != previous_max).then_some(maximum), deadline)
     }
 
     /// Publish one semantic frame into native subscribers without starting
@@ -1438,6 +1497,80 @@ mod tests {
         assert_eq!(broadcast.max_native_playout_delay_ns(), 100_000_000);
         broadcast.unsubscribe_native(1);
         assert_eq!(broadcast.max_native_playout_delay_ns(), 0);
+    }
+
+    #[test]
+    fn stale_playout_report_expires_without_unsubscribing() {
+        let broadcast = AudioBroadcast::new();
+        let (tx, _rx) = mpsc::channel(crate::AUDIO_QUEUE_MAX_FRAMES);
+        broadcast.subscribe_native(1, 64, tx);
+        let now = Instant::now();
+        broadcast.set_native_playout_delay_at(1, 2_000_000_000, now);
+        let expiry = now + PLAYOUT_REPORT_TTL;
+
+        assert_eq!(
+            broadcast.expire_native_playout_delays(now),
+            (None, Some(expiry))
+        );
+        assert_eq!(
+            broadcast.expire_native_playout_delays(expiry),
+            (Some(0), None)
+        );
+        assert_eq!(broadcast.expire_native_playout_delays(expiry), (None, None));
+        assert_eq!(
+            broadcast.set_native_playout_delay_at(1, 80_000_000, expiry),
+            Some((true, 80_000_000)),
+        );
+    }
+
+    #[test]
+    fn stale_viewer_does_not_override_fresh_playout_reports() {
+        let broadcast = AudioBroadcast::new();
+        let (first_tx, _first_rx) = mpsc::channel(crate::AUDIO_QUEUE_MAX_FRAMES);
+        let (second_tx, _second_rx) = mpsc::channel(crate::AUDIO_QUEUE_MAX_FRAMES);
+        broadcast.subscribe_native(1, 64, first_tx);
+        broadcast.subscribe_native(2, 64, second_tx);
+        let now = Instant::now();
+        broadcast.set_native_playout_delay_at(1, 2_000_000_000, now);
+        let fresh = now + Duration::from_secs(2);
+        broadcast.set_native_playout_delay_at(2, 80_000_000, fresh);
+
+        assert_eq!(
+            broadcast.expire_native_playout_delays(now + PLAYOUT_REPORT_TTL),
+            (Some(80_000_000), Some(fresh + PLAYOUT_REPORT_TTL)),
+        );
+        // Refreshing an unchanged value renews its lifetime.
+        assert_eq!(
+            broadcast.set_native_playout_delay_at(2, 80_000_000, fresh + Duration::from_secs(2)),
+            Some((false, 80_000_000)),
+        );
+        assert_eq!(
+            broadcast.expire_native_playout_delays(fresh + PLAYOUT_REPORT_TTL),
+            (
+                None,
+                Some(fresh + Duration::from_secs(2) + PLAYOUT_REPORT_TTL)
+            ),
+        );
+        broadcast.unsubscribe_native(1);
+        assert_eq!(
+            broadcast.set_native_playout_delay_ns(1, 2_000_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn new_report_replaces_expired_maximum_before_maintenance() {
+        let broadcast = AudioBroadcast::new();
+        let (first_tx, _first_rx) = mpsc::channel(crate::AUDIO_QUEUE_MAX_FRAMES);
+        let (second_tx, _second_rx) = mpsc::channel(crate::AUDIO_QUEUE_MAX_FRAMES);
+        broadcast.subscribe_native(1, 64, first_tx);
+        broadcast.subscribe_native(2, 64, second_tx);
+        let now = Instant::now();
+        broadcast.set_native_playout_delay_at(1, 2_000_000_000, now);
+        assert_eq!(
+            broadcast.set_native_playout_delay_at(2, 90_000_000, now + PLAYOUT_REPORT_TTL),
+            Some((true, 90_000_000)),
+        );
     }
 
     #[test]

@@ -441,8 +441,26 @@ export function createShareTransport(
       // transport transitions to "disconnected" and the reconnect loop
       // retries instead of hanging in "connecting" forever.
       const PEER_JOIN_TIMEOUT_MS = 30_000;
+      // Presence can outlive a crashed producer. Offer to each advertised
+      // session and let the first authenticated answer choose the peer.
+      // Keep collecting joins while createOffer/setLocalDescription await.
+      const producerSessions = new Set<string>();
+      let offerToProducer: ((sessionId: string) => void) | undefined;
+      let answeringProducer: string | null = null;
+      const rememberProducer = (m: ServerMessage) => {
+        if (
+          (m.role && m.role !== "producer") ||
+          !m.sessionId ||
+          answeringProducer !== null ||
+          producerSessions.has(m.sessionId) ||
+          producerSessions.size >= MAX_PENDING_CANDIDATES
+        )
+          return;
+        producerSessions.add(m.sessionId);
+        offerToProducer?.(m.sessionId);
+      };
       dbg.log("waiting for registered + peer_joined");
-      const producerSessionId = await new Promise<string>((resolve, reject) => {
+      await new Promise<void>((resolve, reject) => {
         let registered = false;
         const timeout = setTimeout(() => {
           dbg.warn(
@@ -481,9 +499,12 @@ export function createShareTransport(
               );
               return;
             }
-            dbg.log("producer joined: %s", m.sessionId);
-            clearTimeout(timeout);
-            resolve(m.sessionId!);
+            rememberProducer(m);
+            if (producerSessions.size > 0) {
+              dbg.log("producer joined: %s", m.sessionId);
+              clearTimeout(timeout);
+              resolve();
+            }
           } else if (m.type === "error") {
             dbg.error("signaling error: %s", m.message);
             clearTimeout(timeout);
@@ -567,20 +588,28 @@ export function createShareTransport(
       }
       dbg.log("SDP offer set as local description, type=%s", offer.type);
 
-      // Send the offer encrypted to the producer.
+      // Replay gathered candidates when a replacement producer appears.
       const sdpData = { sdp: { type: offer.type, sdp: offer.sdp } };
-      signalingSocket.send(
-        buildSealedMessage(
-          keys,
-          keys.signing.secretKey,
-          producerSessionId,
-          sdpData,
-        ),
-      );
-      dbg.log("sent encrypted SDP offer to producer %s", producerSessionId);
+      const localCandidates: RTCIceCandidateInit[] = [];
+      let localCandidateChars = 0;
+      const sendToProducer = (sessionId: string, data: unknown) => {
+        signalingSocket.send(
+          buildSealedMessage(keys, keys.signing.secretKey, sessionId, data),
+        );
+      };
+      offerToProducer = (sessionId) => {
+        sendToProducer(sessionId, sdpData);
+        for (const candidate of localCandidates)
+          sendToProducer(sessionId, { candidate });
+        dbg.log("sent encrypted SDP offer to producer %s", sessionId);
+      };
+      for (const sessionId of producerSessions) offerToProducer(sessionId);
 
       // Buffer ICE candidates that arrive before we have the remote description
-      const pendingCandidates: RTCIceCandidateInit[] = [];
+      const pendingCandidates: {
+        from: string;
+        candidate: RTCIceCandidateInit;
+      }[] = [];
       let pendingCandidateChars = 0;
       let remoteDescSet = false;
 
@@ -595,15 +624,19 @@ export function createShareTransport(
         )
           return;
         dbg.log("local ICE candidate: %s", e.candidate.candidate);
-        const candidateData = { candidate: e.candidate.toJSON() };
-        signalingSocket.send(
-          buildSealedMessage(
-            keys,
-            keys.signing.secretKey,
-            producerSessionId,
-            candidateData,
-          ),
-        );
+        const candidate = e.candidate.toJSON();
+        const chars = JSON.stringify(candidate).length;
+        if (
+          localCandidates.length >= MAX_PENDING_CANDIDATES ||
+          localCandidateChars + chars > MAX_PENDING_CANDIDATE_CHARS
+        )
+          return;
+        localCandidates.push(candidate);
+        localCandidateChars += chars;
+        for (const sessionId of answeringProducer
+          ? [answeringProducer]
+          : producerSessions)
+          sendToProducer(sessionId, { candidate });
       };
 
       // Receive answer + remote ICE candidates. Every producer reply is
@@ -637,7 +670,22 @@ export function createShareTransport(
           m.type,
           m.data ? Object.keys(m.data) : "no data",
         );
-        if (m.type !== "signal" || !m.data) return;
+        if (m.type === "peer_joined") {
+          rememberProducer(m);
+          return;
+        }
+        if (m.type === "peer_left") {
+          if (m.sessionId) producerSessions.delete(m.sessionId);
+          return;
+        }
+        if (
+          m.type !== "signal" ||
+          !m.data ||
+          !m.from ||
+          !producerSessions.has(m.from) ||
+          (answeringProducer !== null && m.from !== answeringProducer)
+        )
+          return;
 
         const opened = openSealedData(m.data, keys);
         if (!opened || typeof opened !== "object" || Array.isArray(opened)) {
@@ -649,6 +697,8 @@ export function createShareTransport(
         const data = opened as Record<string, unknown>;
 
         if (data.sdp) {
+          if (answeringProducer !== null) return;
+          answeringProducer = m.from;
           dbg.log("received remote SDP answer");
           const sdp = data.sdp as { type?: string; sdp?: string };
           peerConnection
@@ -672,8 +722,9 @@ export function createShareTransport(
                 pendingCandidates.length,
               );
               for (const c of pendingCandidates) {
+                if (c.from !== answeringProducer) continue;
                 peerConnection
-                  .addIceCandidate(new RTCIceCandidate(c))
+                  .addIceCandidate(new RTCIceCandidate(c.candidate))
                   .catch(() => {});
               }
               pendingCandidates.length = 0;
@@ -717,7 +768,7 @@ export function createShareTransport(
               "remote ICE candidate (buffered): %s",
               (candidate as { candidate?: string }).candidate,
             );
-            pendingCandidates.push(candidate);
+            pendingCandidates.push({ from: m.from, candidate });
             pendingCandidateChars += candidateChars;
           }
         }

@@ -7,6 +7,7 @@ import {
   YAS_MEDIA_CODEC_OPUS,
   YAS_MEDIA_DEVICE_AVAILABLE,
   YAS_MEDIA_FRAME,
+  YAS_MEDIA_FRAME_DISCARDABLE,
   YAS_MEDIA_KIND_AUDIO_OUTPUT,
   YAS_MEDIA_WIRE_SAMPLE_RATE,
 } from "../yas/generated";
@@ -65,75 +66,176 @@ function lifecycleWith(
 }
 
 describe("YasNativeDesktopClientLifecycle", () => {
-  it("marks a successfully opened audio output subscribed until close", async () => {
-    const format = {
-      codec: YAS_MEDIA_CODEC_OPUS,
-      channels: 2,
-      sampleRate: YAS_MEDIA_WIRE_SAMPLE_RATE,
-      width: 0,
-      height: 0,
-      frameRateMilli: 0,
-      extensions: [],
-    };
-    let subscribed = false;
-    const audioPlayer = {
-      reset: vi.fn(() => {
-        subscribed = false;
-      }),
-      setSubscribed: vi.fn((value: boolean) => {
-        subscribed = value;
-      }),
-    };
-    const media = {
-      openOutput: vi.fn().mockResolvedValue({
+  it("renews audio credit after packet loss until the output closes", async () => {
+    vi.useFakeTimers();
+    try {
+      const format = {
+        codec: YAS_MEDIA_CODEC_OPUS,
+        channels: 2,
+        sampleRate: YAS_MEDIA_WIRE_SAMPLE_RATE,
+        width: 0,
+        height: 0,
+        frameRateMilli: 0,
+        extensions: [],
+      };
+      let subscribed = false;
+      const audioPlayer = {
+        reset: vi.fn(() => {
+          subscribed = false;
+        }),
+        setSubscribed: vi.fn((value: boolean) => {
+          subscribed = value;
+        }),
+      };
+      const media = {
+        openOutput: vi.fn().mockResolvedValue({
+          streamHandle: 9n,
+          selectedFormat: format,
+        }),
+        closeStream: vi.fn().mockResolvedValue(undefined),
+        sendFrameAck: vi.fn(),
+      };
+      const lifecycle = lifecycleWith(null, null, media);
+      Reflect.deleteProperty(lifecycle, "sendAudioUnsubscribe");
+      Object.assign(lifecycle as object, {
+        audioOutput: null,
+        audioOutputGeneration: 0,
+        pendingAudioOperation: null,
+        audioOutputDrain: null,
+        desiredAudioBitrate: null,
+        mediaSnapshot: {
+          revision: 1n,
+          devices: [
+            {
+              kind: "device",
+              deviceHandle: 7n,
+              revision: 1n,
+              deviceKind: YAS_MEDIA_KIND_AUDIO_OUTPUT,
+              state: YAS_MEDIA_DEVICE_AVAILABLE,
+              flags: 0,
+              name: "Output",
+              formats: [format],
+              extensions: [],
+            },
+          ],
+          leases: [],
+          portals: [],
+          players: [],
+        },
+        options: {
+          audioPlayer,
+        },
+      });
+
+      lifecycle.sendAudioSubscribe(64);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(media.openOutput).toHaveBeenCalledOnce();
+      expect(audioPlayer.setSubscribed).toHaveBeenCalledWith(true);
+      expect(subscribed).toBe(true);
+
+      // No frame reaches the browser: all granted datagrams can have been
+      // lost. A reliable credit renewal must restart delivery without a frame
+      // callback or an audio toggle.
+      const initialAcks = media.sendFrameAck.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(media.sendFrameAck.mock.calls.length).toBeGreaterThan(initialAcks);
+      expect(media.sendFrameAck).toHaveBeenLastCalledWith({
         streamHandle: 9n,
-        selectedFormat: format,
+        consumedSequence: 0n,
+        queueDepth: 0,
+        desiredCreditFrames: 64,
+      });
+      lifecycle.sendAudioUnsubscribe();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(media.closeStream).toHaveBeenCalledOnce();
+      expect(subscribed).toBe(false);
+      const finalAcks = media.sendFrameAck.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(media.sendFrameAck).toHaveBeenCalledTimes(finalAcks);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps audio subscribed when unreliable frames arrive out of order", async () => {
+    let onFrame!: (
+      frame: import("../yas/media").YasMediaFrame,
+      datagram: boolean,
+    ) => void;
+    const media = {
+      catalog: {
+        subscribe: vi.fn(() => vi.fn()),
+        watch: vi.fn().mockResolvedValue(undefined),
+      },
+      onPortalRequest: vi.fn(() => vi.fn()),
+      onFrame: vi.fn((listener) => {
+        onFrame = listener;
+        return vi.fn();
       }),
-      closeStream: vi.fn().mockResolvedValue(undefined),
+      onFrameAck: vi.fn(() => vi.fn()),
+      onStreamStatus: vi.fn(() => vi.fn()),
       sendFrameAck: vi.fn(),
     };
     const lifecycle = lifecycleWith(null, null, media);
-    Reflect.deleteProperty(lifecycle, "sendAudioUnsubscribe");
-    Object.assign(lifecycle as object, {
-      audioOutput: null,
-      audioOutputGeneration: 0,
-      pendingAudioOperation: null,
-      audioOutputDrain: null,
-      desiredAudioBitrate: null,
-      mediaSnapshot: {
-        revision: 1n,
-        devices: [
-          {
-            kind: "device",
-            deviceHandle: 7n,
-            revision: 1n,
-            deviceKind: YAS_MEDIA_KIND_AUDIO_OUTPUT,
-            state: YAS_MEDIA_DEVICE_AVAILABLE,
-            flags: 0,
-            name: "Output",
-            formats: [format],
-            extensions: [],
-          },
-        ],
-        leases: [],
-        portals: [],
-        players: [],
+    const play = vi.fn();
+    Object.assign(lifecycle, {
+      audioOutput: {
+        streamHandle: 9n,
+        sampleRate: 48_000,
+        consumedSequence: 0n,
+        reassembly: null,
       },
       options: {
-        audioPlayer,
+        audioPlayer: { handleAudioFrame: play },
+        session: {
+          receiveBudget: { reserveExact: () => ({ release: vi.fn() }) },
+        },
       },
     });
-
-    lifecycle.sendAudioSubscribe(64);
-    await flush();
-    expect(media.openOutput).toHaveBeenCalledOnce();
-    expect(audioPlayer.setSubscribed).toHaveBeenCalledWith(true);
-    expect(subscribed).toBe(true);
-
-    lifecycle.sendAudioUnsubscribe();
-    await flush();
-    expect(media.closeStream).toHaveBeenCalledOnce();
-    expect(subscribed).toBe(false);
+    await lifecycle.start();
+    const frame = (sequence: bigint) => ({
+      streamHandle: 9n,
+      sequence,
+      captureTime: sequence * 960n,
+      presentationTime: sequence * 960n,
+      codecVersion: YAS_MEDIA_CODEC_OPUS,
+      flags: YAS_MEDIA_FRAME_DISCARDABLE,
+      fragmentIndex: 0,
+      fragmentCount: 1,
+      completeLength: 9,
+      payload: new Uint8Array([1, 0, 0, 0, 3, 0, 0xf8, 0xff, 0xfe]),
+    });
+    onFrame(frame(2n), true);
+    onFrame(frame(1n), true);
+    onFrame(frame(2n), true);
+    onFrame(frame(3n), true);
+    // Lose the second fragment, then accept a newer complete frame and
+    // ignore the old fragment when it eventually arrives.
+    const lost = {
+      ...frame(4n),
+      fragmentCount: 2,
+      payload: frame(4n).payload.subarray(0, 4),
+    };
+    onFrame(lost, true);
+    onFrame(frame(5n), true);
+    onFrame(
+      { ...lost, fragmentIndex: 1, payload: frame(4n).payload.subarray(4) },
+      true,
+    );
+    // A reliable fallback can arrive behind the unordered lane too.
+    onFrame(frame(4n), false);
+    onFrame(frame(6n), true);
+    expect(lifecycle.sendAudioUnsubscribe).not.toHaveBeenCalled();
+    expect(play).toHaveBeenCalledTimes(4);
+    expect(() => onFrame({ ...frame(7n), codecVersion: 999 }, true)).toThrow(
+      "changed codec",
+    );
+    expect(lifecycle.sendAudioUnsubscribe).not.toHaveBeenCalled();
+    onFrame({ ...frame(7n), codecVersion: 999 }, false);
+    expect(lifecycle.sendAudioUnsubscribe).toHaveBeenCalledOnce();
+    expect(media.sendFrameAck).toHaveBeenLastCalledWith(
+      expect.objectContaining({ consumedSequence: 6n }),
+    );
   });
 
   it("cleans WATCHes that settle after invalidated disposal", async () => {
@@ -289,6 +391,10 @@ describe("YasNativeDesktopClientLifecycle", () => {
       for (const listener of mediaFrameListeners ?? [])
         listener({ payload, sensitive: false, datagram: false });
       expect(onFrame).toHaveBeenCalledOnce();
+      expect(onFrame).toHaveBeenLastCalledWith(expect.any(Object), false);
+      for (const listener of mediaFrameListeners ?? [])
+        listener({ payload, sensitive: true, datagram: true });
+      expect(onFrame).toHaveBeenLastCalledWith(expect.any(Object), true);
 
       desktop.dispose();
       client.dispose();

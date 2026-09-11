@@ -196,7 +196,7 @@ restarting the uplink with the new identity/allowlist.
 
 ```bash
 yas --on ssh:dev-server terminal list     # SSH (auto-installs yas)
-yas --on share:mypassphrase terminal list # WebRTC shared terminal
+yas --on share:mypassphrase terminal list # WebRTC share
 yas --on prod terminal list               # named remote
 yas --on local:work terminal list         # named local server (auto-starts)
 

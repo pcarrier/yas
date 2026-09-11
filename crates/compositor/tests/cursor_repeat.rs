@@ -374,32 +374,46 @@ fn cursor_authority_replacement_and_artwork_deduplication() {
         .roundtrip(&mut app)
         .expect("fresh cursor restore after re-enter");
 
-    // A video player may leave its idle-hidden cursor selected after the host
-    // mouse starts moving. Motion is enough to recover it unless the client
-    // has a real pointer lock for this surface.
+    // An application's hidden cursor remains authoritative during motion.
+    // Synthetic leave/enter pairs flash the default arrow between the
+    // application's hide requests and repeatedly reset video hover state.
     pointer.set_cursor(reenter_serial, None, 0, 0);
     queue
         .roundtrip(&mut app)
         .expect("idle cursor hide roundtrip");
-    handle
-        .command_tx
-        .send(CompositorCommand::PointerMotion {
-            surface_id,
-            x: 11.0,
-            y: 10.0,
-            time_ms: 1,
-        })
-        .expect("send idle-hidden pointer motion");
-    handle.wake();
-    std::thread::sleep(Duration::from_millis(50));
-    queue
-        .roundtrip(&mut app)
-        .expect("idle-hidden cursor re-enter roundtrip");
-    let hover_serial = app.enter_serial.expect("idle-hidden re-enter serial");
-    assert_ne!(
-        hover_serial, reenter_serial,
-        "motion over an idle-hidden cursor did not request a fresh cursor shape"
-    );
+    events.extend(handle.event_rx.try_iter());
+    let leave_count = app.leave_count;
+    for step in 1..=5 {
+        handle
+            .command_tx
+            .send(CompositorCommand::PointerMotion {
+                surface_id,
+                x: 10.0 + f64::from(step),
+                y: 10.0,
+                time_ms: step,
+            })
+            .expect("send hidden pointer motion");
+        handle.wake();
+        std::thread::sleep(Duration::from_millis(50));
+        queue
+            .roundtrip(&mut app)
+            .expect("hidden cursor motion roundtrip");
+        assert_eq!(
+            app.enter_serial,
+            Some(reenter_serial),
+            "motion re-entered the surface"
+        );
+        assert_eq!(app.leave_count, leave_count, "motion left the surface");
+        let motion_events: Vec<_> = handle.event_rx.try_iter().collect();
+        assert!(
+            !motion_events
+                .iter()
+                .any(|event| matches!(event, CompositorEvent::SurfaceCursor { .. })),
+            "motion flashed a cursor without an application cursor update"
+        );
+        events.extend(motion_events);
+    }
+    let hover_serial = reenter_serial;
     cursor_shape.set_shape(hover_serial, wp_cursor_shape_device_v1::Shape::Text);
     queue
         .roundtrip(&mut app)
@@ -431,6 +445,7 @@ fn cursor_authority_replacement_and_artwork_deduplication() {
         .expect("send locked pointer motion");
     handle.wake();
     std::thread::sleep(Duration::from_millis(50));
+    queue.roundtrip(&mut app).expect("locked motion roundtrip");
     let locked_motion_events: Vec<_> = handle.event_rx.try_iter().collect();
     assert!(
         !locked_motion_events
@@ -459,11 +474,11 @@ fn cursor_authority_replacement_and_artwork_deduplication() {
     std::thread::sleep(Duration::from_millis(50));
     queue
         .roundtrip(&mut app)
-        .expect("unlocked cursor re-enter roundtrip");
-    let unlocked_serial = app.enter_serial.expect("unlocked re-enter serial");
-    assert_ne!(
+        .expect("unlocked cursor motion roundtrip");
+    let unlocked_serial = app.enter_serial.expect("unlocked enter serial");
+    assert_eq!(
         unlocked_serial, hover_serial,
-        "motion after unlocking did not request a fresh cursor shape"
+        "motion after unlocking unexpectedly re-entered the surface"
     );
     cursor_shape.set_shape(unlocked_serial, wp_cursor_shape_device_v1::Shape::Pointer);
     queue
@@ -500,10 +515,8 @@ fn cursor_authority_replacement_and_artwork_deduplication() {
             "hidden",
             "default",
             "hidden",
-            "default",
             "text",
             "hidden",
-            "default",
             "pointer",
         ],
         "a stale shape, identical commits, and commits from a replaced cursor \

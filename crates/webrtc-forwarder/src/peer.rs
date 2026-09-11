@@ -12,39 +12,93 @@ use str0m::channel::ChannelId;
 use str0m::net::Receive;
 use str0m::{Candidate, Event, Input, Output, Rtc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use yas_wire::core::ClientHello;
 use yas_wire::{Decode, Encode, Extension, FrameCodec, PREFACE};
 
 const GATHER_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_NATIVE_CHANNELS_PER_PEER: usize = 64;
-/// How much unwritten client-to-server data one reliable channel may hold.
-///
-/// A full queue here is fatal — the channel is closed as over-budget — so the
-/// depth has to be what the protocol says a peer may have in flight, not a
-/// number that merely looks safe. One message deep meant a browser sending its
-/// preface and first HELLO back to back closed the share before it finished
-/// opening, because the writer task had not been scheduled between the two.
-///
-/// Bytes are what the budget is really about, and an mpsc bounds messages, so
-/// this is the recommended in-flight budget divided by the largest message
-/// that can occupy a slot.
-const PEER_INGRESS_PENDING_MESSAGES: usize = (yas_wire::schema::transport::RECOMMENDED_BUFFERED
-    / yas_wire::schema::transport::RECOMMENDED_WIRE_FRAME as u64)
-    as usize;
+/// Account unwritten bytes, including the chunk held by the writer. Dividing
+/// this allowance by the largest message yielded just 16 queue slots: a burst
+/// of tiny ACK/input requests could close a healthy connection after 1 KiB.
+const PEER_INGRESS_BUDGET_BYTES: usize = yas_wire::schema::transport::RECOMMENDED_BUFFERED as usize;
+/// A minimum charge also bounds queue metadata and tiny-message counts.
+const PEER_INGRESS_MIN_CHARGE: usize = 1024;
+const PEER_INGRESS_PENDING_MESSAGES: usize = PEER_INGRESS_BUDGET_BYTES / PEER_INGRESS_MIN_CHARGE;
 const PEER_INGRESS_MAX_MESSAGE: usize =
     yas_wire::schema::transport::RECOMMENDED_WIRE_FRAME as usize;
 const DATAGRAM_INGRESS_MESSAGES: usize = 64;
 const DATAGRAM_PAIR_TIMEOUT: Duration = Duration::from_secs(1);
 
-fn enqueue_peer_ingress(
-    sender: &mpsc::Sender<Vec<u8>>,
-    data: &[u8],
-) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
-    if data.len() > PEER_INGRESS_MAX_MESSAGE {
-        return Err(mpsc::error::TrySendError::Full(Vec::new()));
+#[derive(Debug, PartialEq, Eq)]
+enum IngressError {
+    MessageTooLarge,
+    ByteBudget,
+    QueueFull,
+    Closed,
+}
+
+#[derive(Debug)]
+struct IngressChunk {
+    bytes: Vec<u8>,
+    _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct ReliableIngressSender {
+    sender: mpsc::Sender<IngressChunk>,
+    budget: Arc<Semaphore>,
+}
+
+fn peer_ingress_channel() -> (ReliableIngressSender, mpsc::Receiver<IngressChunk>) {
+    let (sender, receiver) = mpsc::channel(PEER_INGRESS_PENDING_MESSAGES);
+    (
+        ReliableIngressSender {
+            sender,
+            budget: Arc::new(Semaphore::new(PEER_INGRESS_BUDGET_BYTES)),
+        },
+        receiver,
+    )
+}
+
+impl ReliableIngressSender {
+    fn enqueue(&self, data: &[u8]) -> Result<(), IngressError> {
+        if data.len() > PEER_INGRESS_MAX_MESSAGE {
+            return Err(IngressError::MessageTooLarge);
+        }
+        if self.sender.is_closed() {
+            return Err(IngressError::Closed);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        // Reserve before copying peer-controlled data. The writer keeps the
+        // permit until its write completes, so dequeueing cannot hide backlog.
+        let permit = self
+            .budget
+            .clone()
+            .try_acquire_many_owned(data.len().max(PEER_INGRESS_MIN_CHARGE) as u32)
+            .map_err(|_| IngressError::ByteBudget)?;
+        self.sender
+            .try_send(IngressChunk {
+                bytes: data.to_vec(),
+                _permit: permit,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => IngressError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => IngressError::Closed,
+            })
     }
-    sender.try_send(data.to_vec())
+
+    fn retained_bytes(&self) -> usize {
+        PEER_INGRESS_BUDGET_BYTES - self.budget.available_permits()
+    }
+}
+
+#[derive(Clone)]
+enum PeerIngress {
+    Reliable(ReliableIngressSender),
+    Datagram(mpsc::Sender<Vec<u8>>),
 }
 
 /// Client-to-server ingress for one native YAS byte stream.
@@ -172,7 +226,7 @@ pub type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 struct PeerChannelState {
     aborts: Arc<Vec<tokio::task::AbortHandle>>,
     available: Arc<AtomicBool>,
-    write_tx: mpsc::Sender<Vec<u8>>,
+    ingress: PeerIngress,
     datagram: bool,
     paired_with: Option<ChannelId>,
 }
@@ -319,7 +373,7 @@ async fn bridge_direct_channel(
     server_tx: mpsc::Sender<(ChannelId, Vec<u8>)>,
 ) -> Result<PeerChannelState, Box<dyn std::error::Error + Send + Sync>> {
     let (mut reader, mut writer) = connect_to_server(upstream).await?;
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(PEER_INGRESS_PENDING_MESSAGES);
+    let (write_tx, mut write_rx) = peer_ingress_channel();
     let read_task = tokio::spawn(async move {
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
@@ -340,7 +394,7 @@ async fn bridge_direct_channel(
     let write_task = tokio::spawn(async move {
         let mut ingress = ClientIngress::new(access);
         while let Some(data) = write_rx.recv().await {
-            match ingress.push(&data) {
+            match ingress.push(&data.bytes) {
                 Ok(Some(bytes)) if writer.write_all(&bytes).await.is_err() => break,
                 Ok(Some(_)) | Ok(None) => {}
                 Err(error) => {
@@ -354,7 +408,7 @@ async fn bridge_direct_channel(
     Ok(PeerChannelState {
         aborts,
         available,
-        write_tx,
+        ingress: PeerIngress::Reliable(write_tx),
         datagram: false,
         paired_with: None,
     })
@@ -391,8 +445,7 @@ async fn bridge_composite_channels(
     )
     .await?;
 
-    let (main_write_tx, mut main_write_rx) =
-        mpsc::channel::<Vec<u8>>(PEER_INGRESS_PENDING_MESSAGES);
+    let (main_write_tx, mut main_write_rx) = peer_ingress_channel();
     let (datagram_write_tx, datagram_write_rx) =
         mpsc::channel::<Vec<u8>>(DATAGRAM_INGRESS_MESSAGES);
 
@@ -417,7 +470,7 @@ async fn bridge_composite_channels(
     let main_write_task = tokio::spawn(async move {
         let mut ingress = ClientIngress::new(access);
         while let Some(data) = main_write_rx.recv().await {
-            match ingress.push(&data) {
+            match ingress.push(&data.bytes) {
                 Ok(Some(bytes)) if main_writer.write_all(&bytes).await.is_err() => break,
                 Ok(Some(_)) | Ok(None) => {}
                 Err(error) => {
@@ -445,14 +498,14 @@ async fn bridge_composite_channels(
         PeerChannelState {
             aborts: main_aborts,
             available: main_available,
-            write_tx: main_write_tx,
+            ingress: PeerIngress::Reliable(main_write_tx),
             datagram: false,
             paired_with: Some(datagram_cid),
         },
         PeerChannelState {
             aborts: datagram_aborts,
             available: datagram_available,
-            write_tx: datagram_write_tx,
+            ingress: PeerIngress::Datagram(datagram_write_tx),
             datagram: true,
             paired_with: Some(main_cid),
         },
@@ -865,7 +918,9 @@ pub async fn handle_peer(
                 Output::Event(ev) => {
                     match ev {
                         Event::ChannelOpen(cid, label) => {
-                            verbose!("data channel opened: {label}");
+                            verbose!(
+                                "data channel opened: {label} peer={peer_session_id} channel={cid:?}"
+                            );
                             ever_had_channel = true;
                             channels_empty_since = None;
                             if channels.len() + keepalive_channels.len() + pending_datagrams.len()
@@ -905,7 +960,11 @@ pub async fn handle_peer(
                                                 // Pre-pair traffic has the
                                                 // same bounded, lossy
                                                 // semantics as live traffic.
-                                                let _ = datagram.write_tx.try_send(frame);
+                                                if let PeerIngress::Datagram(sender) =
+                                                    &datagram.ingress
+                                                {
+                                                    let _ = sender.try_send(frame);
+                                                }
                                             }
                                             channels.insert(cid, main);
                                             channels.insert(datagram_cid, datagram);
@@ -949,19 +1008,23 @@ pub async fn handle_peer(
                             }
                         }
                         Event::ChannelData(cd) => {
-                            let overflowed = channels.get(&cd.id).is_some_and(|state| {
-                                if state.datagram {
-                                    if !cd.data.is_empty()
-                                        && cd.data.len() <= crate::MAX_DATAGRAM_SIZE
-                                    {
-                                        // A full sideband queue is packet
-                                        // loss, never reliable-stream
-                                        // backpressure.
-                                        let _ = state.write_tx.try_send(cd.data.to_vec());
+                            let failure = channels.get(&cd.id).and_then(|state| {
+                                match &state.ingress {
+                                    PeerIngress::Datagram(sender) => {
+                                        if !cd.data.is_empty()
+                                            && cd.data.len() <= crate::MAX_DATAGRAM_SIZE
+                                        {
+                                            // A full sideband queue is packet
+                                            // loss, never reliable-stream
+                                            // backpressure.
+                                            let _ = sender.try_send(cd.data.to_vec());
+                                        }
+                                        None
                                     }
-                                    false
-                                } else {
-                                    enqueue_peer_ingress(&state.write_tx, &cd.data).is_err()
+                                    PeerIngress::Reliable(sender) => sender
+                                        .enqueue(&cd.data)
+                                        .err()
+                                        .map(|error| (error, sender.retained_bytes())),
                                 }
                             });
                             if !channels.contains_key(&cd.id)
@@ -974,8 +1037,13 @@ pub async fn handle_peer(
                             {
                                 pending.frames.push_back(cd.data.to_vec());
                             }
-                            if overflowed {
-                                verbose!("closing over-budget native share channel");
+                            if let Some((error, retained)) = failure {
+                                verbose!(
+                                    "closing native share ingress: peer={peer_session_id} channel={:?} \
+                                     reason={error:?} message_bytes={} retained_bytes={retained} budget_bytes={PEER_INGRESS_BUDGET_BYTES}",
+                                    cd.id,
+                                    cd.data.len()
+                                );
                                 if let Some(state) = channels.remove(&cd.id) {
                                     state.abort();
                                     if let Some(paired) = state.paired_with {
@@ -996,7 +1064,7 @@ pub async fn handle_peer(
                             }
                         }
                         Event::ChannelClose(cid) => {
-                            verbose!("data channel closed");
+                            verbose!("data channel closed: peer={peer_session_id} channel={cid:?}");
                             keepalive_channels.remove(&cid);
                             if let Some(state) = channels.remove(&cid) {
                                 state.abort();
@@ -1033,7 +1101,7 @@ pub async fn handle_peer(
                             dtls_dedupe.dtls_connected();
                         }
                         Event::IceConnectionStateChange(state) => {
-                            verbose!("ICE state: {state:?}");
+                            verbose!("ICE state: {state:?} peer={peer_session_id}");
                             if matches!(state, str0m::IceConnectionState::Disconnected) {
                                 return Ok(());
                             }
@@ -1341,32 +1409,127 @@ mod tests {
     }
 
     #[test]
-    fn native_share_ingress_is_bounded_before_server_admission() {
-        let (sender, mut receiver) = mpsc::channel(PEER_INGRESS_PENDING_MESSAGES);
-        // A handshake arrives as several messages before anything drains one.
-        // Closing the share there is what "closing over-budget native share
-        // channel" was really reporting, so the queue has to survive a burst.
-        for byte in 0..PEER_INGRESS_PENDING_MESSAGES {
-            enqueue_peer_ingress(&sender, &[byte as u8]).unwrap();
+    fn native_share_ingress_accepts_small_request_bursts() {
+        let (sender, mut receiver) = peer_ingress_channel();
+        // A busy browser can batch ACKs, pointer input, and resize requests
+        // before the writer runs. This entire burst is only 4 KiB.
+        for marker in 0..64u8 {
+            sender.enqueue(&[marker; 64]).unwrap();
         }
-        assert!(matches!(
-            enqueue_peer_ingress(&sender, &[0xff]),
-            Err(mpsc::error::TrySendError::Full(_))
-        ));
-        assert_eq!(receiver.try_recv().unwrap(), vec![0]);
-        while receiver.try_recv().is_ok() {}
+        for marker in 0..64u8 {
+            assert_eq!(receiver.try_recv().unwrap().bytes, vec![marker; 64]);
+        }
+        assert_eq!(sender.retained_bytes(), 0);
+    }
 
-        // Oversized is refused on its own terms, and refused *before* it can
-        // occupy a slot: an empty queue stays empty.
-        let oversized = vec![0x5a; PEER_INGRESS_MAX_MESSAGE + 1];
-        assert!(matches!(
-            enqueue_peer_ingress(&sender, &oversized),
-            Err(mpsc::error::TrySendError::Full(bytes)) if bytes.is_empty()
-        ));
+    #[test]
+    fn native_share_ingress_counts_bytes_until_the_writer_finishes() {
+        let (sender, mut receiver) = peer_ingress_channel();
+        let maximum = vec![0x5a; PEER_INGRESS_MAX_MESSAGE];
+        for _ in 0..PEER_INGRESS_BUDGET_BYTES / maximum.len() {
+            sender.enqueue(&maximum).unwrap();
+        }
+        assert_eq!(sender.retained_bytes(), PEER_INGRESS_BUDGET_BYTES);
+        assert_eq!(sender.enqueue(&[1]), Err(IngressError::ByteBudget));
+
+        // Removing a chunk from the queue is not progress if its local socket
+        // write is still blocked. Only finishing/dropping that chunk releases
+        // space; the other queued chunks retain their reservations.
+        let writing = receiver.try_recv().unwrap();
+        assert_eq!(sender.enqueue(&[1]), Err(IngressError::ByteBudget));
+        drop(writing);
+        sender.enqueue(&maximum).unwrap();
+        assert_eq!(sender.retained_bytes(), PEER_INGRESS_BUDGET_BYTES);
+        drop(receiver);
+        assert_eq!(sender.retained_bytes(), 0);
+        assert_eq!(sender.enqueue(&[1]), Err(IngressError::Closed));
+    }
+
+    #[test]
+    fn native_share_ingress_bounds_tiny_messages_and_ignores_empty_messages() {
+        let (sender, mut receiver) = peer_ingress_channel();
+        for _ in 0..PEER_INGRESS_PENDING_MESSAGES + 1 {
+            sender.enqueue(&[]).unwrap();
+        }
+        assert_eq!(sender.retained_bytes(), 0);
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+        for _ in 0..PEER_INGRESS_PENDING_MESSAGES {
+            sender.enqueue(&[1]).unwrap();
+        }
+        assert_eq!(sender.enqueue(&[1]), Err(IngressError::ByteBudget));
+        drop(receiver.try_recv().unwrap());
+        sender.enqueue(&[2]).unwrap();
+    }
+
+    #[test]
+    fn native_share_ingress_rejects_oversized_messages_without_reserving_space() {
+        let (sender, mut receiver) = peer_ingress_channel();
+        assert_eq!(
+            sender.enqueue(&vec![0x5a; PEER_INGRESS_MAX_MESSAGE + 1]),
+            Err(IngressError::MessageTooLarge)
+        );
+        assert_eq!(sender.retained_bytes(), 0);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        sender.enqueue(&[1]).unwrap();
+        assert_eq!(receiver.try_recv().unwrap().bytes, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn native_share_burst_survives_a_blocked_hosted_writer() {
+        let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
+        let upstream = crate::Upstream {
+            hosted: Some(Arc::new(move || {
+                let (client, server) = tokio::io::duplex(64);
+                accepted_tx.send(server).unwrap();
+                Box::pin(async move {
+                    let (reader, writer) = tokio::io::split(client);
+                    Ok((
+                        Box::new(reader) as BoxedRead,
+                        Box::new(writer) as BoxedWrite,
+                    ))
+                })
+            })),
+            ..Default::default()
+        };
+        let mut rtc = Rtc::new(Instant::now());
+        let cid = rtc.sdp_api().add_channel("burst-test".into());
+        let (server_tx, _server_rx) = mpsc::channel(1);
+        let state = bridge_direct_channel(cid, crate::Access::ReadWrite, &upstream, server_tx)
+            .await
+            .unwrap();
+        let mut server = accepted_rx.recv().await.unwrap();
+        let PeerIngress::Reliable(sender) = &state.ingress else {
+            panic!("expected reliable ingress");
+        };
+        let mut expected = Vec::new();
+        for marker in 0..64u8 {
+            let chunk = [marker; 64];
+            sender.enqueue(&chunk).unwrap();
+            expected.extend_from_slice(&chunk);
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            sender.retained_bytes() > 0,
+            "blocked writes lost their reservation"
+        );
+        let mut actual = vec![0; expected.len()];
+        tokio::time::timeout(Duration::from_secs(2), async {
+            server.read_exact(&mut actual).await.unwrap();
+            while sender.retained_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the burst did not drain after the server resumed reading");
+        assert_eq!(actual, expected);
+        assert!(state.available.load(Ordering::Acquire));
+        state.abort();
     }
 
     #[tokio::test]

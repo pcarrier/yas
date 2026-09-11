@@ -24,6 +24,11 @@ const [armed, setArmed] = createSignal(false);
 /** True while the prefix is waiting for the key that chooses an action. */
 export const prefixArmed = armed;
 
+/** Open the same shortcut map from pointer or touch activation. */
+export function armPrefix(): void {
+  setArmed(true);
+}
+
 interface PrefixAction {
   run: () => void;
   /** What the key does, for the map shown while the prefix is armed. */
@@ -196,7 +201,7 @@ export function prefixToken(event: PrefixChord): string | null {
 export function handlePrefixKey(event: PrefixChord): boolean {
   if (!armed()) {
     if (!isPrefixChord(event)) return false;
-    setArmed(true);
+    armPrefix();
     return true;
   }
   const token = prefixToken(event);

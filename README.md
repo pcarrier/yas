@@ -181,6 +181,8 @@ automatically target that instance.
 
 ## Supported platforms
 
+For a GPU sandbox with Ubuntu, systemd, and browsers, see [YAS on Tensorlake](docs/tensorlake.md).
+
 | Platform | Arch          | Wayland compositor | Notes                 |
 | -------- | ------------- | ------------------ | --------------------- |
 | Linux    | x86_64, arm64 | Yes                | Full features         |

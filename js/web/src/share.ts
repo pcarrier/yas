@@ -101,7 +101,7 @@ async function main() {
       connections: [
         {
           id: "share",
-          label: "shared terminal",
+          label: "shared session",
           transport: shareTransport(
             HUB_URL,
             result.passphrase,
