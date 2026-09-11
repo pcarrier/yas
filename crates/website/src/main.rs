@@ -4,7 +4,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::header::{self, HeaderMap, HeaderValue};
 use axum::http::{Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use base64::Engine;
@@ -558,18 +558,64 @@ fn static_response(
     response
 }
 
+static RELEASE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("release HTTP client")
+});
+
 async fn release_asset(Path(file): Path<String>) -> Response {
+    proxy_release_asset(
+        &RELEASE_CLIENT,
+        "https://github.com/yas-run/yas/releases/latest/download",
+        &file,
+    )
+    .await
+}
+
+async fn proxy_release_asset(client: &reqwest::Client, base: &str, file: &str) -> Response {
     if file.is_empty()
+        || file == "."
+        || file == ".."
         || !file
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
     {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    Redirect::temporary(&format!(
-        "https://github.com/yas-run/yas/releases/latest/download/{file}"
-    ))
-    .into_response()
+    // Follow GitHub's redirects here: its download responses do not provide
+    // CORS headers, so redirecting the browser breaks extension registries.
+    let upstream = match client.get(format!("{base}/{file}")).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("yas-website: release asset {file}: {error}");
+            return (StatusCode::BAD_GATEWAY, "release download failed").into_response();
+        }
+    };
+    if upstream.status() == StatusCode::NOT_FOUND {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    if !upstream.status().is_success() {
+        return (StatusCode::BAD_GATEWAY, "release download failed").into_response();
+    }
+    let content_type = if file.ends_with(".json") {
+        "application/json"
+    } else if file.ends_with(".wasm") {
+        "application/wasm"
+    } else if file.ends_with(".js") {
+        "text/javascript"
+    } else {
+        "application/octet-stream"
+    };
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    response.headers_mut().extend([
+        (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+        // These URLs track the latest release, not immutable objects.
+        (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+    ]);
+    response
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -990,6 +1036,84 @@ mod tests {
         let response = root(HeaderMap::new()).await;
         assert_eq!(response.headers()[header::VARY], "Accept, User-Agent");
         assert!(response.headers().contains_key(header::ETAG));
+    }
+
+    #[tokio::test]
+    async fn release_registry_follows_redirects_and_serves_cors_bytes() {
+        let manifest = br#"{"extensions":[{"file":"doctor.js"}]}"#;
+        let module = b"export default 42;";
+        let upstream = Router::new()
+            .route(
+                "/latest/{file}",
+                get(|Path(file): Path<String>| async move {
+                    axum::response::Redirect::temporary(&format!("/assets/{file}"))
+                }),
+            )
+            .route(
+                "/assets/manifest.json",
+                get(|| async { manifest.as_slice() }),
+            )
+            .route("/assets/doctor.js", get(|| async { module.as_slice() }))
+            .route("/assets/broken", get(|| async { StatusCode::FORBIDDEN }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/latest", listener.local_addr().unwrap());
+        let upstream_task = tokio::spawn(async move { axum::serve(listener, upstream).await });
+        let website = Router::new()
+            .route(
+                "/ext/{file}",
+                get(move |Path(file): Path<String>| {
+                    let base = base.clone();
+                    async move { proxy_release_asset(&RELEASE_CLIENT, &base, &file).await }
+                }),
+            )
+            .layer(middleware::from_fn(cors));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/ext", listener.local_addr().unwrap());
+        let website_task = tokio::spawn(async move { axum::serve(listener, website).await });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        for (file, content_type, bytes) in [
+            ("manifest.json", "application/json", manifest.as_slice()),
+            (
+                "doctor.js?blake3=test",
+                "text/javascript",
+                module.as_slice(),
+            ),
+        ] {
+            let response = client
+                .get(format!("{base}/{file}"))
+                .header(header::ORIGIN, "http://localhost:10000")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!response.headers().contains_key(header::LOCATION));
+            assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+            assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
+        }
+        for (file, status) in [
+            ("missing", StatusCode::NOT_FOUND),
+            ("broken", StatusCode::BAD_GATEWAY),
+            ("bad%2Fname", StatusCode::NOT_FOUND),
+        ] {
+            let response = client.get(format!("{base}/{file}")).send().await.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        }
+        for file in ["", ".", "..", "../manifest.json"] {
+            assert_eq!(
+                proxy_release_asset(&client, "http://127.0.0.1:1", file)
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND,
+            );
+        }
+        upstream_task.abort();
+        website_task.abort();
     }
 
     #[test]

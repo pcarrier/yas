@@ -14,7 +14,8 @@ Requests to `/` receive the landing page only when `Accept` includes `text/html`
 All others receive the PowerShell installer for PowerShell user agents, or the
 shell installer otherwise. The scripts download stable-name assets directly
 from the latest [GitHub release](https://github.com/yas-run/yas/releases/latest).
-`/ext/<asset>` redirects to the same release.
+`/ext/<asset>` proxies assets from the same release with CORS headers so
+browsers can use `https://yas.run/ext` as an extension registry.
 
 Signaling messages are Ed25519-verified. Redis stores expiring presence and
 relays messages between instances. `yas share` and the `/s` browser client use

@@ -72,12 +72,13 @@ QuickJS receives one dependency-free `.js` file and does no build work.
 ## Where releases put them
 
 The release workflow builds these architecture-independent objects once and
-publishes them twice:
+publishes them as GitHub Release assets, available through two URL forms:
 
 - **`https://yas.run/ext/<file>`**, with
-  `https://yas.run/ext/manifest.json` beside it. Like `yas.run/bin`,
-  this is the _current_ release only — Pages publishes the tree wholesale, so
-  the previous version's bytes stop resolving when the next release lands.
+  `https://yas.run/ext/manifest.json` beside it. This is the _current_
+  release only. The website proxies the latest GitHub
+  Release with CORS headers; previous versions stop resolving here when the
+  next release lands.
 - **GitHub Release assets**, `…/releases/download/v<version>/<file>`. This
   is the durable home: a `#digest` pin outlives its version here and nowhere
   else.

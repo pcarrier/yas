@@ -7,6 +7,11 @@ between the two Fly Machines.
 `/` serves the landing page only when `Accept` includes `text/html`; otherwise
 it serves the PowerShell or shell installer based on the user agent.
 
+`/ext/<file>` proxies the latest GitHub Release assets, following download
+redirects on the server and returning CORS headers for browser extension
+registries. Responses use `Cache-Control: no-store` because these URLs track
+the latest release. Website deployments do not rebuild extensions.
+
 ## First deployment
 
 Use the `yas-887` Fly organization throughout:
