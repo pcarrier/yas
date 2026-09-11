@@ -39,6 +39,7 @@ yas-edge = { workspace = true }
 yas-proxy = { workspace = true }
 yas-webrtc-forwarder = { workspace = true }
 yas-composite-transport = { workspace = true }
+yas-uplink = { workspace = true }
 yas-ssh = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -64,3 +65,10 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = "0.14"
+tokio-rustls = "0.26"
+tokio-tungstenite = "0.29"
+
+[[example]]
+name = "uplink-e2e-fixture"
+path = "tests/support/uplink_browser.rs"

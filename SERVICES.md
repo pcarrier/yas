@@ -14,7 +14,8 @@ Requests to `/` receive the landing page only when `Accept` includes `text/html`
 All others receive the PowerShell installer for PowerShell user agents, or the
 shell installer otherwise. The scripts download stable-name assets directly
 from the latest [GitHub release](https://github.com/yas-run/yas/releases/latest).
-`/ext/<asset>` redirects to the same release.
+`/ext/<asset>` proxies assets from the same release with CORS headers so
+browsers can use `https://yas.run/ext` as an extension registry.
 
 Signaling messages are Ed25519-verified. Redis stores expiring presence and
 relays messages between instances. `yas share` and the `/s` browser client use
@@ -101,3 +102,23 @@ For Homebrew on macOS:
 ```sh
 brew services start yas
 ```
+
+## Uplink services
+
+A service running `yas uplink https://relay.example` needs
+`YAS_UPLINK_TOKEN` for control-plane routing, `YAS_UPLINK_IDENTITY` containing
+its X25519 private key as 43-character unpadded base64url, and `YAS_UPLINK_CLIENT_KEYS` containing
+the comma-separated public keys allowed to reach its YAS socket. Create the
+identity once with `yas uplink-keygen --private`. Supply the private key through
+the service environment to keep it out of process arguments. With that key in
+`YAS_UPLINK_IDENTITY`, `yas uplink-public-key` prints its public key, and
+`yas uplink-url https://relay.example` generates a connection URL using
+`YAS_UPLINK_CLIENT_TOKEN`. Keep the same identity across service restarts.
+Private keys do not belong on the relay.
+
+Consumers independently pin the producer's public key and use their own
+private identities. Keys and the producer allowlist are loaded at startup;
+restart the uplink service to apply rotation or revocation. Upgrading from
+bearer-only uplinks requires configuring both endpoints and updating consumer
+URIs. Relays must forward opaque TLS records and encrypted datagrams. See
+[uplink setup and protocol](docs/uplink.md).

@@ -339,6 +339,12 @@ export type TransportConfig =
       options?: YasTransportOptions;
     }
   | { type: "share"; hubUrl: string; passphrase: string; debug?: YasDebug }
+  | {
+      type: "uplink";
+      url: string;
+      identity: string;
+      options?: YasTransportOptions;
+    }
   | { type: "custom"; transport: YasTransport };
 
 export const DEFAULT_FONT = "ui-monospace, monospace";

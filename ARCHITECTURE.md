@@ -85,6 +85,7 @@ restartable; PTYs survive their restart.
 | `yas-edge`             | `crates/edge/`             | lib           | Authenticated fixed-home YAS WebSocket/WebTransport edge and web application host                                |
 | `yas-ssh`              | `crates/ssh/`              | lib           | Embedded SSH client (russh): ssh-agent auth, `~/.ssh/config`, `direct-streamlocal` channels                      |
 | `yas-proxy`            | `crates/proxy/`            | lib           | Native connection pool for socket, TCP, SSH, WebSocket, WebTransport, and WebRTC upstreams                       |
+| `yas-uplink`           | `crates/uplink/`           | lib           | End-to-end Noise IK with pinned X25519 identities, AES-GCM, and authenticated datagrams                          |
 | `yas` (CLI)            | `crates/cli/`              | bin           | Browser client, agent subcommands, SSH/proxy/share transports, `remote` management, `server`/`share` subcommands |
 | `yas-webrtc-forwarder` | `crates/webrtc-forwarder/` | lib           | WebRTC bridge: signaling, STUN/TURN NAT traversal, peer-to-peer data channels                                    |
 | `yas-fonts`            | `crates/fonts/`            | lib           | Server font catalogue, metadata, TTC extraction, embedding policy, and content hashing                           |
@@ -94,6 +95,16 @@ restartable; PTYs survive their restart.
 | `yas-sd-notify`        | `crates/sd-notify/`        | lib           | Tiny pure-`libc` `sd_notify(3)` for daemon readiness; no `libsystemd` dependency                                 |
 
 Each Rust crate is a single `lib.rs` or `main.rs`. Larger crates (`yas-server`, `yas-compositor`, `yas-cli`, `yas-webrtc-forwarder`) use a small number of sibling files in the same directory.
+
+The uplink producer in `yas-cli` and consumer in `yas-proxy` share `yas-uplink`.
+The relay carries opaque Noise IK records. The producer requires a locally
+allowlisted X25519 identity and fresh-session confirmation before opening local
+IPC; the consumer pins the producer independently of the control plane.
+Independent AES-GCM datagrams use directional session roots, counter-derived
+key epochs, and a replay window. Browser clients can connect directly with
+`YasUplinkTransport` using WebCrypto, or through a trusted home server's Relay
+connector. `YasNoiseTransport` also wraps custom opaque carriers with routed
+datagrams. See [uplink](docs/uplink.md).
 
 ### Dependency graph
 

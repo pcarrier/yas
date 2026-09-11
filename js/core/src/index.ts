@@ -327,3 +327,11 @@ export type {
   LayoutPane,
   LayoutAssignments,
 } from "./layout/tree";
+
+export { YasUplinkTransport } from "./transports/uplink";
+export { YasNoiseTransport } from "./transports/noise";
+export type { YasNoiseTransportOptions } from "./transports/noise";
+export {
+  generateUplinkKeyPair,
+  uplinkPublicKey,
+} from "./transports/uplink-crypto";

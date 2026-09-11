@@ -1,0 +1,68 @@
+{
+  "source": "Generated with Node OpenSSL HKDF-SHA256 and AES-256-GCM; disposable test material.",
+  "material": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "token": "07070707070707070707070707070707",
+  "plaintext": "696e646570656e64656e7420617564696f207061636b6574",
+  "packets": [
+    {
+      "direction": 0,
+      "counter": "0",
+      "ciphertext": "00000000000000004d899cf85ad80e610bb6a53d7d84b42ecc7a9f292b73900df71a43aa34fee42625a72aa96bfa71c2"
+    },
+    {
+      "direction": 0,
+      "counter": "1",
+      "ciphertext": "0000000000000001c87e9ce1f9e69d52d83b08b6d0e3a618e0b3633491f7a14ac923c2cc6698c2db0d12941ac6ac7abc"
+    },
+    {
+      "direction": 0,
+      "counter": "1048575",
+      "ciphertext": "00000000000fffffbacb48b3384fd3a7b149670c5dd465b5350b94bab30d0a19a102cdfc8461054a6a9f72d86c4779d5"
+    },
+    {
+      "direction": 0,
+      "counter": "1048576",
+      "ciphertext": "00000000001000004c10d8f985736d3c66d263aa415a5b26179210478b25b8878ce2b84225973886e49dc3d5c91305b9"
+    },
+    {
+      "direction": 0,
+      "counter": "1048580",
+      "ciphertext": "000000000010000480419e7c046636b9ba9201cf62d18a09b080a03f5f94f6aeab3f7081bd6745d86562e3c0de8202c7"
+    },
+    {
+      "direction": 0,
+      "counter": "18446744073709551615",
+      "ciphertext": "ffffffffffffffff222d090e0589a8b94161a405f87174f45f83933e999182de492a0d34e46d270095c828c62acfccd8"
+    },
+    {
+      "direction": 1,
+      "counter": "0",
+      "ciphertext": "000000000000000086743863dab471a3046531b674b1816608727c7e98cead4eb64a0a444320771d57eafc5f67cdb23a"
+    },
+    {
+      "direction": 1,
+      "counter": "1",
+      "ciphertext": "0000000000000001a6a97a60b73c65504e851873091f5e4fc5db9ab0c718c53a9a6d4e437d998441450e15b7fce86d30"
+    },
+    {
+      "direction": 1,
+      "counter": "1048575",
+      "ciphertext": "00000000000fffff45a9b780209700a04ec93b41f26e7d3f1e2d1337d361bea0e0adda6127ff54849374f6fc1febc3d3"
+    },
+    {
+      "direction": 1,
+      "counter": "1048576",
+      "ciphertext": "0000000000100000958f139325840eb5f527218d6618b9bea3fa8fd5d5381119bba3aca20a55a7e4cf12c2b6015cd716"
+    },
+    {
+      "direction": 1,
+      "counter": "1048580",
+      "ciphertext": "00000000001000040d1c3a87fc8c8fae37ae0544d2aa3ce5cf16e1c50ce44c63441f25db075c572bb51a49d35d0ce323"
+    },
+    {
+      "direction": 1,
+      "counter": "18446744073709551615",
+      "ciphertext": "ffffffffffffffffea76746bcd27743195fa50ebb785c015248f52acbfaf4520cc6435b20864379271334ccbe54c5eec"
+    }
+  ]
+}

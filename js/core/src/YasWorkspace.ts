@@ -1,3 +1,4 @@
+import { YasUplinkTransport } from "./transports/uplink";
 import { YasNativeWorkspaceConnection } from "./YasNativeWorkspaceConnection";
 import type { AwaitSessionExitOptions } from "./workspaceConnectionTypes";
 import type {
@@ -835,6 +836,12 @@ function resolveNativeTransport(
         config.hubUrl,
         config.passphrase,
         config.debug,
+      );
+    case "uplink":
+      return new YasUplinkTransport(
+        config.url,
+        config.identity,
+        config.options,
       );
     case "custom":
       return config.transport;

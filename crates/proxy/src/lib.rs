@@ -600,6 +600,10 @@ pub async fn connect_yas_upstream_split(
     ),
     String,
 > {
+    if let Some(rest) = uri.strip_prefix("uplink:") {
+        let conn = connect_uplink(rest).await?;
+        return Ok((conn.reader, conn.writer));
+    }
     if let Some(rest) = uri.strip_prefix("share:") {
         let conn = connect_share(rest).await?;
         return Ok((conn.reader, conn.writer));
@@ -619,7 +623,7 @@ pub async fn connect_yas_upstream_split(
     } else {
         return Err(format!(
             "unsupported native YAS upstream scheme in '{uri}' \
-             (expected socket:, tcp:, ws://, wss://, wt://, share:, or ssh:)"
+             (expected socket:, tcp:, ws://, wss://, wt://, share:, uplink:, or ssh:)"
         ));
     };
     Ok((conn.reader, conn.writer))
@@ -680,25 +684,127 @@ async fn connect_share(rest: &str) -> Result<UpstreamConn, String> {
 // Uplink relay consumers
 // ---------------------------------------------------------------------------
 
-/// Split `uplink:` URI rest into (token, control_url).
-///
-/// Accepted forms:
-///   `https://relay.example#TOKEN`
-fn parse_uplink_uri(rest: &str) -> Result<(String, String), String> {
-    let (control_raw, token_raw) = rest
-        .rsplit_once('#')
-        .ok_or("uplink: remote requires uplink:<control-url>#<token>")?;
-    let control = percent_decode(control_raw)
-        .trim_end_matches('/')
-        .to_string();
-    if control.is_empty() {
-        return Err("uplink: remote requires a control URL".into());
+struct UplinkTarget {
+    control: url::Url,
+    token: String,
+    server: yas_uplink::PublicKey,
+    identity: yas_uplink::Identity,
+}
+
+/// Materialize the calling process's environment identity only in memory, so
+/// an existing proxy receives this invocation's key over authenticated IPC.
+/// Explicit URI identities take precedence. Other target types are unchanged.
+pub fn prepare_uplink_uri(uri: &str) -> Result<String, String> {
+    prepare_uplink_uri_with(uri, || match std::env::var("YAS_UPLINK_IDENTITY") {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err("YAS_UPLINK_IDENTITY must be unpadded base64url".into()),
+    })
+}
+
+fn prepare_uplink_uri_with(
+    uri: &str,
+    environment: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<String, String> {
+    let Some(rest) = uri.strip_prefix("uplink:") else {
+        return Ok(uri.to_owned());
+    };
+    let mut url = url::Url::parse(rest).map_err(|_| "uplink: invalid control URL")?;
+    let fragment = url.fragment().unwrap_or_default();
+    if url::form_urlencoded::parse(fragment.as_bytes()).any(|(name, _)| name == "identity") {
+        return Ok(uri.to_owned());
     }
-    let token = percent_decode(token_raw);
-    if token.is_empty() {
-        return Err("uplink: remote requires a token after #".into());
+    let Some(identity) = environment()? else {
+        return Ok(uri.to_owned());
+    };
+    yas_uplink::Identity::from_base64(&identity)?;
+    let mut fields = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in url::form_urlencoded::parse(fragment.as_bytes()) {
+        fields.append_pair(&name, &value);
     }
-    Ok((token, control))
+    fields.append_pair("identity", &identity);
+    url.set_fragment(Some(&fields.finish()));
+    Ok(format!("uplink:{url}"))
+}
+
+/// All fragment fields are local. Only `token` goes to the control plane;
+/// the server pin and private identity cannot come from its response.
+fn parse_uplink_uri(rest: &str) -> Result<UplinkTarget, String> {
+    let prepared = prepare_uplink_uri(&format!("uplink:{rest}"))?;
+    let rest = prepared
+        .strip_prefix("uplink:")
+        .expect("prepared uplink URI");
+    let mut control = url::Url::parse(rest).map_err(|_| "uplink: invalid control URL")?;
+    if control.scheme() != "https"
+        || control.host_str().is_none()
+        || !control.username().is_empty()
+        || control.password().is_some()
+        || control.query().is_some()
+    {
+        return Err(
+            "uplink: control URL must be HTTPS without userinfo or query parameters".into(),
+        );
+    }
+    let fragment = control
+        .fragment()
+        .ok_or("uplink: requires #token=TOKEN&server=PUBLIC_KEY and YAS_UPLINK_IDENTITY or identity=PRIVATE_KEY")?;
+    let (mut token, mut server, mut identity) = (None, None, None);
+    for (name, value) in url::form_urlencoded::parse(fragment.as_bytes()) {
+        let slot = match name.as_ref() {
+            "token" => &mut token,
+            "server" => &mut server,
+            "identity" => &mut identity,
+            _ => {
+                return Err(
+                    "uplink: unknown fragment field; requires token, server, identity".into(),
+                );
+            }
+        };
+        if slot.is_some() || value.is_empty() {
+            return Err("uplink: duplicate or empty fragment field".into());
+        }
+        *slot = Some(value.into_owned());
+    }
+    let token = token.ok_or("uplink: missing token")?;
+    let server = server
+        .ok_or("uplink: missing pinned server public key")?
+        .parse()?;
+    let identity = yas_uplink::Identity::from_base64(
+        &identity.ok_or("uplink: set YAS_UPLINK_IDENTITY or supply identity=PRIVATE_KEY")?,
+    )?;
+    control.set_fragment(None);
+    control.set_path(&format!("{}/attach", control.path().trim_end_matches('/')));
+    Ok(UplinkTarget {
+        control,
+        token,
+        server,
+        identity,
+    })
+}
+
+/// HTTPS control client with the same explicit CA override semantics as the
+/// WSS and WebTransport legs. Reqwest's platform verifier otherwise ignores
+/// SSL_CERT_FILE/SSL_CERT_DIR on macOS.
+pub fn uplink_http_client() -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none());
+    if std::env::var_os("SSL_CERT_FILE").is_some() || std::env::var_os("SSL_CERT_DIR").is_some() {
+        let roots = rustls_native_certs::load_native_certs();
+        if roots.certs.is_empty() {
+            return Err("uplink: explicit CA configuration contains no certificates".into());
+        }
+        let certs = roots
+            .certs
+            .iter()
+            .map(|cert| reqwest::Certificate::from_der(cert.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "uplink: invalid CA certificate")?;
+        builder = builder.tls_certs_only(certs);
+    }
+    builder
+        .build()
+        .map_err(|_| "uplink: HTTP client setup failed".into())
 }
 
 /// Resolve an `uplink:` remote: ask the control plane where the
@@ -706,33 +812,51 @@ fn parse_uplink_uri(rest: &str) -> Result<(String, String), String> {
 /// uplink is connected), then attach over WebSocket with the token as the
 /// auth passphrase.  The token is a credential — never log it.
 async fn connect_uplink(rest: &str) -> Result<UpstreamConn, String> {
-    let (token, control) = parse_uplink_uri(rest)?;
-    if token.is_empty() {
-        return Err("uplink: remote requires a token".into());
-    }
-    let attach = format!("{control}/attach");
-    let resp = reqwest::Client::new()
-        .get(&attach)
-        .header("authorization", format!("Bearer {token}"))
+    let target = parse_uplink_uri(rest)?;
+    let crypto = target.identity.client_config(target.server)?;
+    let resp = uplink_http_client()?
+        .get(target.control)
+        .header("authorization", format!("Bearer {}", target.token))
         .header("accept", "application/json")
         .send()
         .await
-        .map_err(|e| format!("{attach}: {e}"))?;
+        .map_err(|_| "uplink: attach request failed")?;
     match resp.status().as_u16() {
         200 => {}
-        401 | 403 => return Err(format!("{attach}: token rejected ({})", resp.status())),
-        404 => return Err(format!("{attach}: session has no connected uplink")),
-        s => return Err(format!("{attach}: HTTP {s}")),
+        401 | 403 => return Err("uplink: token rejected".into()),
+        404 => return Err("uplink: session has no connected uplink".into()),
+        s => return Err(format!("uplink: attach HTTP {s}")),
     }
     let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("{attach}: bad response: {e}"))?;
+        .map_err(|_| "uplink: invalid attach response")?;
     let ws = body
         .get("ws")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("{attach}: response missing \"ws\""))?;
-    connect_ws(ws, Some(&token)).await
+        .ok_or("uplink: attach response missing ws")?;
+    let worker = url::Url::parse(ws).map_err(|_| "uplink: invalid worker URL")?;
+    if worker.scheme() != "wss"
+        || !worker.username().is_empty()
+        || worker.password().is_some()
+        || worker.fragment().is_some()
+    {
+        return Err("uplink: worker URL must be WSS without userinfo or a fragment".into());
+    }
+    // The worker carries opaque Noise records, not standalone yas.v1 messages.
+    // Suppress worker-controlled URLs and error text, which may contain tokens.
+    let conn = connect_ws_mode(worker.as_str(), Some(&target.token), WsMode::Bytes)
+        .await
+        .map_err(|_| "uplink: worker connection failed")?;
+    let stream = tokio::io::join(conn.reader, conn.writer);
+    let stream = yas_uplink::connect(stream, crypto)
+        .await
+        .map_err(|_| "uplink: end-to-end authentication failed")?;
+    let (reader, writer) = tokio::io::split(stream);
+    Ok(UpstreamConn {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+    })
 }
 
 /// Public entry point for direct (non-daemon) `uplink:` connections, used by
@@ -893,17 +1017,24 @@ async fn connect_tcp(addr: &str) -> Result<UpstreamConn, String> {
 }
 
 async fn connect_ws(uri: &str, passphrase: Option<&str>) -> Result<UpstreamConn, String> {
-    connect_ws_mode(uri, passphrase, false).await
+    connect_ws_mode(uri, passphrase, WsMode::Frames).await
 }
 
 async fn connect_ws_yas(uri: &str, passphrase: Option<&str>) -> Result<UpstreamConn, String> {
-    connect_ws_mode(uri, passphrase, true).await
+    connect_ws_mode(uri, passphrase, WsMode::Yas).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WsMode {
+    Frames,
+    Yas,
+    Bytes,
 }
 
 async fn connect_ws_mode(
     uri: &str,
     passphrase: Option<&str>,
-    yas: bool,
+    mode: WsMode,
 ) -> Result<UpstreamConn, String> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
@@ -911,7 +1042,7 @@ async fn connect_ws_mode(
     let mut request = uri
         .into_client_request()
         .map_err(|error| format!("{uri}: {error}"))?;
-    if yas {
+    if mode == WsMode::Yas {
         request.headers_mut().insert(
             "sec-websocket-protocol",
             yas_wire::schema::transport::WEBSOCKET_SUBPROTOCOL
@@ -919,10 +1050,15 @@ async fn connect_ws_mode(
                 .expect("generated WebSocket protocol is a valid header value"),
         );
     }
-    let (mut ws, response) = tokio_tungstenite::connect_async(request)
+    let config = (mode == WsMode::Bytes).then(|| {
+        tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(64 * 1024))
+            .max_frame_size(Some(64 * 1024))
+    });
+    let (mut ws, response) = tokio_tungstenite::connect_async_with_config(request, config, false)
         .await
         .map_err(|e| format!("{uri}: {e}"))?;
-    if yas
+    if mode == WsMode::Yas
         && response
             .headers()
             .get("sec-websocket-protocol")
@@ -954,12 +1090,13 @@ async fn connect_ws_mode(
         reader: Box::new(WsFrameReader {
             inner: ws_read,
             buf: bytes::Bytes::new(),
+            frame_lengths: mode != WsMode::Bytes,
         }),
-        writer: Box::new(if yas {
-            WsFrameWriter::new_yas(ws_write)
-        } else {
-            WsFrameWriter::new(ws_write)
-        }),
+        writer: match mode {
+            WsMode::Yas => Box::new(WsFrameWriter::new_yas(ws_write)),
+            WsMode::Frames => Box::new(WsFrameWriter::new(ws_write)),
+            WsMode::Bytes => Box::new(WsByteWriter { inner: ws_write }),
+        },
     })
 }
 
@@ -1077,6 +1214,7 @@ type WsStream = futures_util::stream::SplitStream<
 struct WsFrameReader {
     inner: WsStream,
     buf: bytes::Bytes,
+    frame_lengths: bool,
 }
 
 impl AsyncRead for WsFrameReader {
@@ -1104,6 +1242,10 @@ impl AsyncRead for WsFrameReader {
                         Message::Close(_) => return std::task::Poll::Ready(Ok(())),
                         _ => continue,
                     };
+                    if !self.frame_lengths {
+                        self.buf = data;
+                        continue;
+                    }
                     let len = data.len() as u32;
                     let mut framed = Vec::with_capacity(4 + data.len());
                     framed.extend_from_slice(&len.to_le_bytes());
@@ -1112,6 +1254,50 @@ impl AsyncRead for WsFrameReader {
                 }
             }
         }
+    }
+}
+
+/// Opaque stream chunks for inner Noise. Never interpret ciphertext as YAS
+/// lengths or remove/add framing bytes. Bound each outgoing message.
+struct WsByteWriter {
+    inner: WsSink,
+}
+
+impl AsyncWrite for WsByteWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        std::task::ready!(self.inner.poll_ready_unpin(cx)).map_err(std::io::Error::other)?;
+        let count = buf.len().min(16 * 1024);
+        self.inner
+            .start_send_unpin(Message::Binary(bytes::Bytes::copy_from_slice(
+                &buf[..count],
+            )))
+            .map_err(std::io::Error::other)?;
+        std::task::Poll::Ready(Ok(count))
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.inner
+            .poll_flush_unpin(cx)
+            .map_err(std::io::Error::other)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Inner Noise carries the half-close. Closing the WebSocket here would
+        // prevent the other direction from delivering its final response.
+        self.inner
+            .poll_flush_unpin(cx)
+            .map_err(std::io::Error::other)
     }
 }
 
@@ -1937,13 +2123,171 @@ mod tests {
     #[test]
     fn parse_uplink_uri_forms() {
         assert!(parse_uplink_uri("eyJhbGciOi.eyJzaWQi.sig").is_err());
-
-        let (token, control) = parse_uplink_uri("https://relay.example/#tok123").unwrap();
-        assert_eq!(token, "tok123");
-        assert_eq!(control, "https://relay.example");
-
+        assert!(parse_uplink_uri("https://relay.example/#tok123").is_err());
+        let (private, public) = yas_uplink::Identity::generate().unwrap();
+        let key = public.to_string();
+        let fragment = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("token", "secret&+#token")
+            .append_pair("server", &key)
+            .append_pair("identity", private.as_str())
+            .finish();
+        let uri = format!("https://relay.example/base/#{fragment}");
+        let parsed = parse_uplink_uri(&uri).unwrap();
+        assert_eq!(parsed.token, "secret&+#token");
+        assert_eq!(parsed.control.as_str(), "https://relay.example/base/attach");
+        assert_eq!(parsed.server.to_string(), key);
+        assert_eq!(parsed.identity.public_key(), public);
+        for bad in [
+            uri.replace("https:", "http:"),
+            uri.replace("relay.example", "user:password@relay.example"),
+            uri.replace("/#", "/?query=1#"),
+            format!("{uri}&server={key}"),
+            format!("{uri}&unknown=1"),
+            format!("https://relay.example#token=x&server={key}&identity=/path/to/key"),
+            uri.replace(&key, "invalid"),
+        ] {
+            assert!(parse_uplink_uri(&bad).is_err());
+        }
         assert!(parse_uplink_uri("https://relay.example#").is_err());
         assert!(parse_uplink_uri("#tok123").is_err());
+    }
+
+    #[test]
+    fn environment_identity_is_materialized_for_ipc_without_changing_the_saved_uri() {
+        let (private, public) = yas_uplink::Identity::generate().unwrap();
+        let original = format!("uplink:https://relay.example#token=routing&server={public}");
+        let prepared =
+            prepare_uplink_uri_with(&original, || Ok(Some(private.to_string()))).unwrap();
+        assert!(!original.contains(private.as_str()));
+        let target = parse_uplink_uri(prepared.strip_prefix("uplink:").unwrap()).unwrap();
+        assert_eq!(target.identity.public_key(), public);
+        assert_eq!(target.control.as_str(), "https://relay.example/attach");
+        assert_eq!(target.token, "routing");
+        // A materialized invocation must ignore a pre-existing proxy's key.
+        assert_eq!(
+            prepare_uplink_uri_with(&prepared, || panic!("explicit identity must win")).unwrap(),
+            prepared
+        );
+        assert_eq!(
+            prepare_uplink_uri_with(&original, || Ok(None)).unwrap(),
+            original
+        );
+        let invalid = "not-a-valid-private-key";
+        let error = prepare_uplink_uri_with(&original, || Ok(Some(invalid.into()))).unwrap_err();
+        assert!(!error.contains(invalid));
+        assert!(prepare_uplink_uri_with(&original, || Ok(Some(String::new()))).is_err());
+        assert_eq!(
+            prepare_uplink_uri_with("ssh:host", || panic!("unrelated transport")).unwrap(),
+            "ssh:host"
+        );
+    }
+
+    #[tokio::test]
+    async fn uplink_noise_survives_websocket_rechunking_and_half_close() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (server_key, server_public) = yas_uplink::Identity::generate().unwrap();
+            let (client_key, client_public) = yas_uplink::Identity::generate().unwrap();
+            let server_config = yas_uplink::Identity::from_base64(&server_key)
+                .unwrap()
+                .server_config(vec![client_public])
+                .unwrap();
+            let client_config = yas_uplink::Identity::from_base64(&client_key)
+                .unwrap()
+                .client_config(server_public)
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let secret = b"private uplink payload".repeat(8192);
+            let expected = secret.clone();
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let capture = captured.clone();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                assert_eq!(
+                    ws.next().await.unwrap().unwrap(),
+                    Message::Text("routing-token".into())
+                );
+                ws.send(Message::Text("ok".into())).await.unwrap();
+                let (mut ws_write, mut ws_read) = ws.split();
+                let (relay, endpoint) = tokio::io::duplex(4096);
+                let (mut relay_read, mut relay_write) = tokio::io::split(relay);
+                let down = tokio::spawn(async move {
+                    while let Some(Ok(Message::Binary(bytes))) = ws_read.next().await {
+                        capture.lock().unwrap().extend_from_slice(&bytes);
+                        if relay_write.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let up = tokio::spawn(async move {
+                    let mut buffer = [0; 4096];
+                    while let Ok(count) = relay_read.read(&mut buffer).await {
+                        if count == 0 {
+                            break;
+                        }
+                        for chunk in buffer[..count].chunks(113) {
+                            if ws_write
+                                .send(Message::Binary(chunk.to_vec().into()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+                let mut stream = yas_uplink::accept(endpoint, server_config).await.unwrap();
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                assert_eq!(
+                    &received[..yas_wire::PREFACE.len()],
+                    yas_wire::PREFACE.as_slice()
+                );
+                assert_eq!(&received[yas_wire::PREFACE.len()..], &expected);
+                stream
+                    .write_all(b"response after half-close")
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                drop(stream);
+                up.await.unwrap();
+                down.abort();
+            });
+            let conn = connect_ws_mode(
+                &format!("ws://{addr}"),
+                Some("routing-token"),
+                WsMode::Bytes,
+            )
+            .await
+            .unwrap();
+            let mut stream =
+                yas_uplink::connect(tokio::io::join(conn.reader, conn.writer), client_config)
+                    .await
+                    .unwrap();
+            stream
+                .write_all(yas_wire::PREFACE.as_slice())
+                .await
+                .unwrap();
+            for chunk in secret.chunks(997) {
+                stream.write_all(chunk).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            stream.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"response after half-close");
+            server.await.unwrap();
+            assert!(
+                !captured
+                    .lock()
+                    .unwrap()
+                    .windows(22)
+                    .any(|w| w == b"private uplink payload")
+            );
+        })
+        .await
+        .expect("uplink Noise over WebSocket stalled");
     }
 
     #[test]

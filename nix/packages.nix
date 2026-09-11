@@ -98,6 +98,20 @@
           }
         );
       yas = mkYas "yas" "";
+      uplinkE2eFixture = craneLib.buildPackage (
+        commonArgs
+        // {
+          pname = "yas-uplink-e2e-fixture";
+          inherit cargoArtifacts;
+          cargoExtraArgs = "-p yas-cli --example uplink-e2e-fixture";
+          doCheck = false;
+          preBuild = copyWebAppDist;
+          installPhaseCommand = ''
+            mkdir -p $out/bin
+            cp target/release/examples/uplink-e2e-fixture $out/bin/
+          '';
+        }
+      );
       # GPL flavor (x264 instead of openh264; see the release-binaries
       # comment below).
       yas-gpl = mkYas "yas-gpl" gplFeatureArgs;
@@ -539,6 +553,7 @@
           webDist
           rustToolchain
           testDbusSessionConfig
+          uplinkE2eFixture
           ;
         yas-release-musl = if pkgs.stdenv.hostPlatform.isLinux then yas-release-musl else null;
         yas-release-gnu-gpl = if pkgs.stdenv.hostPlatform.isLinux then yas-release-gnu-gpl else null;

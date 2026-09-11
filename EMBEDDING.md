@@ -357,3 +357,22 @@ workspace.subscribe(() => {
 
 - [Python](examples/fd-channel-python.py)
 - [Bun](examples/fd-channel-bun.ts)
+
+## Uplink connections
+
+`@yas-run/core/transports` exports `YasUplinkTransport`, which connects directly
+through an uplink relay using browser WebCrypto (X25519, AES-GCM, SHA-256).
+Pass the producer's pinned connection URL and the client's 43-character
+base64url private key separately: `new YasUplinkTransport(url, privateKey)`.
+`generateUplinkKeyPair()` generates an identity and `uplinkPublicKey(privateKey)`
+derives its public key. Authorize that public key on the producer.
+
+`YasWorkspace` accepts the equivalent
+`{ type: "uplink", url, identity: privateKey }` transport configuration.
+Identity storage belongs to the embedding app; the transport does not persist
+keys. The app must be served from a trusted origin independently of the relay,
+and the relay control endpoint must permit that origin through CORS.
+
+`YasNoiseTransport` wraps custom opaque carriers and supports optional encrypted
+routed datagrams. See [the uplink protocol](docs/uplink.md#browser-embedding) for
+carrier requirements, limits, key rotation, and migration from Ed25519/TLS.

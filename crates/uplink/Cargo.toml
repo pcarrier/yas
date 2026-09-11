@@ -1,0 +1,20 @@
+[package]
+name = "yas-uplink"
+version = "0.1.4"
+edition.workspace = true
+description = "End-to-end authenticated YAS uplink transport"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+base64 = "0.22"
+ring = "0.17"
+zeroize = "1"
+snow = { version = "0.10", features = ["ring-accelerated"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+tokio = { version = "1", features = ["io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "test-util", "io-std"] }
+serde_json = "1"

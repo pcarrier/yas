@@ -456,9 +456,11 @@ async fn connect_via_native_proxy_at(
         read_proxy_handshake_line(&mut stream),
     )
     .await
-    .map_err(|_| format!("yas-proxy: timed out connecting to {upstream_uri}"))??;
+    .map_err(|_| "yas-proxy: timed out connecting to upstream".to_owned())??;
     if response == "ok" {
         Ok(Transport::Unix(stream))
+    } else if upstream_uri.starts_with("uplink:") {
+        Err("yas-proxy: uplink connection failed".into())
     } else if let Some(message) = response.strip_prefix("error ") {
         Err(format!("yas-proxy: {message}"))
     } else {
@@ -470,6 +472,8 @@ async fn connect_via_native_proxy_at(
 /// selector. In particular, this resolves SSH to the canonical socket and
 /// negotiates `yas.v1` for WebSocket.
 pub async fn connect_via_native_proxy(upstream_uri: &str) -> Result<Transport, String> {
+    let prepared = yas_proxy::prepare_uplink_uri(upstream_uri)?;
+    let upstream_uri = prepared.as_str();
     let socket = ensure_proxy().await?;
 
     #[cfg(unix)]
@@ -498,9 +502,12 @@ pub async fn connect_via_native_proxy(upstream_uri: &str) -> Result<Transport, S
             read_proxy_handshake_line(&mut stream),
         )
         .await
-        .map_err(|_| format!("yas-proxy: timed out connecting to {upstream_uri}"))??;
+        .map_err(|_| "yas-proxy: timed out connecting to upstream".to_owned())??;
         if response == "ok" {
             return Ok(Transport::NamedPipe(stream));
+        }
+        if upstream_uri.starts_with("uplink:") {
+            return Err("yas-proxy: uplink connection failed".into());
         }
         if let Some(message) = response.strip_prefix("error ") {
             return Err(format!("yas-proxy: {message}"));
@@ -723,9 +730,10 @@ async fn connect_native_uri_inner(
         return connect_native_upstream(uri).await;
     }
     if uri.starts_with("uplink:") {
-        return Err(format!(
-            "{uri}: native YAS uplink attachment requires a YAS-aware uplink endpoint"
-        ));
+        if proxy_enabled() {
+            return connect_via_native_proxy(uri).await;
+        }
+        return connect_native_upstream(uri).await;
     }
     if let Some(path) = uri.strip_prefix("socket:") {
         return connect_ipc(path).await;

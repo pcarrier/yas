@@ -2,8 +2,8 @@
 //!
 //! Authenticates to an HTTPS control endpoint with `YAS_UPLINK_TOKEN`,
 //! receives a pool of WebTransport relays,
-//! establish a session with one, and bridge each relay-initiated
-//! bidirectional stream to the local yas server socket.
+//! establishes a session with one, authenticates each consumer using pinned
+//! X25519 keys over Noise IK, then bridges decrypted streams to local YAS.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,6 +21,47 @@ const DATAGRAM_QUEUE: usize = 64;
 
 type DatagramRoutes = yas_composite_transport::RoutedDatagramRoutes;
 
+/// Derive only the public identity; private input never appears in diagnostics.
+pub fn public_key_from_env() -> Result<yas_uplink::PublicKey, String> {
+    let encoded = std::env::var("YAS_UPLINK_IDENTITY").map_err(|error| match error {
+        std::env::VarError::NotPresent =>
+            "YAS_UPLINK_IDENTITY is not set; load your existing private key or generate one with yas uplink-keygen --private".to_owned(),
+        std::env::VarError::NotUnicode(_) =>
+            "YAS_UPLINK_IDENTITY must be 43 characters of unpadded base64url".to_owned(),
+    })?;
+    yas_uplink::Identity::from_base64(&encoded)
+        .map(|identity| identity.public_key())
+        .map_err(|error| format!("YAS_UPLINK_IDENTITY: {error}"))
+}
+
+/// Build a consumer URI offline, with a locally derived server pin. The client
+/// token is distinct from the producer token; only the relay can issue it.
+pub fn connection_url(control: &str, client_token: &str) -> Result<String, String> {
+    let mut url = url::Url::parse(control).map_err(|_| "invalid uplink control URL")?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "uplink control URL must be HTTPS without userinfo, query parameters, or a fragment"
+                .into(),
+        );
+    }
+    if client_token.trim().is_empty() || client_token.chars().any(char::is_control) {
+        return Err("client token must be nonempty and contain no control characters".into());
+    }
+    let public = public_key_from_env()?;
+    let fragment = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("token", client_token)
+        .append_pair("server", &public.to_string())
+        .finish();
+    url.set_fragment(Some(&fragment));
+    Ok(format!("uplink:{url}"))
+}
+
 struct Relay {
     /// Connection URL as minted by the control plane (fragment stripped).
     /// The URL is the session credential — never log it; use `label`.
@@ -32,7 +73,25 @@ struct Relay {
     cert_hash: Option<Vec<u8>>,
 }
 
-pub async fn cmd_uplink(url: String) -> Result<(), String> {
+pub async fn cmd_uplink(
+    url: String,
+    identity: String,
+    allow_client: Vec<String>,
+) -> Result<(), String> {
+    let identity = yas_uplink::Identity::from_base64(&identity)?;
+    let allowed = allow_client
+        .iter()
+        .map(|key| key.parse())
+        .collect::<Result<Vec<_>, _>>()?;
+    let crypto = identity.server_config(allowed)?;
+    let control = url::Url::parse(&url).map_err(|_| "invalid uplink control URL")?;
+    if control.scheme() != "https"
+        || !control.username().is_empty()
+        || control.password().is_some()
+        || control.fragment().is_some()
+    {
+        return Err("uplink control URL must be HTTPS without userinfo or a fragment".into());
+    }
     let token = std::env::var("YAS_UPLINK_TOKEN").unwrap_or_default();
     if token.is_empty() {
         return Err("YAS_UPLINK_TOKEN is not set".into());
@@ -50,7 +109,7 @@ pub async fn cmd_uplink(url: String) -> Result<(), String> {
             }
             Ok(())
         }
-        result = run_loop(&url, &token, current) => result,
+        result = run_loop(&url, &token, current, crypto) => result,
     }
 }
 
@@ -58,8 +117,9 @@ async fn run_loop(
     url: &str,
     token: &str,
     current: Arc<Mutex<Option<wt::Session>>>,
+    crypto: Arc<yas_uplink::ServerConfig>,
 ) -> Result<(), String> {
-    let http = reqwest::Client::new();
+    let http = yas_proxy::uplink_http_client()?;
     let mut backoff = INITIAL_BACKOFF;
 
     loop {
@@ -84,7 +144,7 @@ async fn run_loop(
         // docs/uplink.md.
         let mut established = false;
         for relay in &pool {
-            match run_session(relay, &current).await {
+            match run_session(relay, &current, crypto.clone()).await {
                 SessionEnd::Ended(reason) => {
                     eprintln!("[uplink] session ended: {reason}");
                     established = true;
@@ -263,7 +323,11 @@ enum SessionEnd {
     Ended(String),
 }
 
-async fn run_session(relay: &Relay, current: &Arc<Mutex<Option<wt::Session>>>) -> SessionEnd {
+async fn run_session(
+    relay: &Relay,
+    current: &Arc<Mutex<Option<wt::Session>>>,
+    crypto: Arc<yas_uplink::ServerConfig>,
+) -> SessionEnd {
     let client = match build_client(relay.cert_hash.as_deref()) {
         Ok(client) => client,
         Err(e) => return SessionEnd::NeverConnected(e),
@@ -278,11 +342,24 @@ async fn run_session(relay: &Relay, current: &Arc<Mutex<Option<wt::Session>>>) -
 
     let routes = DatagramRoutes::new(MAX_DATAGRAM_ROUTES);
     tokio::spawn(distribute_datagrams(session.clone(), routes.clone()));
+    let pending = Arc::new(tokio::sync::Semaphore::new(64));
+    let local_socket = crate::transport::default_local_socket();
 
     let reason = loop {
         match session.accept_bi().await {
             Ok((send, recv)) => {
-                tokio::spawn(bridge(session.clone(), routes.clone(), send, recv));
+                let Ok(permit) = pending.clone().try_acquire_owned() else {
+                    continue;
+                };
+                tokio::spawn(bridge(
+                    session.clone(),
+                    routes.clone(),
+                    send,
+                    recv,
+                    crypto.clone(),
+                    permit,
+                    local_socket.clone(),
+                ));
             }
             Err(e) => break format!("{e}"),
         }
@@ -292,34 +369,59 @@ async fn run_session(relay: &Relay, current: &Arc<Mutex<Option<wt::Session>>>) -
 }
 
 /// Bridge one relay-initiated stream to one local yas server connection.
-/// A direct stream begins with the exact YAS preface. A WebTransport consumer
-/// begins with an explicit composite-main selector whose token also routes its
-/// independent datagrams on the shared uplink session.
+/// Authentication precedes both ingress classification and local IPC. The
+/// relay sees only Noise records; plaintext selectors cannot bypass admission.
 async fn bridge(
     session: wt::Session,
     routes: DatagramRoutes,
     send: wt::SendStream,
     recv: wt::RecvStream,
+    crypto: Arc<yas_uplink::ServerConfig>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    local_socket: String,
 ) {
     let relay = tokio::io::join(recv, send);
-    match yas_composite_transport::classify(relay).await {
-        Ok(yas_composite_transport::Ingress::Direct(relay)) => bridge_direct(relay).await,
-        Ok(yas_composite_transport::Ingress::Composite { offer, stream })
+    let relay = match yas_uplink::accept(relay, crypto).await {
+        Ok(relay) => relay,
+        Err(_) => return,
+    };
+    // Bind each sideband's keys to its authenticated main stream. The random
+    // route token remains authenticated as AEAD AAD on every datagram.
+    let material = relay.datagram_key_material();
+    let ingress = tokio::time::timeout(
+        Duration::from_secs(5),
+        yas_composite_transport::classify(relay),
+    )
+    .await;
+    drop(permit);
+    match ingress {
+        Ok(Ok(yas_composite_transport::Ingress::Direct(relay))) => {
+            bridge_direct(relay, &local_socket).await
+        }
+        Ok(Ok(yas_composite_transport::Ingress::Composite { offer, stream }))
             if offer.role == yas_composite_transport::Role::Main =>
         {
-            bridge_composite(session, routes, offer, stream).await;
+            let (sender, receiver) = yas_uplink::datagram_pair(material, offer.token, false);
+            bridge_composite(
+                session,
+                routes,
+                offer,
+                stream,
+                sender,
+                receiver,
+                &local_socket,
+            )
+            .await;
         }
-        Ok(yas_composite_transport::Ingress::Composite { stream, .. }) => drop(stream),
-        Err(error) => eprintln!("[uplink] rejected relay stream selector: {error}"),
+        _ => {}
     }
 }
 
-async fn bridge_direct<S>(relay: S)
+async fn bridge_direct<S>(relay: S, path: &str)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let path = crate::transport::default_local_socket();
-    let transport = match crate::transport::connect_ipc(&path).await {
+    let transport = match crate::transport::connect_ipc(path).await {
         Ok(transport) => transport,
         Err(e) => {
             eprintln!("[uplink] local yas server unavailable at {path}: {e}");
@@ -330,14 +432,14 @@ where
     let (mut recv, mut send) = tokio::io::split(relay);
 
     let down = async move {
-        let _ = tokio::io::copy(&mut recv, &mut sock_write).await;
-        let _ = sock_write.shutdown().await;
+        tokio::io::copy(&mut recv, &mut sock_write).await?;
+        sock_write.shutdown().await
     };
     let up = async move {
-        let _ = tokio::io::copy(&mut sock_read, &mut send).await;
-        let _ = send.shutdown().await;
+        tokio::io::copy(&mut sock_read, &mut send).await?;
+        send.shutdown().await
     };
-    tokio::join!(down, up);
+    let _ = tokio::try_join!(down, up);
 }
 
 async fn distribute_datagrams(session: wt::Session, routes: DatagramRoutes) {
@@ -352,13 +454,17 @@ async fn bridge_composite<S>(
     routes: DatagramRoutes,
     offer: yas_composite_transport::Offer,
     relay: S,
+    mut sender: yas_uplink::DatagramSender,
+    mut receiver: yas_uplink::DatagramReceiver,
+    path: &str,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let physical_maximum = session
         .max_datagram_size()
         .saturating_sub(yas_composite_transport::ROUTED_DATAGRAM_HEADER)
-        .min(yas_composite_transport::HARD_MAX_DATAGRAM as usize);
+        .saturating_sub(yas_uplink::DATAGRAM_OVERHEAD)
+        .min(yas_composite_transport::HARD_MAX_DATAGRAM as usize - yas_uplink::DATAGRAM_OVERHEAD);
     if offer.max_datagram as usize > physical_maximum {
         eprintln!(
             "[uplink] rejected composite maximum {} above path maximum {physical_maximum}",
@@ -367,15 +473,14 @@ async fn bridge_composite<S>(
         return;
     }
 
-    let path = crate::transport::default_local_socket();
-    let main = match crate::transport::connect_ipc(&path).await {
+    let main = match crate::transport::connect_ipc(path).await {
         Ok(transport) => transport,
         Err(error) => {
             eprintln!("[uplink] local yas server unavailable at {path}: {error}");
             return;
         }
     };
-    let side = match crate::transport::connect_ipc(&path).await {
+    let side = match crate::transport::connect_ipc(path).await {
         Ok(transport) => transport,
         Err(error) => {
             eprintln!("[uplink] local YAS datagram sideband unavailable at {path}: {error}");
@@ -406,26 +511,19 @@ async fn bridge_composite<S>(
         return;
     }
 
-    let Ok(mut route_rx) = routes.register(offer.token, offer.max_datagram, DATAGRAM_QUEUE) else {
+    let encrypted_maximum = offer.max_datagram + yas_uplink::DATAGRAM_OVERHEAD as u32;
+    let Ok(mut route_rx) = routes.register(offer.token, encrypted_maximum, DATAGRAM_QUEUE) else {
         return;
     };
 
     let (mut relay_read, mut relay_write) = tokio::io::split(relay);
     let down = async {
-        if tokio::io::copy(&mut relay_read, &mut main_write)
-            .await
-            .is_ok()
-        {
-            let _ = main_write.shutdown().await;
-        }
+        tokio::io::copy(&mut relay_read, &mut main_write).await?;
+        main_write.shutdown().await
     };
     let up = async {
-        if tokio::io::copy(&mut main_read, &mut relay_write)
-            .await
-            .is_ok()
-        {
-            let _ = relay_write.shutdown().await;
-        }
+        tokio::io::copy(&mut main_read, &mut relay_write).await?;
+        relay_write.shutdown().await
     };
     let side_routes = routes.clone();
     let side_token = offer.token;
@@ -438,10 +536,13 @@ async fn bridge_composite<S>(
                 else {
                     break;
                 };
+                let Some(encrypted) = sender.seal(&frame) else {
+                    break;
+                };
                 let Ok(routed) = yas_composite_transport::encode_routed_datagram(
                     offer.token,
-                    &frame,
-                    offer.max_datagram,
+                    &encrypted,
+                    encrypted_maximum,
                 ) else {
                     break;
                 };
@@ -452,6 +553,9 @@ async fn bridge_composite<S>(
         };
         let side_in = async {
             while let Some(frame) = route_rx.recv().await {
+                let Some(frame) = receiver.open(&frame) else {
+                    continue;
+                };
                 if yas_composite_transport::write_datagram(
                     &mut side_write,
                     &frame,
@@ -473,7 +577,7 @@ async fn bridge_composite<S>(
 
     // The authoritative reliable splice owns the connection lifetime. An
     // optional sideband ending only removes its route and cannot drop `main`.
-    tokio::join!(down, up);
+    let _ = tokio::try_join!(down, up);
     routes.remove(offer.token);
     side_task.abort();
 }
@@ -594,6 +698,208 @@ fn jittered(base: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn producer_authenticates_before_ipc_and_encrypts_datagrams() {
+        use tokio::io::AsyncReadExt;
+        use yas_composite_transport::{Offer, Role};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (server_key, server_public) = yas_uplink::Identity::generate().unwrap();
+            let (client_key, client_public) = yas_uplink::Identity::generate().unwrap();
+            let (attacker_key, _) = yas_uplink::Identity::generate().unwrap();
+            let crypto = yas_uplink::Identity::from_base64(&server_key)
+                .unwrap()
+                .server_config(vec![client_public])
+                .unwrap();
+            let client_crypto = yas_uplink::Identity::from_base64(&client_key)
+                .unwrap()
+                .client_config(server_public)
+                .unwrap();
+            let attacker_crypto = yas_uplink::Identity::from_base64(&attacker_key)
+                .unwrap()
+                .client_config(server_public)
+                .unwrap();
+            let socket = dir.path().join("local.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let hash = ring::digest::digest(&ring::digest::SHA256, cert.cert.der());
+            let mut worker = wt::ServerBuilder::new()
+                .with_addr("127.0.0.1:0".parse().unwrap())
+                .with_certificate(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                        .into(),
+                )
+                .unwrap();
+            let outer = build_client(Some(hash.as_ref())).unwrap();
+            let url: url::Url =
+                format!("https://127.0.0.1:{}/", worker.local_addr().unwrap().port())
+                    .parse()
+                    .unwrap();
+            let (local, remote) = tokio::join!(outer.connect(url), async {
+                worker.accept().await.unwrap().ok().await.unwrap()
+            });
+            let local = local.unwrap();
+            let routes = DatagramRoutes::new(16);
+            let datagrams = tokio::spawn(distribute_datagrams(local.clone(), routes.clone()));
+
+            for case in 0..4 {
+                let local = local.clone();
+                let routes = routes.clone();
+                let crypto = crypto.clone();
+                let socket = socket.to_str().unwrap().to_string();
+                let producer = tokio::spawn(async move {
+                    let (send, recv) = local.accept_bi().await.unwrap();
+                    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+                        .acquire_owned()
+                        .await
+                        .unwrap();
+                    bridge(local, routes, send, recv, crypto, permit, socket).await;
+                });
+                let (send, recv) = remote.open_bi().await.unwrap();
+                let mut stream = tokio::io::join(recv, send);
+                if case == 0 {
+                    // A relay can synthesize protocol bytes, but those bytes
+                    // must never open a local socket before Noise authentication.
+                    stream
+                        .write_all(yas_wire::PREFACE.as_slice())
+                        .await
+                        .unwrap();
+                    stream.shutdown().await.unwrap();
+                    drop(stream);
+                    producer.await.unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                    continue;
+                }
+                if case == 1 {
+                    assert!(
+                        yas_uplink::connect(stream, attacker_crypto.clone())
+                            .await
+                            .is_err()
+                    );
+                    producer.await.unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                    continue;
+                }
+                let mut stream = yas_uplink::connect(stream, client_crypto.clone())
+                    .await
+                    .unwrap();
+                // Authentication alone also does not open IPC: the encrypted
+                // YAS preface or composite selector must follow first.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                        .await
+                        .is_err()
+                );
+                if case == 2 {
+                    stream
+                        .write_all(yas_wire::PREFACE.as_slice())
+                        .await
+                        .unwrap();
+                    stream.write_all(b"command").await.unwrap();
+                    stream.flush().await.unwrap();
+                    let (mut ipc, _) = listener.accept().await.unwrap();
+                    let mut received = vec![0; yas_wire::PREFACE.len() + 7];
+                    ipc.read_exact(&mut received).await.unwrap();
+                    assert_eq!(
+                        received,
+                        [yas_wire::PREFACE.as_slice(), b"command"].concat()
+                    );
+                    ipc.write_all(b"reply").await.unwrap();
+                    ipc.shutdown().await.unwrap();
+                    let mut reply = Vec::new();
+                    stream.read_to_end(&mut reply).await.unwrap();
+                    assert_eq!(reply, b"reply");
+                    stream.shutdown().await.unwrap();
+                    producer.await.unwrap();
+                    continue;
+                }
+
+                let token = [0x35; 16];
+                let maximum = 512;
+                let material = stream.datagram_key_material();
+                let (mut sender, mut receiver) = yas_uplink::datagram_pair(material, token, true);
+                yas_composite_transport::write_offer(
+                    &mut stream,
+                    Offer::new(Role::Main, token, maximum).unwrap(),
+                )
+                .await
+                .unwrap();
+                stream.flush().await.unwrap();
+                let (mut main, _) = listener.accept().await.unwrap();
+                let (mut side, _) = listener.accept().await.unwrap();
+                for (socket, expected) in [(&mut main, Role::Main), (&mut side, Role::Datagram)] {
+                    match yas_composite_transport::classify(socket).await.unwrap() {
+                        yas_composite_transport::Ingress::Composite { offer, .. } => {
+                            assert_eq!(offer.role, expected);
+                            assert_eq!(offer.token, token);
+                            assert_eq!(offer.max_datagram, maximum);
+                        }
+                        _ => panic!("missing local composite selector"),
+                    }
+                }
+                // A reliable reply also synchronizes route registration.
+                main.write_all(b"ready").await.unwrap();
+                let mut ready = [0; 5];
+                stream.read_exact(&mut ready).await.unwrap();
+                assert_eq!(&ready, b"ready");
+
+                let encrypted = sender.seal(b"private datagram").unwrap();
+                let wire_maximum = maximum + yas_uplink::DATAGRAM_OVERHEAD as u32;
+                let mut forged = encrypted.clone();
+                *forged.last_mut().unwrap() ^= 1;
+                for bytes in [&forged, &encrypted, &encrypted] {
+                    let routed =
+                        yas_composite_transport::encode_routed_datagram(token, bytes, wire_maximum)
+                            .unwrap();
+                    remote.send_datagram(routed.into()).unwrap();
+                }
+                assert_eq!(
+                    yas_composite_transport::read_datagram(&mut side, maximum)
+                        .await
+                        .unwrap(),
+                    b"private datagram"
+                );
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(50),
+                        yas_composite_transport::read_datagram(&mut side, maximum)
+                    )
+                    .await
+                    .is_err()
+                );
+
+                yas_composite_transport::write_datagram(&mut side, b"private reply", maximum)
+                    .await
+                    .unwrap();
+                let packet = remote.read_datagram().await.unwrap();
+                let (received_token, ciphertext) =
+                    yas_composite_transport::split_routed_datagram(&packet).unwrap();
+                assert_eq!(received_token, token);
+                assert!(!ciphertext.windows(13).any(|w| w == b"private reply"));
+                assert_eq!(receiver.open(ciphertext).unwrap(), b"private reply");
+                stream.shutdown().await.unwrap();
+                main.shutdown().await.unwrap();
+                producer.await.unwrap();
+            }
+            datagrams.abort();
+            local.close(0, b"test complete");
+        })
+        .await
+        .expect("producer uplink test stalled");
+    }
 
     #[test]
     fn parse_pool_accepts_plain_and_pinned_relay_urls() {

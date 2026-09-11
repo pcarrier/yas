@@ -17,6 +17,15 @@ Share over WebRTC:
 yas share # prints a URL anyone can open
 ```
 
+For full-control access through an untrusted relay, `yas uplink` requires
+mutually pinned X25519 identities and encrypts the YAS session end to end
+with Noise IK and AES-256-GCM. On each endpoint, set
+`YAS_UPLINK_IDENTITY` from `yas uplink-keygen --private`, and print its public
+key with `yas uplink-public-key`. The producer can generate a connection URL
+with `yas uplink-url`. Exchange public keys independently of the relay and
+follow [uplink setup](docs/uplink.md). Existing bearer-only uplinks
+must configure keys; there is no plaintext fallback.
+
 Manage named remotes and connect to them:
 
 ```bash
@@ -256,6 +265,9 @@ deployment are covered by [ARCHITECTURE.md](ARCHITECTURE.md) and
 | `YAS_EXPORT_SOCK`                                | unset                              | Set to `1` (or pass `--export-sock` to `yas server`) to export the server's socket path as `YAS_SOCK` in spawned terminals, so `yas` commands inside them target that server |
 | `YAS_INJECT_PATH`                                | unset                              | Set to `1` (or pass `--inject-path` to `yas server`) to append the server binary's directory to `PATH` in spawned terminals, so `yas` itself is callable inside them         |
 | `YAS_UPLINK_TOKEN`                               | unset                              | Bearer token for the `yas uplink` control endpoint                                                                                                                           |
+| `YAS_UPLINK_CLIENT_TOKEN`                        | unset                              | Consumer routing token for `yas uplink-url`; overridden by `--client-token`                                                                                                  |
+| `YAS_UPLINK_IDENTITY`                            | unset                              | X25519 private key as 43-character base64url; producer `--identity` or consumer URI `identity` overrides it                                                                  |
+| `YAS_UPLINK_CLIENT_KEYS`                         | unset                              | Producer allowlist of comma-separated X25519 public keys (43-character base64url each); equivalent to repeatable `--allow-client`                                            |
 | `YAS_TARGET`                                     | unset                              | Default remote for non-browser CLI commands: a URI or named remote (overrides `yas.target` in `yas.conf`)                                                                    |
 | `YAS_REMOTES`                                    | `~/.config/yas/yas.remotes`        | Only the file the one-time import reads; the live catalogue is the home server's `remotes` KV key                                                                            |
 | `YAS_RELAY`                                      | `1`                                | Set to `0` on the home server to disable route publication and nested connections                                                                                            |

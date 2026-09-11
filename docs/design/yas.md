@@ -1139,6 +1139,13 @@ flags, enum variants, or optional extensions.
 
 ## Trust model
 
+An uplink's outer relay is not an admitted YAS endpoint. Each consumer must
+complete end-to-end Noise IK authentication using a locally allowlisted X25519
+key and a fresh-session confirmation before the producer opens a local socket. The consumer independently pins
+the producer key; ephemeral X25519 establishes session keys. Relay and
+control-plane bearer credentials confer no YAS authority by themselves.
+See [uplink](../uplink.md) for key setup, protocol, and migration requirements.
+
 A normal YAS connection is a full-control session. Every normally admitted
 endpoint may use every operation the server advertises, observe every exposed
 resource catalogue, start arbitrary terminal and native processes, access the
