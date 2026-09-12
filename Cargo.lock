@@ -8117,7 +8117,7 @@ dependencies = [
 
 [[package]]
 name = "yas-browser"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "js-sys",
@@ -8129,7 +8129,7 @@ dependencies = [
 
 [[package]]
 name = "yas-cli"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "axum",
  "blake3",
@@ -8173,7 +8173,7 @@ dependencies = [
 
 [[package]]
 name = "yas-composite-transport"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "tokio",
  "yas-wire",
@@ -8181,7 +8181,7 @@ dependencies = [
 
 [[package]]
 name = "yas-compositor"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "ash",
  "calloop",
@@ -8195,7 +8195,7 @@ dependencies = [
 
 [[package]]
 name = "yas-desktop"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "data-url",
  "futures-util",
@@ -8209,7 +8209,7 @@ dependencies = [
 
 [[package]]
 name = "yas-edge"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -8238,14 +8238,14 @@ dependencies = [
 
 [[package]]
 name = "yas-fonts"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "blake3",
 ]
 
 [[package]]
 name = "yas-fssync"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "ignore",
@@ -8254,7 +8254,7 @@ dependencies = [
 
 [[package]]
 name = "yas-git"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "encoding_rs",
  "flate2",
@@ -8266,7 +8266,7 @@ dependencies = [
 
 [[package]]
 name = "yas-guest"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "getrandom 0.2.17",
@@ -8277,7 +8277,7 @@ dependencies = [
 
 [[package]]
 name = "yas-lsp"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "libc",
@@ -8289,7 +8289,7 @@ dependencies = [
 
 [[package]]
 name = "yas-proxy"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -8314,14 +8314,14 @@ dependencies = [
 
 [[package]]
 name = "yas-sd-notify"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "yas-server"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -8379,7 +8379,7 @@ dependencies = [
 
 [[package]]
 name = "yas-ssh"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "log",
  "russh",
@@ -8389,7 +8389,7 @@ dependencies = [
 
 [[package]]
 name = "yas-terminal-driver"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "regex",
  "yas-alacritty-terminal",
@@ -8398,14 +8398,14 @@ dependencies = [
 
 [[package]]
 name = "yas-terminal-model"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "unicode-width",
 ]
 
 [[package]]
 name = "yas-uplink"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "base64",
  "ring",
@@ -8418,7 +8418,7 @@ dependencies = [
 
 [[package]]
 name = "yas-webrtc-forwarder"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "base64",
  "clap",
@@ -8450,7 +8450,7 @@ dependencies = [
 
 [[package]]
 name = "yas-webserver"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "argon2 0.5.3",
  "axum",
@@ -8465,7 +8465,7 @@ dependencies = [
 
 [[package]]
 name = "yas-website"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
@@ -8481,7 +8481,7 @@ dependencies = [
 
 [[package]]
 name = "yas-wire"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "lz4_flex",
  "serde",

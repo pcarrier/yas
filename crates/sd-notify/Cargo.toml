@@ -1,6 +1,6 @@
 [package]
 name = "yas-sd-notify"
-version = "0.1.4"
+version = "0.2.0"
 edition.workspace = true
 description = "Tiny no-dep sd_notify(3) implementation used by yas daemons"
 license.workspace = true

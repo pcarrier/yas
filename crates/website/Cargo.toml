@@ -1,6 +1,6 @@
 [package]
 name = "yas-website"
-version = "0.1.4"
+version = "0.2.0"
 edition.workspace = true
 description = "yas.run website and WebRTC signaling service"
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "yas-wire"
-version = "0.1.4"
+version = "0.2.0"
 edition.workspace = true
 description = "YAS protocol wire codecs and schema primitives"
 license.workspace = true

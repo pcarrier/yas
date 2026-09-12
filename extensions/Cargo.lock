@@ -273,7 +273,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "yas-ext-muster"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "yas-ext-systemd"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "yas-guest",
  "yas-wire",
@@ -291,14 +291,14 @@ dependencies = [
 
 [[package]]
 name = "yas-ext-xdg-desktop"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "yas-guest",
 ]
 
 [[package]]
 name = "yas-guest"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "getrandom",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "yas-wire"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "lz4_flex",
  "serde",

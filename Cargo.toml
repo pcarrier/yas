@@ -42,25 +42,25 @@ repository = "https://github.com/yas-run/yas"
 homepage = "https://yas.run"
 
 [workspace.dependencies]
-yas-wire = { version = "0.1.4", path = "crates/yas" }
-yas-guest = { version = "0.1.4", path = "crates/guest" }
-yas-fssync = { version = "0.1.4", path = "crates/fssync" }
-yas-git = { version = "0.1.4", path = "crates/git" }
-yas-lsp = { version = "0.1.4", path = "crates/lsp" }
-yas-composite-transport = { version = "0.1.4", path = "crates/composite-transport" }
-yas-uplink = { version = "0.1.4", path = "crates/uplink" }
-yas-terminal-model = { version = "0.1.4", path = "crates/terminal-model" }
-yas-terminal-driver = { version = "0.1.4", path = "crates/alacritty-driver" }
-yas-fonts = { version = "0.1.4", path = "crates/fonts" }
-yas-webserver = { version = "0.1.4", path = "crates/webserver" }
-yas-server = { version = "0.1.4", path = "crates/server", default-features = false }
-yas-edge = { version = "0.1.4", path = "crates/edge" }
-yas-proxy = { version = "0.1.4", path = "crates/proxy" }
-yas-webrtc-forwarder = { version = "0.1.4", path = "crates/webrtc-forwarder" }
-yas-compositor = { version = "0.1.4", path = "crates/compositor" }
-yas-sd-notify = { version = "0.1.4", path = "crates/sd-notify" }
-yas-ssh = { version = "0.1.4", path = "crates/ssh" }
-yas-desktop = { version = "0.1.4", path = "crates/desktop" }
+yas-wire = { version = "0.2.0", path = "crates/yas" }
+yas-guest = { version = "0.2.0", path = "crates/guest" }
+yas-fssync = { version = "0.2.0", path = "crates/fssync" }
+yas-git = { version = "0.2.0", path = "crates/git" }
+yas-lsp = { version = "0.2.0", path = "crates/lsp" }
+yas-composite-transport = { version = "0.2.0", path = "crates/composite-transport" }
+yas-uplink = { version = "0.2.0", path = "crates/uplink" }
+yas-terminal-model = { version = "0.2.0", path = "crates/terminal-model" }
+yas-terminal-driver = { version = "0.2.0", path = "crates/alacritty-driver" }
+yas-fonts = { version = "0.2.0", path = "crates/fonts" }
+yas-webserver = { version = "0.2.0", path = "crates/webserver" }
+yas-server = { version = "0.2.0", path = "crates/server", default-features = false }
+yas-edge = { version = "0.2.0", path = "crates/edge" }
+yas-proxy = { version = "0.2.0", path = "crates/proxy" }
+yas-webrtc-forwarder = { version = "0.2.0", path = "crates/webrtc-forwarder" }
+yas-compositor = { version = "0.2.0", path = "crates/compositor" }
+yas-sd-notify = { version = "0.2.0", path = "crates/sd-notify" }
+yas-ssh = { version = "0.2.0", path = "crates/ssh" }
+yas-desktop = { version = "0.2.0", path = "crates/desktop" }
 
 [profile.release]
 opt-level = 3
