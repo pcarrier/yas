@@ -68,7 +68,7 @@ function TerminalScreen() {
 }
 ```
 
-Read-only terminals use the same sizing behavior as writable terminals; `readOnly` only disables mutating input. Terminals resize the remote session to their available grid by default. Pass `resizable={false}` for passive previews or read-only transports that must preserve the host dimensions; the canvas is then contained and centered within the embedding element. Add `fitWidth` when a passive preview should expand a smaller grid to the container's full width.
+Read-only terminals use the same sizing behavior as writable terminals; `readOnly` only disables mutating input. Terminals resize the remote session to their available grid by default. The grid stays at native size in the top-left corner of its container, with excess content clipped while a resize is pending. Pass `resizable={false}` for passive views or read-only transports that must preserve the host dimensions; this keeps the same native-size presentation. Add `fitWidth` to opt a passive preview into scaling and centering to fill the container's width, as used by the right-sidebar and Cmd-K B switcher previews. Use a flex container to center the preview vertically within a fixed height.
 
 ### React API
 

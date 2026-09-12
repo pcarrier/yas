@@ -1,5 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createWebRtcDataChannelTransport } from "../transports/webrtc";
+import {
+  YasStreamFrameDecoder,
+  YasWriter,
+  encodeYasFrame,
+  frameForByteStream,
+} from "../yas/wire";
+import {
+  YAS_CLASS_EVENT,
+  YAS_FAMILY_TRANSFER,
+  YAS_TRANSFER_BYTE_DATA,
+} from "../yas/generated";
 
 // ---------------------------------------------------------------------------
 // Minimal WebRTC mocks (jsdom doesn't ship WebRTC APIs)
@@ -12,6 +23,7 @@ class MockRTCDataChannel {
   ordered?: boolean;
   maxRetransmits: number | null = null;
   sendError: Error | null = null;
+  maxMessageBytes = Infinity;
 
   onopen: ((ev: Event) => void) | null = null;
   onmessage: ((ev: MessageEvent) => void) | null = null;
@@ -28,6 +40,8 @@ class MockRTCDataChannel {
 
   send(data: Uint8Array) {
     if (this.sendError) throw this.sendError;
+    if (data.byteLength > this.maxMessageBytes)
+      throw new TypeError("SCTP message exceeds receive limit");
     this.sent.push(new Uint8Array(data));
   }
 
@@ -56,6 +70,7 @@ class MockRTCDataChannel {
 
 class MockRTCPeerConnection {
   connectionState: RTCPeerConnectionState = "new";
+  sctp = { maxMessageSize: 256 * 1024 };
   private listeners: Record<string, ((...args: any[]) => void)[]> = {};
   lastChannel: MockRTCDataChannel | null = null;
   channels: MockRTCDataChannel[] = [];
@@ -242,6 +257,69 @@ describe("createWebRtcDataChannelTransport", () => {
     expect(onmsg).toHaveBeenCalledTimes(1);
     const received = new Uint8Array(onmsg.mock.calls[0][0]);
     expect(received).toEqual(payload);
+  });
+
+  it("sends a 64 KiB extension payload and its headers in one message", () => {
+    const t = create();
+    channel.maxMessageBytes = pc.sctp.maxMessageSize;
+    channel.simulateOpen();
+    const bytes = Uint8Array.from({ length: 64 * 1024 }, (_, i) => i % 251);
+    const frame = encodeYasFrame({
+      family: YAS_FAMILY_TRANSFER,
+      kind: YAS_TRANSFER_BYTE_DATA,
+      class: YAS_CLASS_EVENT,
+      sensitive: true,
+      payload: new YasWriter().u32(2).u64(0n).bytes(bytes).finish(),
+    });
+
+    expect(() => t.send(frameForByteStream(frame))).not.toThrow();
+    expect(channel.sent.map((chunk) => chunk.length)).toEqual([65_557]);
+    const decoder = new YasStreamFrameDecoder(1024 * 1024);
+    expect(channel.sent.flatMap((chunk) => decoder.push(chunk))).toEqual([
+      frame,
+    ]);
+    expect(t.status).toBe("connected");
+  });
+
+  it.each([
+    { maxMessageSize: 256 * 1024, chunks: [262_144, 262_144, 1] },
+    { maxMessageSize: Infinity, chunks: [524_289] },
+  ])(
+    "splits stream writes at the negotiated limit: $maxMessageSize",
+    ({ maxMessageSize, chunks }) => {
+      pc.sctp = { maxMessageSize };
+      const t = create();
+      channel.maxMessageBytes = maxMessageSize;
+      channel.simulateOpen();
+      const bytes = Uint8Array.from(
+        { length: 2 * 262_144 + 1 },
+        (_, i) => i % 251,
+      );
+      t.send(bytes);
+      const sent = new Uint8Array(bytes.length);
+      let offset = 0;
+      for (const chunk of channel.sent) {
+        sent.set(chunk, offset);
+        offset += chunk.length;
+      }
+      expect(sent).toEqual(bytes);
+      bytes.fill(0);
+      expect(channel.sent.map((chunk) => chunk.length)).toEqual(chunks);
+      expect(channel.sent[0][1]).toBe(1);
+    },
+  );
+
+  it("respects a smaller negotiated SCTP message limit", () => {
+    pc.sctp = { maxMessageSize: 16 * 1024 };
+    const t = create();
+    channel.maxMessageBytes = pc.sctp.maxMessageSize;
+    channel.simulateOpen();
+    t.send(new Uint8Array(32 * 1024));
+    t.send(Uint8Array.of(1));
+    expect(channel.sent.map((chunk) => chunk.length)).toEqual([
+      16_384, 16_384, 1,
+    ]);
+    expect(channel.sent[2]).toEqual(Uint8Array.of(1));
   });
 
   it("closes instead of retaining unbounded pre-connect stream chunks", () => {

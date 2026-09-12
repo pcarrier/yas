@@ -1522,10 +1522,14 @@ export function SwitcherOverlay(props: {
             sessionId={item.sessionId}
             readOnly
             resizable={false}
+            fitWidth
             showCursor={false}
             style={{
               width: `${iconSize()}px`,
               height: `${iconSize()}px`,
+              display: "flex",
+              "align-items": "center",
+              "justify-content": "center",
               "pointer-events": "none",
             }}
           />

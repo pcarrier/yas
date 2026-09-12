@@ -21,7 +21,7 @@ export interface YasTerminalProps {
   readOnly?: boolean;
   /** Resize the remote session to this surface. Disable for passive previews. Default: true. */
   resizable?: boolean;
-  /** Stretch a passive preview to its container width. Ignored while resizable. */
+  /** Scale and center a passive preview to fit its container width. Ignored while resizable. */
   fitWidth?: boolean;
   showCursor?: boolean;
   onRender?: (renderMs: number) => void;

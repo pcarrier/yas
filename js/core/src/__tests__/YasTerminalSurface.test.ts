@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   YasTerminalSurface,
-  terminalGridPresentation,
   terminalSurfaceForInput,
 } from "../YasTerminalSurface";
 
@@ -87,33 +86,6 @@ describe("YasTerminalSurface sizing", () => {
     return { surface, canvas };
   }
 
-  it("keeps smaller grids at native resolution and only scales down", () => {
-    expect(terminalGridPresentation(1000, 700, 400, 200)).toEqual({
-      scale: 1,
-      width: 400,
-      height: 200,
-      left: 300,
-      top: 250,
-    });
-    expect(terminalGridPresentation(300, 200, 600, 300)).toEqual({
-      scale: 0.5,
-      width: 300,
-      height: 150,
-      left: 0,
-      top: 25,
-    });
-  });
-
-  it("does not blur a fitted grid by magnifying its sub-cell remainder", () => {
-    expect(terminalGridPresentation(1001, 701, 1000, 700)).toEqual({
-      scale: 1,
-      width: 1000,
-      height: 700,
-      left: 0.5,
-      top: 0.5,
-    });
-  });
-
   it("resolves the mounted surface from its keyboard textarea", () => {
     const { surface, canvas } = attachSurface();
     const input = canvas.parentElement?.querySelector(
@@ -161,44 +133,50 @@ describe("YasTerminalSurface sizing", () => {
     readOnly.surface.dispose();
   });
 
-  it("contains passive surfaces without registering their container size", () => {
+  it("anchors passive surfaces without registering their container size", () => {
     const writable = attachSurface({ resizable: false });
     const readOnly = attachSurface({ readOnly: true, resizable: false });
 
-    // A passive surface is *clamped*, not stretched: `width: 100%` scaled the
-    // grid to the container instead of letting it keep its own cell size, so
-    // the bound is now a maximum.
     expect({
       writable: {
         maxWidth: writable.canvas.style.maxWidth,
         maxHeight: writable.canvas.style.maxHeight,
         objectFit: writable.canvas.style.objectFit,
         objectPosition: writable.canvas.style.objectPosition,
+        position: writable.canvas.style.position,
+        top: writable.canvas.style.top,
+        left: writable.canvas.style.left,
       },
       readOnly: {
         maxWidth: readOnly.canvas.style.maxWidth,
         maxHeight: readOnly.canvas.style.maxHeight,
         objectFit: readOnly.canvas.style.objectFit,
         objectPosition: readOnly.canvas.style.objectPosition,
+        position: readOnly.canvas.style.position,
+        top: readOnly.canvas.style.top,
+        left: readOnly.canvas.style.left,
       },
     }).toEqual({
       writable: {
-        maxWidth: "100%",
-        maxHeight: "100%",
-        objectFit: "contain",
-        objectPosition: "center",
+        maxWidth: "",
+        maxHeight: "",
+        objectFit: "",
+        objectPosition: "",
+        position: "absolute",
+        top: "0px",
+        left: "0px",
       },
       readOnly: {
-        maxWidth: "100%",
-        maxHeight: "100%",
-        objectFit: "contain",
-        objectPosition: "center",
+        maxWidth: "",
+        maxHeight: "",
+        objectFit: "",
+        objectPosition: "",
+        position: "absolute",
+        top: "0px",
+        left: "0px",
       },
     });
-    // A passive surface does observe its container — it needs the box to pick
-    // how far to box-filter the canvas down before the browser minifies it —
-    // but the measurement stays local: no view id is allocated, so nothing it
-    // sees can reach the server and drag the session's grid down to a card.
+    // Passive measurements stay local, ready for fitWidth to be enabled.
     expect(observe).toHaveBeenCalledTimes(2);
     resizeTo(200, 100);
     expect(writable.surface["_presentBox"]).toEqual({
@@ -221,10 +199,17 @@ describe("YasTerminalSurface sizing", () => {
 
     expect(canvas.style.minWidth).toBe("100%");
     expect(canvas.style.maxWidth).toBe("100%");
+    expect(canvas.style.objectFit).toBe("contain");
+    expect(canvas.style.objectPosition).toBe("center");
+    expect(canvas.style.margin).toBe("auto");
 
     surface.setFitWidth(false);
     expect(canvas.style.minWidth).toBe("");
-    expect(canvas.style.maxWidth).toBe("100%");
+    expect(canvas.style.maxWidth).toBe("");
+    expect(canvas.style.objectFit).toBe("");
+    expect(canvas.style.margin).toBe("");
+    expect(canvas.style.top).toBe("0px");
+    expect(canvas.style.left).toBe("0px");
 
     surface.dispose();
   });
@@ -260,6 +245,7 @@ describe("YasTerminalSurface sizing", () => {
     const { surface, canvas } = attachSurface({
       readOnly: true,
       resizable: false,
+      fitWidth: true,
     });
     // @ts-expect-error — install the terminal dimensions a passive surface follows.
     surface.terminal = {
@@ -1696,20 +1682,67 @@ describe("YasTerminalSurface displayed grid", () => {
   }
 
   it.each([
-    [12, 40],
-    [48, 120],
+    [12, 40, true, false],
+    [48, 120, true, false],
+    [24, 80, true, false],
+    [12, 40, false, false],
+    [48, 120, false, false],
+    [12, 40, true, true],
   ])(
-    "keeps the cursor on the displayed grid while %ix%i is requested",
-    (rows, cols) => {
+    "keeps the grid and cursor at native size for %ix%i (resizable=%s, fitWidth=%s)",
+    (rows, cols, resizable, fitWidth) => {
       const { renderer, makeSurface } = makeRenderer();
       const surface = makeSurface();
+      const canvas = document.createElement("canvas");
+      vi.spyOn(canvas, "getContext").mockReturnValue(null);
+      surface["glCanvas"] = canvas;
+      surface.setResizable(resizable);
+      surface.setFitWidth(fitWidth);
+      surface["applyCanvasLayout"]();
       surface["_rows"] = rows;
       surface["_cols"] = cols;
+      // Include a sub-cell remainder and a passive measurement: neither may
+      // scale or center the grid, including while a resize is in flight.
+      surface["_containerW"] = cols * 10 + 1;
+      surface["_containerH"] = rows * 20 + 1;
+      surface["_presentBox"] = { width: cols * 10, height: rows * 20 };
       surface["predicted"] = "abc";
       surface.paintFrame();
       expect(renderer.render.mock.calls[0]!.slice(5, 7)).toEqual([1, 21]);
+      expect(canvas.style.width).toBe("800px");
+      expect(canvas.style.height).toBe("480px");
+      expect(canvas.style.left).toBe("0px");
+      expect(canvas.style.top).toBe("0px");
+      expect(canvas.width).toBe(800);
+      expect(canvas.height).toBe(480);
     },
   );
+
+  it("downscales only opted-in previews and restores native size when disabled", () => {
+    const { makeSurface } = makeRenderer();
+    const surface = makeSurface();
+    const canvas = document.createElement("canvas");
+    vi.spyOn(canvas, "getContext").mockReturnValue(null);
+    surface["glCanvas"] = canvas;
+    surface.setResizable(false);
+    surface.setFitWidth(true);
+    surface["_presentBox"] = { width: 400, height: 240 };
+    surface.paintFrame();
+    expect(canvas.style.height).toBe("auto");
+    expect(canvas.style.minWidth).toBe("100%");
+    expect(canvas.style.maxWidth).toBe("100%");
+    expect(canvas.width).toBe(400);
+    expect(canvas.height).toBe(240);
+
+    surface.setFitWidth(false);
+    surface.paintFrame();
+    expect(canvas.style.width).toBe("800px");
+    expect(canvas.style.height).toBe("480px");
+    expect(canvas.style.left).toBe("0px");
+    expect(canvas.style.top).toBe("0px");
+    expect(canvas.width).toBe(800);
+    expect(canvas.height).toBe(480);
+  });
 
   it("keeps glyphs and cursor metrics aligned when a preview shares the terminal", () => {
     const { makeSurface, extents } = makeRenderer();

@@ -327,9 +327,14 @@ export function createWebRtcDataChannelTransport(
 
     send(data: Uint8Array) {
       if (!channel || channel.readyState !== "open") return;
-      const owned = new Uint8Array(data.byteLength);
-      owned.set(data);
-      channel.send(owned);
+      // An open DataChannel has an SCTP transport with a negotiated limit.
+      // YAS frames can span messages because this channel is a byte stream.
+      const maxChunkBytes = pc.sctp!.maxMessageSize;
+      for (let offset = 0; offset < data.byteLength; offset += maxChunkBytes) {
+        channel.send(
+          new Uint8Array(data.subarray(offset, offset + maxChunkBytes)),
+        );
+      }
     },
 
     sendDatagram(data: Uint8Array) {

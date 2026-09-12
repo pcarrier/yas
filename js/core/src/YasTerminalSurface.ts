@@ -137,7 +137,7 @@ export interface YasTerminalSurfaceOptions {
   readOnly?: boolean;
   /** Resize the remote session to this surface. Disable for passive previews. Default: true. */
   resizable?: boolean;
-  /** Stretch a passive preview to its container width. Ignored while resizable. */
+  /** Scale and center a passive preview to fit its container width. Ignored while resizable. */
   fitWidth?: boolean;
   showCursor?: boolean;
   onRender?: (renderMs: number) => void;
@@ -155,54 +155,6 @@ export interface YasTerminalSurfaceHandle {
   cols: number;
   status: ConnectionStatus;
   focus(): void;
-}
-
-export function terminalGridPresentation(
-  containerWidth: number,
-  containerHeight: number,
-  naturalWidth: number,
-  naturalHeight: number,
-): {
-  scale: number;
-  width: number;
-  height: number;
-  left: number;
-  top: number;
-} {
-  if (
-    containerWidth <= 0 ||
-    containerHeight <= 0 ||
-    naturalWidth <= 0 ||
-    naturalHeight <= 0
-  ) {
-    return {
-      scale: 1,
-      width: Math.max(0, naturalWidth),
-      height: Math.max(0, naturalHeight),
-      left: 0,
-      top: 0,
-    };
-  }
-  // Never magnify a terminal bitmap with CSS. Even the sub-cell remainder
-  // left by the ordinary rows/cols calculation produces a fractional scale
-  // above 1, which makes the browser resample an otherwise DPR-exact canvas
-  // and softens every glyph. A grid that is too large may still be reduced
-  // transiently while its resize round-trip completes; a smaller shared grid
-  // stays at native resolution and is centred in the pane.
-  const scale = Math.min(
-    1,
-    containerWidth / naturalWidth,
-    containerHeight / naturalHeight,
-  );
-  const width = naturalWidth * scale;
-  const height = naturalHeight * scale;
-  return {
-    scale,
-    width,
-    height,
-    left: Math.max(0, (containerWidth - width) / 2),
-    top: Math.max(0, (containerHeight - height) / 2),
-  };
 }
 
 /** Terminal-rendering slice exposed by the native Workspace connection. */
@@ -1062,7 +1014,7 @@ export class YasTerminalSurface {
 
     // Both branches leave width/height to doRender, which sizes the element to
     // the grid's natural device pixels every frame.
-    if (this._resizable) {
+    if (this._resizable || !this._fitWidth) {
       Object.assign(this.glCanvas.style, {
         display: "block",
         minWidth: "",
@@ -1081,14 +1033,8 @@ export class YasTerminalSurface {
     } else {
       Object.assign(this.glCanvas.style, {
         display: "block",
-        // Sidebar previews fill their card even when the terminal's natural
-        // grid is narrower. Other passive uses (such as switcher icons) keep
-        // the natural-size behavior unless they explicitly opt in.
-        minWidth: this._fitWidth ? "100%" : "",
-        // Clamp by default. With max-* the natural 1:1 size wins whenever it
-        // fits, and only a grid too big for the box gets scaled down
-        // (object-fit keeps that proportional). `min-width` above turns this
-        // into full-width presentation for previews that explicitly want it.
+        // Sidebar and switcher previews opt into scaling and centering.
+        minWidth: "100%",
         maxWidth: "100%",
         maxHeight: "100%",
         margin: "auto",
@@ -1410,7 +1356,7 @@ export class YasTerminalSurface {
       this.syncTerminalSize(this.terminal);
     }
     // Both modes observe — a resizable pane to drive the grid, a passive one
-    // to learn how far its canvas is about to be minified — and
+    // to track its box for optional preview scaling — and
     // setupResizeObserver picks the branch off _resizable.
     this.setupResizeObserver();
     this.contentDirty = true;
@@ -1808,10 +1754,9 @@ export class YasTerminalSurface {
 
     if (!this._resizable) {
       // A passive view must not register a container size with the server: a
-      // thumbnail is presentation, not a request to reflow the PTY. It still needs the box for
-      // presentation — doRender composites the shared canvas down to roughly
-      // this size, leaving CSS a scale it can actually filter — so observe,
-      // but stop short of handleResize.
+      // thumbnail is presentation, not a request to reflow the PTY. Track the
+      // box for fitWidth previews, whose canvas is minified before CSS scales
+      // it, but stop short of handleResize.
       this.resizeObserver = new ResizeObserver((entries) => {
         const entry = entries[entries.length - 1];
         const box = entry && devicePixelBox(entry);
@@ -1865,12 +1810,9 @@ export class YasTerminalSurface {
 
   private _resizeTimer: ReturnType<typeof setTimeout> | undefined;
   private _lastViewSizeAt = 0;
-  /** Container CSS size, cached in handleResize (post-layout) so doRender
-   *  can center a grid smaller than its pane without a forced reflow. */
+  /** Last measured container CSS size, used to suppress premature resizes. */
   private _containerW = 0;
   private _containerH = 0;
-  /** CSS scale used to fit the negotiated shared grid to this pane. */
-  private _presentationScale = 1;
   /** Container size in device pixels, tracked only for a non-resizable view.
    *  Presentation only — it never reaches handleResize, so a thumbnail can't
    *  drag the session's grid down to its own box. */
@@ -1885,9 +1827,6 @@ export class YasTerminalSurface {
     const w = this.container.clientWidth;
     const h = this.container.clientHeight;
     const firstMeasurement = this._containerW <= 0 || this._containerH <= 0;
-    // Cached for doRender's centering math: an observer callback runs
-    // after layout, so this read is free here and would force a reflow
-    // in the render loop.
     this._containerW = w;
     this._containerH = h;
     // Newly inserted and hidden panes can measure 0x0 before layout. Sending
@@ -2168,52 +2107,18 @@ export class YasTerminalSurface {
     const pw = termCols * cell.pw;
     const ph = termRows * cell.ph;
 
-    // Size the element to the grid's natural device pixels. In resizable
-    // panes that is also the backing store, so the copy is 1:1 and that is the
-    // whole story; non-resizable ones additionally clamp with
-    // max-width/max-height (see applyCanvasLayout) so an oversized grid still
-    // scales down to fit, but one that already fits is left at 1:1 instead of
-    // being magnified. When the clamp bites, the composite below has already
-    // halved the backing store towards the box, so the residual CSS scale is
-    // always under 2:1.
+    // Keep the grid at native size, anchored by applyCanvasLayout at the
+    // top-left even while a resize is in flight. Only fitWidth previews
+    // scale; their auto height preserves the canvas's intrinsic aspect ratio.
+    const scalePreview = !this._resizable && this._fitWidth;
     const naturalW = termCols * cell.w;
     const naturalH = termRows * cell.h;
-    const presentation = this._resizable
-      ? terminalGridPresentation(
-          this._containerW,
-          this._containerH,
-          naturalW,
-          naturalH,
-        )
-      : null;
-    this._presentationScale = presentation?.scale ?? 1;
-    const cssW = `${presentation?.width ?? naturalW}px`;
-    // Non-resizable surfaces leave the height to the canvas's intrinsic aspect
-    // ratio, so that clamping the width scales the grid instead of squashing
-    // it and letterboxing the difference.
-    const cssH = this._resizable
-      ? `${presentation?.height ?? naturalH}px`
-      : "auto";
+    const cssW = `${naturalW}px`;
+    const cssH = scalePreview ? "auto" : `${naturalH}px`;
     const glCanvas = this.glCanvas;
     if (glCanvas) {
       if (glCanvas.style.width !== cssW) glCanvas.style.width = cssW;
       if (glCanvas.style.height !== cssH) glCanvas.style.height = cssH;
-      if (this._resizable) {
-        // Keep a smaller shared PTY grid at native resolution so the browser
-        // never magnifies and resamples its DPR-exact backing store. Preserve
-        // the cell aspect ratio when a too-large grid must be reduced, and
-        // centre either result in the pane.
-        const cssLeft = `${presentation?.left ?? 0}px`;
-        const cssTop = `${presentation?.top ?? 0}px`;
-        if (glCanvas.style.left !== cssLeft || glCanvas.style.top !== cssTop) {
-          glCanvas.style.left = cssLeft;
-          glCanvas.style.top = cssTop;
-          // The box moved: the sub-pixel snap computed against the old
-          // position is stale.  Schedule another frame so measureSnap sees
-          // the new box; it converges because these writes are guarded.
-          this.scheduleRender();
-        }
-      }
     }
 
     const mem = conn.wasmMemory();
@@ -2296,12 +2201,11 @@ export class YasTerminalSurface {
     const shared = conn.getSharedRenderer();
     const displayCanvas = this.glCanvas;
     if (shared && displayCanvas) {
-      // A grid too big for its box — a dock thumbnail, a preview card — is
+      // A preview grid too big for its card is
       // minified by the browser, which takes a single bilinear tap and drops
       // most of every glyph.  Composite it down in whole halves first so what
-      // is left for CSS to scale is under 2:1.  A resizable pane is already
-      // 1:1, so n is 0 and this is the plain copy it always was.
-      const box = this._resizable ? null : this._presentBox;
+      // is left for CSS to scale is under 2:1. Other surfaces always copy 1:1.
+      const box = scalePreview ? this._presentBox : null;
       const n = box ? halvings(pw, ph, box.width, box.height) : 0;
       const dw = halve(pw, n);
       const dh = halve(ph, n);
@@ -2562,7 +2466,7 @@ export class YasTerminalSurface {
     }
     const ch = cell.ph;
     const canvasH = viewportRows * ch;
-    const cssPixel = cell.ph / cell.h / this._presentationScale;
+    const cssPixel = cell.ph / cell.h;
     const barW = this._scrollbarWidth * cssPixel;
     const minBarH = Math.min(canvasH / 2, 24 * cssPixel);
     const barH = Math.max(minBarH, (viewportRows / totalLines) * canvasH);
@@ -3441,7 +3345,7 @@ export class YasTerminalSurface {
       const t = this.terminal;
       if (!t) return;
       const maxLines = t.scrollback_lines();
-      const cellH = Math.max(1, this.cell.h * this._presentationScale);
+      const cellH = Math.max(1, this.cell.h);
       // Anchor on the distance to the *bottom*, measured from real DOM
       // geometry rather than recomputed as `maxLines * cellH`. The two
       // agree only while the spacer matches the current `clientHeight`;
@@ -3504,7 +3408,7 @@ export class YasTerminalSurface {
     const spacer = this.scrollSpacer;
     const t = this.terminal;
     if (!el || !spacer || !t) return;
-    const cellH = Math.max(1, this.cell.h * this._presentationScale);
+    const cellH = Math.max(1, this.cell.h);
     const lines = t.scrollback_lines();
     // Browser scrollTop is capped at scrollHeight - clientHeight. Size the
     // content to viewport + scrollback range so the maximum reachable
@@ -3626,14 +3530,8 @@ export class YasTerminalSurface {
       if (!rect) return { row: 0, col: 0 };
       const rows = Math.max(1, this.gridRows);
       const cols = Math.max(1, this.gridCols);
-      const cellH =
-        rect.height > 0
-          ? rect.height / rows
-          : this.cell.h * this._presentationScale;
-      const cellW =
-        rect.width > 0
-          ? rect.width / cols
-          : this.cell.w * this._presentationScale;
+      const cellH = rect.height > 0 ? rect.height / rows : this.cell.h;
+      const cellW = rect.width > 0 ? rect.width / cols : this.cell.w;
       return {
         row: Math.min(
           Math.max(Math.floor((e.clientY - rect.top) / cellH), 0),
@@ -4064,7 +3962,7 @@ export class YasTerminalSurface {
         // Scrollback navigation. Native scroll does the work; a notched
         // wheel only has its travel put back on the row grid first, so the
         // sync has no rounding left to write back afterwards.
-        const cellH = this.cell.h * this._presentationScale;
+        const cellH = this.cell.h;
         const rows = notchedRows(e, cellH);
         const el = this.scrollEl;
         if (rows === 0 || !el) return;
@@ -4077,7 +3975,7 @@ export class YasTerminalSurface {
       e.preventDefault();
       const steps = wheelDetents.take(
         e,
-        this.cell.h * this._presentationScale,
+        this.cell.h,
         this.gridRows,
         performance.now(),
       );
@@ -4321,7 +4219,7 @@ export class YasTerminalSurface {
       flingLastAt = now;
       touchAccum += touchVel * dt;
       touchVel *= Math.pow(FLING_DECAY_PER_MS, dt);
-      const lineH = this.cell.h * this._presentationScale || 20;
+      const lineH = this.cell.h || 20;
       let steps = 0;
       while (
         Math.abs(touchAccum) >= lineH &&
@@ -4500,7 +4398,7 @@ export class YasTerminalSurface {
         touchLastAt = now;
         touchLastY = touch.clientY;
         touchAccum += dy;
-        const lineH = this.cell.h * this._presentationScale || 20;
+        const lineH = this.cell.h || 20;
         // Every report carries the cell where the drag began: the first
         // wheel step places the app's cursor there (vim & co. move the
         // cursor to the reported position), and pinning the rest keeps a

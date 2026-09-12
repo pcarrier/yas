@@ -300,6 +300,12 @@ identical to the Unix socket protocol. The forwarder connects to `yas server`
 when the channel opens, negotiates a server-enforced read-only catalogue, and
 admits the consumer only after the native HELLO completes.
 
+Browser reliable writes are split at the negotiated SCTP message limit
+(`RTCSctpTransport.maxMessageSize`). str0m 0.23.1 advertises and accepts
+256 KiB, so a 64 KiB Transfer payload plus its protocol headers fits in one
+message. Message boundaries do not delimit YAS frames. Native reliable writes
+use 64 KiB chunks to fit within str0m's 128 KiB aggregate send buffer.
+
 ### Optional datagram channel
 
 Peers that support native datagrams open a second DataChannel labeled
